@@ -4,13 +4,18 @@ use std::{
     io::{self, IsTerminal, Write},
 };
 
-use crossterm::terminal;
+use crossterm::{
+    event::{self, Event},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
+    app::{AppState, KeyboardInput},
     calendar::{CalendarDate, CalendarMonth},
-    tui::{DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, MonthGrid, render_month_to_string},
+    tui::{AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, render_month_to_string},
 };
 
 const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
@@ -98,8 +103,8 @@ where
 {
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
-            let month = CalendarMonth::for_launch_date(config.start_date);
-            match draw_month_to_terminal(stdout, &month) {
+            let app = AppState::new(config.start_date);
+            match run_interactive_terminal(stdout, app) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
@@ -167,15 +172,53 @@ fn terminal_size() -> (u16, u16) {
         .unwrap_or((DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT))
 }
 
-fn draw_month_to_terminal<W>(stdout: W, month: &CalendarMonth) -> io::Result<()>
+fn run_interactive_terminal<W>(mut stdout: W, app: AppState) -> io::Result<()>
 where
     W: Write,
 {
+    terminal::enable_raw_mode()?;
+    execute!(stdout, EnterAlternateScreen)?;
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| {
-        frame.render_widget(MonthGrid::new(month), frame.area());
-    })?;
+    let result = run_event_loop(&mut terminal, app);
+    let cleanup_result = restore_terminal(&mut terminal);
+
+    result.and(cleanup_result)
+}
+
+fn run_event_loop<W>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    mut app: AppState,
+) -> io::Result<()>
+where
+    W: Write,
+{
+    let mut keyboard = KeyboardInput::default();
+
+    loop {
+        terminal.draw(|frame| {
+            frame.render_widget(AppView::new(&app), frame.area());
+        })?;
+
+        if app.should_quit() {
+            return Ok(());
+        }
+
+        if let Event::Key(key) = event::read()? {
+            let action = keyboard.translate(key);
+            app.apply(action);
+        }
+    }
+}
+
+fn restore_terminal<W>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Result<()>
+where
+    W: Write,
+{
+    terminal::disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
     Ok(())
 }
 

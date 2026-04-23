@@ -8,7 +8,10 @@ use ratatui::{
 };
 use time::Weekday;
 
-use crate::calendar::{CalendarCell, CalendarMonth, DAYS_PER_WEEK, MONTH_GRID_WEEKS};
+use crate::{
+    app::{AppState, ViewMode},
+    calendar::{CalendarCell, CalendarMonth, DAYS_PER_WEEK, MONTH_GRID_WEEKS},
+};
 
 pub const DEFAULT_RENDER_WIDTH: u16 = 84;
 pub const DEFAULT_RENDER_HEIGHT: u16 = 26;
@@ -35,6 +38,29 @@ impl<'a> MonthGrid<'a> {
 impl Widget for MonthGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         render_month_grid(self.month, area, buf, self.styles);
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct AppView<'a> {
+    app: &'a AppState,
+}
+
+impl<'a> AppView<'a> {
+    pub const fn new(app: &'a AppState) -> Self {
+        Self { app }
+    }
+}
+
+impl Widget for AppView<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        match self.app.view_mode() {
+            ViewMode::Month => {
+                let month = self.app.calendar_month();
+                MonthGrid::new(&month).render(area, buf);
+            }
+            ViewMode::DayPlaceholder => render_day_placeholder(self.app, area, buf),
+        }
     }
 }
 
@@ -206,6 +232,46 @@ fn render_too_small_message(area: Rect, buf: &mut Buffer, styles: MonthGridStyle
             area.width,
             "terminal too small",
             styles.in_month,
+        );
+    }
+}
+
+fn render_day_placeholder(app: &AppState, area: Rect, buf: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let styles = MonthGridStyles::new();
+    buf.set_style(area, Style::default());
+
+    let selected = app.selected_date();
+    let title = format!(
+        "{} {}, {}",
+        selected.month(),
+        selected.day(),
+        selected.year()
+    );
+    write_centered(buf, area.y, area.x, area.width, &title, styles.title);
+
+    if area.height > 2 {
+        write_centered(
+            buf,
+            area.y + 2,
+            area.x,
+            area.width,
+            "No agenda loaded",
+            styles.in_month,
+        );
+    }
+
+    if area.height > 4 {
+        write_centered(
+            buf,
+            area.y + 4,
+            area.x,
+            area.width,
+            "Esc returns to month",
+            styles.filler,
         );
     }
 }
@@ -555,5 +621,23 @@ mod tests {
         assert!(rendered.contains("April 2026"));
         assert!(rendered.contains("Sun"));
         assert!(rendered.contains("[23*]"));
+    }
+
+    #[test]
+    fn app_view_renders_day_placeholder() {
+        let app = {
+            let mut app = AppState::new(date(2026, Month::April, 23));
+            app.apply(crate::app::AppAction::OpenDay);
+            app
+        };
+        let area = Rect::new(0, 0, 49, 10);
+        let mut buffer = Buffer::empty(area);
+
+        AppView::new(&app).render(area, &mut buffer);
+        let rendered = buffer_to_string(&buffer);
+
+        assert!(rendered.contains("April 23, 2026"));
+        assert!(rendered.contains("No agenda loaded"));
+        assert!(!rendered.contains("April 2026"));
     }
 }
