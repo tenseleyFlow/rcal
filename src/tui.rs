@@ -599,7 +599,17 @@ fn render_month_grid(
     render_title(month, &layout, buf, styles);
     render_weekdays(&layout, buf, styles);
 
-    for cell in month.cells().filter(|cell| !cell.is_selected) {
+    for cell in month
+        .cells()
+        .filter(|cell| !cell.is_selected && !cell.is_today)
+    {
+        render_cell(cell, &layout, agenda_source, buf, styles);
+    }
+
+    for cell in month
+        .cells()
+        .filter(|cell| cell.is_today && !cell.is_selected)
+    {
         render_cell(cell, &layout, agenda_source, buf, styles);
     }
 
@@ -629,7 +639,19 @@ fn render_week_grid(
     render_week_title(selected_week, &layout, buf, styles);
     render_weekdays_for_week(&layout, buf, styles);
 
-    for cell in selected_week.cells.iter().filter(|cell| !cell.is_selected) {
+    for cell in selected_week
+        .cells
+        .iter()
+        .filter(|cell| !cell.is_selected && !cell.is_today)
+    {
+        render_week_cell(cell, &layout, agenda_source, buf, styles);
+    }
+
+    for cell in selected_week
+        .cells
+        .iter()
+        .filter(|cell| cell.is_today && !cell.is_selected)
+    {
         render_week_cell(cell, &layout, agenda_source, buf, styles);
     }
 
@@ -1431,6 +1453,16 @@ mod tests {
         calendar::CalendarDate,
     };
 
+    #[derive(Debug, Clone, Copy)]
+    struct ExpectedBorder<'a> {
+        horizontal: &'a str,
+        vertical: &'a str,
+        corner: &'a str,
+        fg: Color,
+        bg: Color,
+        modifier: Modifier,
+    }
+
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
     }
@@ -1454,6 +1486,31 @@ mod tests {
             .cells()
             .find(|cell| cell.is_in_visible_month && cell.date.day() == day)
             .expect("day exists in month")
+    }
+
+    fn assert_cell_perimeter(buffer: &Buffer, rect: Rect, expected: ExpectedBorder<'_>) {
+        let left = rect.left();
+        let right = rect.right().saturating_sub(1);
+        let top = rect.top();
+        let bottom = rect.bottom().saturating_sub(1);
+        let border_points = [
+            ((left, top), expected.corner),
+            ((right, top), expected.corner),
+            ((left, bottom), expected.corner),
+            ((right, bottom), expected.corner),
+            ((left + 1, top), expected.horizontal),
+            ((left + 1, bottom), expected.horizontal),
+            ((left, top + 1), expected.vertical),
+            ((right, top + 1), expected.vertical),
+        ];
+
+        for (position, symbol) in border_points {
+            let cell = buffer.cell(position).expect("border cell exists");
+            assert_eq!(cell.symbol(), symbol);
+            assert_eq!(cell.fg, expected.fg);
+            assert_eq!(cell.bg, expected.bg);
+            assert!(cell.modifier.contains(expected.modifier));
+        }
     }
 
     fn centered(width: usize, text: &str) -> String {
@@ -1540,6 +1597,20 @@ mod tests {
         assert!(today_cell.modifier.contains(Modifier::BOLD));
         assert!(today_cell.modifier.contains(Modifier::DIM));
 
+        let today_rect = layout.cell_rect(today.week_index, today.weekday_index);
+        assert_cell_perimeter(
+            &buffer,
+            today_rect,
+            ExpectedBorder {
+                horizontal: "=",
+                vertical: "!",
+                corner: "+",
+                fg: Color::Yellow,
+                bg: Color::Reset,
+                modifier: Modifier::DIM,
+            },
+        );
+
         let filler_cell = buffer.cell((2, 3)).expect("filler label cell exists");
         assert_eq!(filler_cell.fg, Color::DarkGray);
         assert!(filler_cell.modifier.contains(Modifier::DIM));
@@ -1553,22 +1624,49 @@ mod tests {
         let selected = month.selected_cell().expect("selected cell exists");
         let rect = layout.cell_rect(selected.week_index, selected.weekday_index);
 
-        let top_left = buffer
-            .cell((rect.x, rect.y))
-            .expect("selected border exists");
-        let top_edge = buffer
-            .cell((rect.x + 1, rect.y))
-            .expect("selected border exists");
-        let left_edge = buffer
-            .cell((rect.x, rect.y + 1))
-            .expect("selected border exists");
+        assert_cell_perimeter(
+            &buffer,
+            rect,
+            ExpectedBorder {
+                horizontal: "#",
+                vertical: "#",
+                corner: "#",
+                fg: Color::Cyan,
+                bg: Color::Blue,
+                modifier: Modifier::BOLD,
+            },
+        );
+    }
 
-        assert_eq!(top_left.symbol(), "#");
-        assert_eq!(top_edge.symbol(), "#");
-        assert_eq!(left_edge.symbol(), "#");
-        assert_eq!(top_left.fg, Color::Cyan);
-        assert_eq!(top_left.bg, Color::Blue);
-        assert!(top_left.modifier.contains(Modifier::BOLD));
+    #[test]
+    fn today_week_cell_has_full_focus_perimeter() {
+        let month =
+            CalendarMonth::from_dates(date(2026, Month::April, 20), date(2026, Month::April, 23));
+        let area = Rect::new(0, 0, 84, 8);
+        let mut buffer = Buffer::empty(area);
+        WeekGrid::new(&month).render(area, &mut buffer);
+
+        let layout = WeekGridLayout::new(area).expect("supported week layout");
+        let week = selected_week(&month).expect("selected week exists");
+        let today = week
+            .cells
+            .iter()
+            .find(|cell| cell.is_today)
+            .expect("today cell appears in selected week");
+        let rect = layout.cell_rect(today.weekday_index);
+
+        assert_cell_perimeter(
+            &buffer,
+            rect,
+            ExpectedBorder {
+                horizontal: "=",
+                vertical: "!",
+                corner: "+",
+                fg: Color::Yellow,
+                bg: Color::Reset,
+                modifier: Modifier::DIM,
+            },
+        );
     }
 
     #[test]
