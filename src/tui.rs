@@ -811,7 +811,7 @@ fn render_create_event_modal(
     }
 
     let modal = create_modal_area(area);
-    buf.set_style(modal, styles.panel);
+    fill_rect(buf, modal, styles.panel);
     draw_border(buf, modal, styles.border, BorderCharacters::normal());
 
     let content = inset_rect(modal);
@@ -1585,6 +1585,14 @@ fn set_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
     }
 }
 
+fn fill_rect(buf: &mut Buffer, rect: Rect, style: Style) {
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            set_cell(buf, x, y, " ", style);
+        }
+    }
+}
+
 fn write_centered(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, style: Style) {
     if width == 0 || !buf.area.contains((x, y).into()) {
         return;
@@ -1904,6 +1912,28 @@ mod tests {
         assert!(rendered.contains("Start date"));
         assert!(rendered.contains("Reminder"));
         assert!(rendered.contains("Ctrl-S save"));
+    }
+
+    #[test]
+    fn create_modal_clears_background_content() {
+        let selected = date(2026, Month::April, 23);
+        let mut app = AppState::new(selected);
+        app.apply(AppAction::OpenCreate);
+        let source = agenda_source(
+            vec![timed_event(
+                "behind",
+                "BackdropGhost",
+                at(selected, 9, 0),
+                at(selected, 10, 0),
+            )],
+            Vec::new(),
+        );
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Create"));
+        assert!(!rendered.contains("Backdrop"));
+        assert!(!rendered.contains("Ghost"));
     }
 
     #[test]
