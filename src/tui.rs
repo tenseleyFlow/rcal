@@ -827,10 +827,9 @@ fn render_create_event_modal(
         "Create",
         styles.title,
     );
-    let mut y = content.y.saturating_add(2);
     let label_width = 12.min(content.width.saturating_sub(1));
 
-    for row in form.rows() {
+    for (y, row) in (content.y.saturating_add(2)..).zip(form.rows()) {
         if y >= content.bottom().saturating_sub(2) {
             break;
         }
@@ -852,8 +851,6 @@ fn render_create_event_modal(
             };
             write_left(buf, y, value_x, value_width, &row.value, style);
         }
-
-        y += 1;
     }
 
     if let Some(error) = form.error() {
