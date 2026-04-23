@@ -13,7 +13,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
-    agenda::{AgendaSource, InMemoryAgendaSource},
+    agenda::{AgendaSource, ConfiguredAgendaSource, HolidayProvider},
     app::{AppState, KeyboardInput},
     calendar::CalendarDate,
     tui::{
@@ -22,14 +22,33 @@ use crate::{
     },
 };
 
-const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
+const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub start_date: CalendarDate,
+    pub holiday_source: HolidaySourceConfig,
+    pub holiday_country: String,
+}
+
+impl AppConfig {
+    pub fn new(start_date: CalendarDate) -> Self {
+        Self {
+            start_date,
+            holiday_source: HolidaySourceConfig::UsFederal,
+            holiday_country: "US".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HolidaySourceConfig {
+    Off,
+    UsFederal,
+    Nager,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
     Run(AppConfig),
     Help,
@@ -39,6 +58,12 @@ pub enum CliAction {
 pub enum CliError {
     DuplicateDate,
     MissingDateValue,
+    DuplicateHolidaySource,
+    MissingHolidaySourceValue,
+    InvalidHolidaySource(String),
+    DuplicateHolidayCountry,
+    MissingHolidayCountryValue,
+    InvalidHolidayCountry(String),
     UnknownArgument(String),
     InvalidDate { input: String, reason: String },
 }
@@ -48,6 +73,27 @@ impl fmt::Display for CliError {
         match self {
             Self::DuplicateDate => write!(f, "--date may only be provided once"),
             Self::MissingDateValue => write!(f, "--date requires a value in YYYY-MM-DD format"),
+            Self::DuplicateHolidaySource => write!(f, "--holiday-source may only be provided once"),
+            Self::MissingHolidaySourceValue => write!(
+                f,
+                "--holiday-source requires one of: off, us-federal, nager"
+            ),
+            Self::InvalidHolidaySource(value) => write!(
+                f,
+                "invalid --holiday-source value '{value}'; expected off, us-federal, or nager"
+            ),
+            Self::DuplicateHolidayCountry => {
+                write!(f, "--holiday-country may only be provided once")
+            }
+            Self::MissingHolidayCountryValue => {
+                write!(f, "--holiday-country requires a two-letter country code")
+            }
+            Self::InvalidHolidayCountry(value) => {
+                write!(
+                    f,
+                    "invalid --holiday-country value '{value}'; expected two ASCII letters"
+                )
+            }
             Self::UnknownArgument(arg) => write!(f, "unknown argument: {arg}"),
             Self::InvalidDate { input, reason } => {
                 write!(f, "invalid --date value '{input}': {reason}")
@@ -81,7 +127,7 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
-            let agenda_source = InMemoryAgendaSource::development_fixture();
+            let agenda_source = agenda_source(&config);
             let (width, height) = terminal_size();
             let rendered =
                 render_app_to_string_with_agenda_source(&app, width, height, &agenda_source);
@@ -110,7 +156,7 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
-            let agenda_source = InMemoryAgendaSource::development_fixture();
+            let agenda_source = agenda_source(&config);
             match run_interactive_terminal(stdout, app, &agenda_source) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
@@ -132,6 +178,8 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut start_date = None;
+    let mut holiday_source = None;
+    let mut holiday_country = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -158,12 +206,62 @@ where
             continue;
         }
 
+        if arg == "--holiday-source" {
+            if holiday_source.is_some() {
+                return Err(CliError::DuplicateHolidaySource);
+            }
+
+            let value = args.next().ok_or(CliError::MissingHolidaySourceValue)?;
+            holiday_source = Some(parse_holiday_source_arg(&value)?);
+            continue;
+        }
+
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--holiday-source="))
+        {
+            if holiday_source.is_some() {
+                return Err(CliError::DuplicateHolidaySource);
+            }
+
+            holiday_source = Some(parse_holiday_source_str(value)?);
+            continue;
+        }
+
+        if arg == "--holiday-country" {
+            if holiday_country.is_some() {
+                return Err(CliError::DuplicateHolidayCountry);
+            }
+
+            let value = args.next().ok_or(CliError::MissingHolidayCountryValue)?;
+            holiday_country = Some(parse_holiday_country_arg(&value)?);
+            continue;
+        }
+
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--holiday-country="))
+        {
+            if holiday_country.is_some() {
+                return Err(CliError::DuplicateHolidayCountry);
+            }
+
+            holiday_country = Some(parse_holiday_country_str(value)?);
+            continue;
+        }
+
         return Err(CliError::UnknownArgument(display_arg(&arg)));
     }
 
-    Ok(CliAction::Run(AppConfig {
-        start_date: CalendarDate::from(start_date.unwrap_or(today)),
-    }))
+    let mut config = AppConfig::new(CalendarDate::from(start_date.unwrap_or(today)));
+    if let Some(holiday_source) = holiday_source {
+        config.holiday_source = holiday_source;
+    }
+    if let Some(holiday_country) = holiday_country {
+        config.holiday_country = holiday_country;
+    }
+
+    Ok(CliAction::Run(config))
 }
 
 fn default_start_date() -> Date {
@@ -177,6 +275,16 @@ fn terminal_size() -> (u16, u16) {
         .ok()
         .filter(|(width, height)| *width > 0 && *height > 0)
         .unwrap_or((DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT))
+}
+
+fn agenda_source(config: &AppConfig) -> ConfiguredAgendaSource {
+    let holidays = match config.holiday_source {
+        HolidaySourceConfig::Off => HolidayProvider::off(),
+        HolidaySourceConfig::UsFederal => HolidayProvider::us_federal(),
+        HolidaySourceConfig::Nager => HolidayProvider::nager(config.holiday_country.clone()),
+    };
+
+    ConfiguredAgendaSource::development(holidays)
 }
 
 fn run_interactive_terminal<W, S>(mut stdout: W, app: AppState, agenda_source: &S) -> io::Result<()>
@@ -248,6 +356,39 @@ fn parse_date_arg(value: &OsStr) -> Result<Date, CliError> {
     parse_date_str(value)
 }
 
+fn parse_holiday_source_arg(value: &OsStr) -> Result<HolidaySourceConfig, CliError> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError::InvalidHolidaySource("value must be valid UTF-8".to_string()))?;
+
+    parse_holiday_source_str(value)
+}
+
+fn parse_holiday_source_str(value: &str) -> Result<HolidaySourceConfig, CliError> {
+    match value {
+        "off" => Ok(HolidaySourceConfig::Off),
+        "us-federal" => Ok(HolidaySourceConfig::UsFederal),
+        "nager" => Ok(HolidaySourceConfig::Nager),
+        _ => Err(CliError::InvalidHolidaySource(value.to_string())),
+    }
+}
+
+fn parse_holiday_country_arg(value: &OsStr) -> Result<String, CliError> {
+    let value = value
+        .to_str()
+        .ok_or_else(|| CliError::InvalidHolidayCountry("value must be valid UTF-8".to_string()))?;
+
+    parse_holiday_country_str(value)
+}
+
+fn parse_holiday_country_str(value: &str) -> Result<String, CliError> {
+    if value.len() == 2 && value.bytes().all(|value| value.is_ascii_alphabetic()) {
+        Ok(value.to_ascii_uppercase())
+    } else {
+        Err(CliError::InvalidHolidayCountry(value.to_string()))
+    }
+}
+
 fn parse_date_str(value: &str) -> Result<Date, CliError> {
     let format =
         format_description::parse("[year]-[month]-[day]").map_err(|err| CliError::InvalidDate {
@@ -290,7 +431,7 @@ mod tests {
 
         let action = parse_args([], today.into()).expect("parse succeeds");
 
-        assert_eq!(action, CliAction::Run(AppConfig { start_date: today }));
+        assert_eq!(action, CliAction::Run(AppConfig::new(today)));
     }
 
     #[test]
@@ -302,9 +443,7 @@ mod tests {
 
         assert_eq!(
             action,
-            CliAction::Run(AppConfig {
-                start_date: date(2027, Month::January, 2)
-            })
+            CliAction::Run(AppConfig::new(date(2027, Month::January, 2)))
         );
     }
 
@@ -316,9 +455,64 @@ mod tests {
 
         assert_eq!(
             action,
+            CliAction::Run(AppConfig::new(date(2027, Month::January, 2)))
+        );
+    }
+
+    #[test]
+    fn holiday_source_flag_sets_provider() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args([arg("--holiday-source"), arg("off")], today.into())
+            .expect("parse succeeds");
+
+        assert_eq!(
+            action,
             CliAction::Run(AppConfig {
-                start_date: date(2027, Month::January, 2)
+                start_date: today,
+                holiday_source: HolidaySourceConfig::Off,
+                holiday_country: "US".to_string(),
             })
+        );
+    }
+
+    #[test]
+    fn nager_holiday_source_accepts_country_code() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [
+                arg("--holiday-source=nager"),
+                arg("--holiday-country"),
+                arg("gb"),
+            ],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Run(AppConfig {
+                start_date: today,
+                holiday_source: HolidaySourceConfig::Nager,
+                holiday_country: "GB".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_holiday_options_are_rejected() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_args([arg("--holiday-source"), arg("network")], today.into())
+                .expect_err("invalid source fails"),
+            CliError::InvalidHolidaySource("network".to_string())
+        );
+        assert_eq!(
+            parse_args([arg("--holiday-country"), arg("USA")], today.into())
+                .expect_err("invalid country fails"),
+            CliError::InvalidHolidayCountry("USA".to_string())
         );
     }
 

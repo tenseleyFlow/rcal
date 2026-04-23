@@ -43,6 +43,6 @@ fn help_flag_succeeds() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        "Usage: rcal [--date YYYY-MM-DD]\n"
+        "Usage: rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n"
     );
 }

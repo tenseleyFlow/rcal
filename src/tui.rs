@@ -1629,7 +1629,13 @@ mod tests {
             app.apply(AppAction::OpenDay);
             app
         };
-        let source = InMemoryAgendaSource::development_fixture();
+        let mut source = InMemoryAgendaSource::development_fixture();
+        source.push_holiday(Holiday::new(
+            "earth-day",
+            "Earth Day",
+            date(2026, Month::April, 23),
+            source_metadata(),
+        ));
         let rendered = render_app_to_string_with_agenda_source(&app, 84, 16, &source);
 
         assert!(rendered.contains("1 holidays | 4 events | Esc returns to month"));
