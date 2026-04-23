@@ -147,6 +147,7 @@ fn io_error_exit(stderr: &mut impl Write, err: io::Error) -> std::process::ExitC
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calendar::CalendarMonth;
     use time::Month;
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
@@ -230,5 +231,25 @@ mod tests {
         .expect_err("duplicate dates fail");
 
         assert_eq!(err, CliError::DuplicateDate);
+    }
+
+    #[test]
+    fn date_flag_seeds_calendar_month_selection() {
+        let today = date(2026, Month::April, 23);
+
+        let action =
+            parse_args([arg("--date"), arg("2027-01-02")], today.into()).expect("parse succeeds");
+        let CliAction::Run(config) = action else {
+            panic!("date flag should produce run config");
+        };
+
+        let month = CalendarMonth::for_launch_date(config.start_date);
+
+        assert_eq!(month.current.year, 2027);
+        assert_eq!(month.current.month, Month::January);
+        assert_eq!(
+            month.selected_cell().map(|cell| cell.date),
+            Some(date(2027, Month::January, 2))
+        );
     }
 }
