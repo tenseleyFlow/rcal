@@ -6,11 +6,13 @@ use std::{
 
 use time::{Date, OffsetDateTime, format_description};
 
+use crate::calendar::CalendarDate;
+
 const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppConfig {
-    pub start_date: Date,
+    pub start_date: CalendarDate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,14 +51,12 @@ where
     E: Write,
 {
     match parse_args(args, default_start_date()) {
-        Ok(CliAction::Run(config)) => match writeln!(
-            stdout,
-            "rcal will open focused on {}",
-            format_date(config.start_date)
-        ) {
-            Ok(()) => std::process::ExitCode::SUCCESS,
-            Err(err) => io_error_exit(&mut stderr, err),
-        },
+        Ok(CliAction::Run(config)) => {
+            match writeln!(stdout, "rcal will open focused on {}", config.start_date) {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(err) => io_error_exit(&mut stderr, err),
+            }
+        }
         Ok(CliAction::Help) => match write!(stdout, "{USAGE}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -103,17 +103,8 @@ where
     }
 
     Ok(CliAction::Run(AppConfig {
-        start_date: start_date.unwrap_or(today),
+        start_date: CalendarDate::from(start_date.unwrap_or(today)),
     }))
-}
-
-pub fn format_date(date: Date) -> String {
-    format!(
-        "{:04}-{:02}-{:02}",
-        date.year(),
-        u8::from(date.month()),
-        date.day()
-    )
 }
 
 fn default_start_date() -> Date {
@@ -158,8 +149,8 @@ mod tests {
     use super::*;
     use time::Month;
 
-    fn date(year: i32, month: Month, day: u8) -> Date {
-        Date::from_calendar_date(year, month, day).expect("valid test date")
+    fn date(year: i32, month: Month, day: u8) -> CalendarDate {
+        CalendarDate::from_ymd(year, month, day).expect("valid test date")
     }
 
     fn arg(value: &str) -> OsString {
@@ -170,7 +161,7 @@ mod tests {
     fn no_args_uses_provided_today() {
         let today = date(2026, Month::April, 23);
 
-        let action = parse_args([], today).expect("parse succeeds");
+        let action = parse_args([], today.into()).expect("parse succeeds");
 
         assert_eq!(action, CliAction::Run(AppConfig { start_date: today }));
     }
@@ -179,7 +170,8 @@ mod tests {
     fn date_flag_sets_start_date() {
         let today = date(2026, Month::April, 23);
 
-        let action = parse_args([arg("--date"), arg("2027-01-02")], today).expect("parse succeeds");
+        let action =
+            parse_args([arg("--date"), arg("2027-01-02")], today.into()).expect("parse succeeds");
 
         assert_eq!(
             action,
@@ -193,7 +185,7 @@ mod tests {
     fn date_equals_form_sets_start_date() {
         let today = date(2026, Month::April, 23);
 
-        let action = parse_args([arg("--date=2027-01-02")], today).expect("parse succeeds");
+        let action = parse_args([arg("--date=2027-01-02")], today.into()).expect("parse succeeds");
 
         assert_eq!(
             action,
@@ -207,8 +199,8 @@ mod tests {
     fn invalid_date_is_rejected() {
         let today = date(2026, Month::April, 23);
 
-        let err =
-            parse_args([arg("--date"), arg("2026-02-30")], today).expect_err("invalid dates fail");
+        let err = parse_args([arg("--date"), arg("2026-02-30")], today.into())
+            .expect_err("invalid dates fail");
 
         assert!(matches!(err, CliError::InvalidDate { .. }));
     }
@@ -217,7 +209,7 @@ mod tests {
     fn missing_date_value_is_rejected() {
         let today = date(2026, Month::April, 23);
 
-        let err = parse_args([arg("--date")], today).expect_err("missing values fail");
+        let err = parse_args([arg("--date")], today.into()).expect_err("missing values fail");
 
         assert_eq!(err, CliError::MissingDateValue);
     }
@@ -233,7 +225,7 @@ mod tests {
                 arg("--date"),
                 arg("2026-04-24"),
             ],
-            today,
+            today.into(),
         )
         .expect_err("duplicate dates fail");
 
