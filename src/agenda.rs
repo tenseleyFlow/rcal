@@ -3,12 +3,12 @@ use std::{
     collections::{HashMap, HashSet},
     env,
     error::Error,
-    fmt, fs,
-    path::PathBuf,
-    time::Duration,
+    fmt, fs, io,
+    path::{Path, PathBuf},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use time::{Month, Time, Weekday};
 
 use crate::calendar::CalendarDate;
@@ -96,6 +96,21 @@ impl SourceMetadata {
     pub fn fixture() -> Self {
         Self::new("fixture", "In-memory fixture")
     }
+
+    pub fn local() -> Self {
+        Self::new("local", "Local events")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Reminder {
+    pub minutes_before: u16,
+}
+
+impl Reminder {
+    pub const fn minutes_before(minutes_before: u16) -> Self {
+        Self { minutes_before }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +145,9 @@ impl EventTiming {
 pub struct Event {
     pub id: String,
     pub title: String,
+    pub location: Option<String>,
     pub notes: Option<String>,
+    pub reminders: Vec<Reminder>,
     pub source: SourceMetadata,
     pub timing: EventTiming,
 }
@@ -145,7 +162,9 @@ impl Event {
         Self {
             id: id.into(),
             title: title.into(),
+            location: None,
             notes: None,
+            reminders: Vec::new(),
             source,
             timing: EventTiming::AllDay { date },
         }
@@ -165,14 +184,26 @@ impl Event {
         Ok(Self {
             id: id.into(),
             title: title.into(),
+            location: None,
             notes: None,
+            reminders: Vec::new(),
             source,
             timing: EventTiming::Timed { start, end },
         })
     }
 
+    pub fn with_location(mut self, location: impl Into<String>) -> Self {
+        self.location = Some(location.into());
+        self
+    }
+
     pub fn with_notes(mut self, notes: impl Into<String>) -> Self {
         self.notes = Some(notes.into());
+        self
+    }
+
+    pub fn with_reminders(mut self, reminders: Vec<Reminder>) -> Self {
+        self.reminders = reminders;
         self
     }
 
@@ -195,6 +226,43 @@ impl Event {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateEventDraft {
+    pub title: String,
+    pub timing: CreateEventTiming,
+    pub location: Option<String>,
+    pub notes: Option<String>,
+    pub reminders: Vec<Reminder>,
+}
+
+impl CreateEventDraft {
+    pub fn into_event(self, id: String) -> Result<Event, AgendaError> {
+        let source = SourceMetadata::local().with_external_id(id.clone());
+        let mut event = match self.timing {
+            CreateEventTiming::AllDay { date } => Event::all_day(id, self.title, date, source),
+            CreateEventTiming::Timed { start, end } => {
+                Event::timed(id, self.title, start, end, source)?
+            }
+        };
+
+        event.location = self.location;
+        event.notes = self.notes;
+        event.reminders = self.reminders;
+        Ok(event)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateEventTiming {
+    AllDay {
+        date: CalendarDate,
+    },
+    Timed {
+        start: EventDateTime,
+        end: EventDateTime,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,18 +397,64 @@ pub trait AgendaSource {
 pub struct ConfiguredAgendaSource {
     events: InMemoryAgendaSource,
     holidays: HolidayProvider,
+    events_file: Option<PathBuf>,
 }
 
 impl ConfiguredAgendaSource {
     pub fn development(holidays: HolidayProvider) -> Self {
-        Self {
-            events: InMemoryAgendaSource::development_fixture(),
-            holidays,
-        }
+        Self::new(InMemoryAgendaSource::new(), holidays)
     }
 
     pub fn new(events: InMemoryAgendaSource, holidays: HolidayProvider) -> Self {
-        Self { events, holidays }
+        Self {
+            events,
+            holidays,
+            events_file: None,
+        }
+    }
+
+    pub fn from_events_file(
+        events_file: impl Into<PathBuf>,
+        holidays: HolidayProvider,
+    ) -> Result<Self, LocalEventStoreError> {
+        let events_file = events_file.into();
+        let events = load_events_file(&events_file)?;
+        Ok(Self {
+            events,
+            holidays,
+            events_file: Some(events_file),
+        })
+    }
+
+    pub fn create_event(&mut self, draft: CreateEventDraft) -> Result<Event, LocalEventStoreError> {
+        let id = self.next_local_event_id(&draft.title);
+        let event = draft
+            .into_event(id)
+            .map_err(|err| LocalEventStoreError::Encode {
+                path: self.events_file.clone(),
+                reason: err.to_string(),
+            })?;
+        if let Some(path) = &self.events_file {
+            let mut events = self.events.events().to_vec();
+            events.push(event.clone());
+            write_events_file(path, &events)?;
+        }
+        self.events.push_event(event.clone());
+        Ok(event)
+    }
+
+    fn next_local_event_id(&self, title: &str) -> String {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let counter = self.events.events().len() + 1;
+        let slug = slugify(title);
+        if slug.is_empty() {
+            format!("local-{now}-{counter}")
+        } else {
+            format!("local-{now}-{counter}-{slug}")
+        }
     }
 }
 
@@ -567,6 +681,10 @@ impl InMemoryAgendaSource {
         self.events.push(event);
     }
 
+    pub fn events(&self) -> &[Event] {
+        &self.events
+    }
+
     pub fn push_holiday(&mut self, holiday: Holiday) {
         self.holidays.push(holiday);
     }
@@ -624,6 +742,328 @@ impl AgendaSource for InMemoryAgendaSource {
             .cloned()
             .collect()
     }
+}
+
+pub fn default_events_file() -> PathBuf {
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME") {
+        return PathBuf::from(data_home).join("rcal").join("events.json");
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("rcal")
+            .join("events.json");
+    }
+
+    env::temp_dir().join("rcal").join("events.json")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalEventStoreError {
+    Read {
+        path: PathBuf,
+        reason: String,
+    },
+    Parse {
+        path: PathBuf,
+        reason: String,
+    },
+    UnsupportedVersion {
+        path: PathBuf,
+        version: u8,
+    },
+    Encode {
+        path: Option<PathBuf>,
+        reason: String,
+    },
+    Write {
+        path: PathBuf,
+        reason: String,
+    },
+}
+
+impl fmt::Display for LocalEventStoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, reason } => {
+                write!(f, "failed to read {}: {reason}", path.display())
+            }
+            Self::Parse { path, reason } => {
+                write!(f, "failed to parse {}: {reason}", path.display())
+            }
+            Self::UnsupportedVersion { path, version } => write!(
+                f,
+                "unsupported local events file version {version} in {}",
+                path.display()
+            ),
+            Self::Encode { path, reason } => {
+                if let Some(path) = path {
+                    write!(f, "failed to encode {}: {reason}", path.display())
+                } else {
+                    write!(f, "failed to encode local event: {reason}")
+                }
+            }
+            Self::Write { path, reason } => {
+                write!(f, "failed to write {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
+impl Error for LocalEventStoreError {}
+
+fn load_events_file(path: &Path) -> Result<InMemoryAgendaSource, LocalEventStoreError> {
+    let body = match fs::read_to_string(path) {
+        Ok(body) => body,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(InMemoryAgendaSource::new());
+        }
+        Err(err) => {
+            return Err(LocalEventStoreError::Read {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            });
+        }
+    };
+
+    let file = serde_json::from_str::<LocalEventsFile>(&body).map_err(|err| {
+        LocalEventStoreError::Parse {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        }
+    })?;
+
+    if file.version != LOCAL_EVENTS_VERSION {
+        return Err(LocalEventStoreError::UnsupportedVersion {
+            path: path.to_path_buf(),
+            version: file.version,
+        });
+    }
+
+    let events = file
+        .events
+        .into_iter()
+        .map(|record| record.into_event(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(InMemoryAgendaSource::with_events_and_holidays(
+        events,
+        Vec::new(),
+    ))
+}
+
+fn write_events_file(path: &Path, events: &[Event]) -> Result<(), LocalEventStoreError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| LocalEventStoreError::Write {
+            path: parent.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+    }
+
+    let file = LocalEventsFile {
+        version: LOCAL_EVENTS_VERSION,
+        events: events.iter().map(LocalEventRecord::from_event).collect(),
+    };
+    let body = serde_json::to_string_pretty(&file).map_err(|err| LocalEventStoreError::Encode {
+        path: Some(path.to_path_buf()),
+        reason: err.to_string(),
+    })?;
+    let temp_path = path.with_extension(format!(
+        "{}.tmp",
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("json")
+    ));
+
+    fs::write(&temp_path, body).map_err(|err| LocalEventStoreError::Write {
+        path: temp_path.clone(),
+        reason: err.to_string(),
+    })?;
+    fs::rename(&temp_path, path).map_err(|err| LocalEventStoreError::Write {
+        path: path.to_path_buf(),
+        reason: err.to_string(),
+    })
+}
+
+const LOCAL_EVENTS_VERSION: u8 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalEventsFile {
+    version: u8,
+    #[serde(default)]
+    events: Vec<LocalEventRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum LocalEventRecord {
+    Timed {
+        id: String,
+        title: String,
+        start_date: String,
+        start_time: String,
+        end_date: String,
+        end_time: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reminders_minutes_before: Vec<u16>,
+    },
+    AllDay {
+        id: String,
+        title: String,
+        date: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reminders_minutes_before: Vec<u16>,
+    },
+}
+
+impl LocalEventRecord {
+    fn from_event(event: &Event) -> Self {
+        let reminders_minutes_before = event
+            .reminders
+            .iter()
+            .map(|reminder| reminder.minutes_before)
+            .collect::<Vec<_>>();
+
+        match event.timing {
+            EventTiming::AllDay { date } => Self::AllDay {
+                id: event.id.clone(),
+                title: event.title.clone(),
+                date: date.to_string(),
+                location: event.location.clone(),
+                notes: event.notes.clone(),
+                reminders_minutes_before,
+            },
+            EventTiming::Timed { start, end } => Self::Timed {
+                id: event.id.clone(),
+                title: event.title.clone(),
+                start_date: start.date.to_string(),
+                start_time: format_time(start.time),
+                end_date: end.date.to_string(),
+                end_time: format_time(end.time),
+                location: event.location.clone(),
+                notes: event.notes.clone(),
+                reminders_minutes_before,
+            },
+        }
+    }
+
+    fn into_event(self, path: &Path) -> Result<Event, LocalEventStoreError> {
+        match self {
+            Self::Timed {
+                id,
+                title,
+                start_date,
+                start_time,
+                end_date,
+                end_time,
+                location,
+                notes,
+                reminders_minutes_before,
+            } => {
+                let start = EventDateTime::new(
+                    parse_local_date(&start_date, path)?,
+                    parse_local_time(&start_time, path)?,
+                );
+                let end = EventDateTime::new(
+                    parse_local_date(&end_date, path)?,
+                    parse_local_time(&end_time, path)?,
+                );
+                let mut event = Event::timed(
+                    id.clone(),
+                    title,
+                    start,
+                    end,
+                    SourceMetadata::local().with_external_id(id),
+                )
+                .map_err(|err| LocalEventStoreError::Parse {
+                    path: path.to_path_buf(),
+                    reason: err.to_string(),
+                })?;
+                event.location = empty_to_none(location);
+                event.notes = empty_to_none(notes);
+                event.reminders = reminders_from_minutes(reminders_minutes_before);
+                Ok(event)
+            }
+            Self::AllDay {
+                id,
+                title,
+                date,
+                location,
+                notes,
+                reminders_minutes_before,
+            } => {
+                let mut event = Event::all_day(
+                    id.clone(),
+                    title,
+                    parse_local_date(&date, path)?,
+                    SourceMetadata::local().with_external_id(id),
+                );
+                event.location = empty_to_none(location);
+                event.notes = empty_to_none(notes);
+                event.reminders = reminders_from_minutes(reminders_minutes_before);
+                Ok(event)
+            }
+        }
+    }
+}
+
+fn reminders_from_minutes(minutes: Vec<u16>) -> Vec<Reminder> {
+    let mut reminders = minutes
+        .into_iter()
+        .map(Reminder::minutes_before)
+        .collect::<Vec<_>>();
+    reminders.sort();
+    reminders.dedup();
+    reminders
+}
+
+fn empty_to_none(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn parse_local_date(value: &str, path: &Path) -> Result<CalendarDate, LocalEventStoreError> {
+    parse_iso_date(value).ok_or_else(|| LocalEventStoreError::Parse {
+        path: path.to_path_buf(),
+        reason: format!("invalid date '{value}'"),
+    })
+}
+
+fn parse_local_time(value: &str, path: &Path) -> Result<Time, LocalEventStoreError> {
+    parse_hhmm_time(value).ok_or_else(|| LocalEventStoreError::Parse {
+        path: path.to_path_buf(),
+        reason: format!("invalid time '{value}'"),
+    })
+}
+
+fn parse_hhmm_time(value: &str) -> Option<Time> {
+    let mut parts = value.split(':');
+    let hour = parts.next()?.parse::<u8>().ok()?;
+    let minute = parts.next()?.parse::<u8>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    Time::from_hms(hour, minute, 0).ok()
+}
+
+fn format_time(time: Time) -> String {
+    format!("{:02}:{:02}", time.hour(), time.minute())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -971,6 +1411,13 @@ mod tests {
         SourceMetadata::fixture()
     }
 
+    fn temp_events_path(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("rcal-local-events-test-{}", std::process::id()))
+            .join(name)
+            .join("events.json")
+    }
+
     fn timed(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
         Event::timed(id, title, start, end, source()).expect("valid timed event")
     }
@@ -1157,6 +1604,97 @@ mod tests {
 
         assert!(DateRange::new(day, day).is_err());
         assert!(Event::timed("bad", "Bad", at(day, 9, 0), at(day, 9, 0), source()).is_err());
+    }
+
+    #[test]
+    fn local_event_store_loads_missing_file_as_empty() {
+        let path = temp_events_path("missing");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+
+        let source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+
+        assert!(
+            source
+                .events_intersecting(DateRange::day(date(23)))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn local_event_store_saves_and_loads_timed_and_all_day_events() {
+        let path = temp_events_path("save-load");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+
+        source
+            .create_event(CreateEventDraft {
+                title: "Planning".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 10, 0),
+                },
+                location: Some("War room".to_string()),
+                notes: Some("Bring notes".to_string()),
+                reminders: vec![Reminder::minutes_before(10), Reminder::minutes_before(60)],
+            })
+            .expect("timed event saves");
+        source
+            .create_event(CreateEventDraft {
+                title: "Release day".to_string(),
+                timing: CreateEventTiming::AllDay { date: day },
+                location: None,
+                notes: None,
+                reminders: vec![Reminder::minutes_before(24 * 60)],
+            })
+            .expect("all-day event saves");
+
+        let body = std::fs::read_to_string(&path).expect("event file exists");
+        assert!(body.contains(r#""version": 1"#));
+        assert!(body.contains(r#""reminders_minutes_before""#));
+
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day, &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_eq!(agenda.all_day_events.len(), 1);
+        assert_eq!(agenda.all_day_events[0].title, "Release day");
+        assert_eq!(agenda.timed_events.len(), 1);
+        assert_eq!(agenda.timed_events[0].event.title, "Planning");
+        assert_eq!(
+            agenda.timed_events[0].event.location.as_deref(),
+            Some("War room")
+        );
+        assert_eq!(
+            agenda.timed_events[0]
+                .event
+                .reminders
+                .iter()
+                .map(|reminder| reminder.minutes_before)
+                .collect::<Vec<_>>(),
+            [10, 60]
+        );
+    }
+
+    #[test]
+    fn local_event_store_rejects_malformed_json() {
+        let path = temp_events_path("malformed");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        std::fs::create_dir_all(path.parent().expect("path has parent"))
+            .expect("parent can be created");
+        std::fs::write(&path, "{not json").expect("file can be written");
+
+        let err = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect_err("malformed file fails");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert!(matches!(err, LocalEventStoreError::Parse { .. }));
+        assert!(err.to_string().contains("failed to parse"));
     }
 
     #[test]

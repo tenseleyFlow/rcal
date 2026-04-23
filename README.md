@@ -6,7 +6,7 @@ built in Rust with `ratatui`, `crossterm`, and the `time` crate.
 This first milestone is meant for local daily trial use. It opens on the
 current month, keeps keyboard navigation fast, falls back to week or day views
 when terminal space is tight, and shows agenda previews from the current local
-fixture plus holiday sources.
+events file plus holiday sources.
 
 ## Install
 
@@ -25,12 +25,15 @@ cargo run -- --date 2026-04-23
 ## Usage
 
 ```sh
-rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]
+rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]
 ```
 
 Options:
 
 - `--date YYYY-MM-DD`: open with a deterministic selected date.
+- `--events-file PATH`: read and write local user-created events at `PATH`.
+  By default, rcal uses `$XDG_DATA_HOME/rcal/events.json`,
+  `$HOME/.local/share/rcal/events.json`, or a temp fallback.
 - `--holiday-source us-federal`: use offline U.S. federal holidays. This is the
   default.
 - `--holiday-source off`: disable holiday rendering.
@@ -46,6 +49,7 @@ access.
 ## Controls
 
 - Arrow keys move the selected date.
+- `+` opens the Create event modal.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.
 - `q` exits.
@@ -59,6 +63,11 @@ access.
 - Left click selects a visible date; left click the selected date again to open
   day view.
 
+Created events are stored locally as JSON and are shown immediately in month,
+week, and day views. The create modal supports timed events, single-day all-day
+events, location, notes, and multiple reminder offsets; reminder notifications
+are not delivered yet.
+
 ## Layout
 
 `rcal` tries to render the full month first. If the terminal is too constrained,
@@ -69,8 +78,8 @@ back to a focused day summary.
 
 - Real account integrations for Outlook, Google Calendar, Exchange, and similar
   providers are not implemented yet.
-- Event editing and persistent user event storage are deferred.
-- The current event data is an in-memory development fixture.
+- Editing or deleting existing events is not implemented yet.
+- Reminder offsets are stored but do not trigger notifications yet.
 - Packaging is currently source-based through Cargo.
 
 ## Development

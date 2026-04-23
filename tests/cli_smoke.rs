@@ -71,3 +71,76 @@ fn holiday_country_without_nager_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--holiday-country may only be used with --holiday-source nager"));
 }
+
+#[test]
+fn events_file_renders_local_event() {
+    let path = std::env::temp_dir().join(format!(
+        "rcal-cli-events-{}-{}.json",
+        std::process::id(),
+        "render"
+    ));
+    std::fs::write(
+        &path,
+        r#"{
+  "version": 1,
+  "events": [
+    {
+      "id": "local-test",
+      "title": "Planning",
+      "start_date": "2026-04-23",
+      "start_time": "09:00",
+      "end_date": "2026-04-23",
+      "end_time": "10:00",
+      "location": "War room",
+      "notes": "Bring notes",
+      "reminders_minutes_before": [10, 60]
+    }
+  ]
+}"#,
+    )
+    .expect("events file can be written");
+
+    let output = rcal()
+        .args([
+            "--date",
+            "2026-04-23",
+            "--events-file",
+            path.to_str().expect("temp path is utf-8"),
+        ])
+        .output()
+        .expect("rcal binary runs");
+
+    let _ = std::fs::remove_file(path);
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("09:00 Plan"));
+}
+
+#[test]
+fn malformed_events_file_fails_cleanly() {
+    let path = std::env::temp_dir().join(format!(
+        "rcal-cli-events-{}-{}.json",
+        std::process::id(),
+        "malformed"
+    ));
+    std::fs::write(&path, "{not json").expect("events file can be written");
+
+    let output = rcal()
+        .args([
+            "--date",
+            "2026-04-23",
+            "--events-file",
+            path.to_str().expect("temp path is utf-8"),
+        ])
+        .output()
+        .expect("rcal binary runs");
+
+    let _ = std::fs::remove_file(path);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to load local events"));
+    assert!(stderr.contains("failed to parse"));
+}

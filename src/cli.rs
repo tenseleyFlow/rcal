@@ -2,6 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     io::{self, IsTerminal, Write},
+    path::PathBuf,
     time::Duration,
 };
 
@@ -14,8 +15,8 @@ use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
-    agenda::{AgendaSource, ConfiguredAgendaSource, HolidayProvider},
-    app::{AppState, KeyboardInput, MouseInput},
+    agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
+    app::{AppState, CreateEventInputResult, KeyboardInput, MouseInput},
     calendar::CalendarDate,
     tui::{
         AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
@@ -28,9 +29,10 @@ const HELP: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\n\n",
     "Usage:\n",
-    "  rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n\n",
+    "  rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n\n",
     "Options:\n",
     "  --date YYYY-MM-DD                   Open with the given date selected.\n",
+    "  --events-file PATH                  Read and write local user events at PATH.\n",
     "  --holiday-source off|us-federal|nager\n",
     "                                      Choose holiday data. Default: us-federal.\n",
     "  --holiday-country CC                Country code for --holiday-source nager. Default: US.\n",
@@ -38,13 +40,14 @@ const HELP: &str = concat!(
     "  -V, --version                       Show version.\n\n",
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
+    "  + opens the Create event modal.\n",
     "  In day view, Left/Right move to the previous or next day.\n",
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
     "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",
     "  Left click selects a visible date; left click the selected date again to open day view.\n\n",
     "Notes:\n",
-    "  Real calendar-account integration and event editing are not in this milestone.\n",
+    "  Real calendar-account integration, editing, deletion, and reminder notifications are not in this milestone.\n",
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -53,6 +56,7 @@ const DIGIT_JUMP_TIMEOUT: Duration = Duration::from_millis(900);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
     pub start_date: CalendarDate,
+    pub events_file: PathBuf,
     pub holiday_source: HolidaySourceConfig,
     pub holiday_country: String,
 }
@@ -61,6 +65,7 @@ impl AppConfig {
     pub fn new(start_date: CalendarDate) -> Self {
         Self {
             start_date,
+            events_file: default_events_file(),
             holiday_source: HolidaySourceConfig::UsFederal,
             holiday_country: "US".to_string(),
         }
@@ -85,6 +90,8 @@ pub enum CliAction {
 pub enum CliError {
     DuplicateDate,
     MissingDateValue,
+    DuplicateEventsFile,
+    MissingEventsFileValue,
     DuplicateHolidaySource,
     MissingHolidaySourceValue,
     InvalidHolidaySource(String),
@@ -101,6 +108,8 @@ impl fmt::Display for CliError {
         match self {
             Self::DuplicateDate => write!(f, "--date may only be provided once"),
             Self::MissingDateValue => write!(f, "--date requires a value in YYYY-MM-DD format"),
+            Self::DuplicateEventsFile => write!(f, "--events-file may only be provided once"),
+            Self::MissingEventsFileValue => write!(f, "--events-file requires a path"),
             Self::DuplicateHolidaySource => write!(f, "--holiday-source may only be provided once"),
             Self::MissingHolidaySourceValue => write!(
                 f,
@@ -161,7 +170,10 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
-            let agenda_source = agenda_source(&config);
+            let agenda_source = match agenda_source(&config) {
+                Ok(source) => source,
+                Err(err) => return local_event_error_exit(&mut stderr, err),
+            };
             let (width, height) = terminal_size();
             let rendered =
                 render_app_to_string_with_agenda_source(&app, width, height, &agenda_source);
@@ -194,8 +206,11 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
-            let agenda_source = agenda_source(&config);
-            match run_interactive_terminal(stdout, app, &agenda_source) {
+            let agenda_source = match agenda_source(&config) {
+                Ok(source) => source,
+                Err(err) => return local_event_error_exit(&mut stderr, err),
+            };
+            match run_interactive_terminal(stdout, app, agenda_source) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
@@ -220,6 +235,7 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut start_date = None;
+    let mut events_file = None;
     let mut holiday_source = None;
     let mut holiday_country = None;
     let mut args = args.into_iter();
@@ -249,6 +265,28 @@ where
             }
 
             start_date = Some(parse_date_str(value)?);
+            continue;
+        }
+
+        if arg == "--events-file" {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+
+            let value = args.next().ok_or(CliError::MissingEventsFileValue)?;
+            events_file = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--events-file="))
+        {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+
+            events_file = Some(PathBuf::from(value));
             continue;
         }
 
@@ -301,6 +339,9 @@ where
 
     let holiday_country_was_provided = holiday_country.is_some();
     let mut config = AppConfig::new(CalendarDate::from(start_date.unwrap_or(today)));
+    if let Some(events_file) = events_file {
+        config.events_file = events_file;
+    }
     if let Some(holiday_source) = holiday_source {
         config.holiday_source = holiday_source;
     }
@@ -327,20 +368,23 @@ fn terminal_size() -> (u16, u16) {
         .unwrap_or((DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT))
 }
 
-fn agenda_source(config: &AppConfig) -> ConfiguredAgendaSource {
+fn agenda_source(config: &AppConfig) -> Result<ConfiguredAgendaSource, LocalEventStoreError> {
     let holidays = match config.holiday_source {
         HolidaySourceConfig::Off => HolidayProvider::off(),
         HolidaySourceConfig::UsFederal => HolidayProvider::us_federal(),
         HolidaySourceConfig::Nager => HolidayProvider::nager(config.holiday_country.clone()),
     };
 
-    ConfiguredAgendaSource::development(holidays)
+    ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays)
 }
 
-fn run_interactive_terminal<W, S>(stdout: W, app: AppState, agenda_source: &S) -> io::Result<()>
+fn run_interactive_terminal<W>(
+    stdout: W,
+    app: AppState,
+    agenda_source: ConfiguredAgendaSource,
+) -> io::Result<()>
 where
     W: Write,
-    S: AgendaSource,
 {
     terminal::enable_raw_mode()?;
     let backend = CrosstermBackend::new(stdout);
@@ -372,14 +416,13 @@ where
     result.and(cleanup_result)
 }
 
-fn run_event_loop<W, S>(
+fn run_event_loop<W>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     mut app: AppState,
-    agenda_source: &S,
+    mut agenda_source: ConfiguredAgendaSource,
 ) -> io::Result<()>
 where
     W: Write,
-    S: AgendaSource,
 {
     let mut keyboard = KeyboardInput::default();
     let mut mouse = MouseInput::default();
@@ -387,7 +430,7 @@ where
     loop {
         terminal.draw(|frame| {
             frame.render_widget(
-                AppView::with_agenda_source(&app, agenda_source),
+                AppView::with_agenda_source(&app, &agenda_source),
                 frame.area(),
             );
         })?;
@@ -396,7 +439,7 @@ where
             return Ok(());
         }
 
-        let event = if keyboard.is_waiting_for_digit() {
+        let event = if !app.is_creating_event() && keyboard.is_waiting_for_digit() {
             if event::poll(DIGIT_JUMP_TIMEOUT)? {
                 event::read()?
             } else {
@@ -410,10 +453,26 @@ where
         match event {
             Event::Key(key) => {
                 mouse.clear();
-                let action = keyboard.translate(key);
-                app.apply(action);
+                if app.is_creating_event() {
+                    match app.handle_create_key(key) {
+                        CreateEventInputResult::Continue => {}
+                        CreateEventInputResult::Cancel => app.close_create_form(),
+                        CreateEventInputResult::Submit(draft) => {
+                            match agenda_source.create_event(draft) {
+                                Ok(_) => app.close_create_form(),
+                                Err(err) => app.set_create_form_error(err.to_string()),
+                            }
+                        }
+                    }
+                } else {
+                    let action = keyboard.translate(key);
+                    app.apply(action);
+                }
             }
             Event::Mouse(mouse_event) => {
+                if app.is_creating_event() {
+                    continue;
+                }
                 keyboard.clear();
                 let size = terminal.size()?;
                 let area = Rect::new(0, 0, size.width, size.height);
@@ -513,6 +572,14 @@ fn io_error_exit(stderr: &mut impl Write, err: io::Error) -> std::process::ExitC
     std::process::ExitCode::FAILURE
 }
 
+fn local_event_error_exit(
+    stderr: &mut impl Write,
+    err: LocalEventStoreError,
+) -> std::process::ExitCode {
+    let _ = writeln!(stderr, "error: failed to load local events: {err}");
+    std::process::ExitCode::from(2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,6 +641,7 @@ mod tests {
                 start_date: today,
                 holiday_source: HolidaySourceConfig::Off,
                 holiday_country: "US".to_string(),
+                ..AppConfig::new(today)
             })
         );
     }
@@ -598,6 +666,7 @@ mod tests {
                 start_date: today,
                 holiday_source: HolidaySourceConfig::Nager,
                 holiday_country: "GB".to_string(),
+                ..AppConfig::new(today)
             })
         );
     }
@@ -622,7 +691,51 @@ mod tests {
                 start_date: today,
                 holiday_source: HolidaySourceConfig::Nager,
                 holiday_country: "CA".to_string(),
+                ..AppConfig::new(today)
             })
+        );
+    }
+
+    #[test]
+    fn events_file_flag_sets_path() {
+        let today = date(2026, Month::April, 23);
+        let path = PathBuf::from("/tmp/rcal-test-events.json");
+
+        let action = parse_args(
+            [arg("--events-file"), arg("/tmp/rcal-test-events.json")],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Run(AppConfig {
+                start_date: today,
+                events_file: path,
+                ..AppConfig::new(today)
+            })
+        );
+    }
+
+    #[test]
+    fn events_file_options_are_rejected_when_invalid() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_args([arg("--events-file")], today.into()).expect_err("missing path fails"),
+            CliError::MissingEventsFileValue
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    arg("--events-file"),
+                    arg("/tmp/one.json"),
+                    arg("--events-file=/tmp/two.json"),
+                ],
+                today.into(),
+            )
+            .expect_err("duplicate path fails"),
+            CliError::DuplicateEventsFile
         );
     }
 

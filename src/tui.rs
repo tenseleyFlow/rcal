@@ -12,7 +12,7 @@ use crate::{
     agenda::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
-    app::{AppState, ViewMode},
+    app::{AppState, CreateEventForm, CreateEventFormRowKind, ViewMode},
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
     },
@@ -88,6 +88,10 @@ impl Widget for AppView<'_> {
                 DayView::responsive_fallback(self.app, self.agenda_source).render(area, buf)
             }
             (ViewMode::Day, _) => DayView::focused(self.app, self.agenda_source).render(area, buf),
+        }
+
+        if let Some(form) = self.app.create_form() {
+            render_create_event_modal(form, area, buf, CreateModalStyles::new());
         }
     }
 }
@@ -467,6 +471,44 @@ impl DayViewStyles {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CreateModalStyles {
+    panel: Style,
+    border: Style,
+    title: Style,
+    label: Style,
+    value: Style,
+    focused: Style,
+    toggle: Style,
+    error: Style,
+    footer: Style,
+}
+
+impl CreateModalStyles {
+    const fn new() -> Self {
+        Self {
+            panel: Style::new().fg(Color::White).bg(Color::Black),
+            border: Style::new().fg(Color::Cyan).bg(Color::Black),
+            title: Style::new()
+                .fg(Color::Cyan)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            label: Style::new().fg(Color::Gray).bg(Color::Black),
+            value: Style::new().fg(Color::White).bg(Color::Black),
+            focused: Style::new()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
+            toggle: Style::new().fg(Color::Yellow).bg(Color::Black),
+            error: Style::new()
+                .fg(Color::Red)
+                .bg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            footer: Style::new().fg(Color::DarkGray).bg(Color::Black),
+        }
+    }
+}
+
 pub fn render_month_to_string(month: &CalendarMonth, width: u16, height: u16) -> String {
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
@@ -758,6 +800,93 @@ fn render_day_header(
     );
 }
 
+fn render_create_event_modal(
+    form: &CreateEventForm,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: CreateModalStyles,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let modal = create_modal_area(area);
+    buf.set_style(modal, styles.panel);
+    draw_border(buf, modal, styles.border, BorderCharacters::normal());
+
+    let content = inset_rect(modal);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    write_centered(
+        buf,
+        content.y,
+        content.x,
+        content.width,
+        "Create",
+        styles.title,
+    );
+    let mut y = content.y.saturating_add(2);
+    let label_width = 12.min(content.width.saturating_sub(1));
+
+    for row in form.rows() {
+        if y >= content.bottom().saturating_sub(2) {
+            break;
+        }
+
+        let marker = if row.focused { ">" } else { " " };
+        write_left(buf, y, content.x, 1, marker, styles.label);
+        let label_x = content.x.saturating_add(2);
+        write_left(buf, y, label_x, label_width, row.label, styles.label);
+
+        let value_x = label_x.saturating_add(label_width).saturating_add(1);
+        if value_x < content.right() {
+            let value_width = content.right() - value_x;
+            let style = if row.focused {
+                styles.focused
+            } else if row.kind == CreateEventFormRowKind::Toggle {
+                styles.toggle
+            } else {
+                styles.value
+            };
+            write_left(buf, y, value_x, value_width, &row.value, style);
+        }
+
+        y += 1;
+    }
+
+    if let Some(error) = form.error() {
+        let error_y = content.bottom().saturating_sub(2);
+        write_left(buf, error_y, content.x, content.width, error, styles.error);
+    }
+
+    let footer_y = content.bottom().saturating_sub(1);
+    write_centered(
+        buf,
+        footer_y,
+        content.x,
+        content.width,
+        "Tab fields | Ctrl-S save | Esc cancel",
+        styles.footer,
+    );
+}
+
+fn create_modal_area(area: Rect) -> Rect {
+    if area.width < 52 || area.height < 16 {
+        return area;
+    }
+
+    let width = area.width.saturating_sub(4).min(72);
+    let height = area.height.saturating_sub(4).min(22);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
 fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
     render_panel(area, "Agenda", buf, styles);
 
@@ -814,15 +943,14 @@ fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles:
             if y >= content.bottom() {
                 return;
             }
-            write_left(
-                buf,
-                y,
-                content.x,
-                content.width,
+            y = render_event_detail_lines(
+                event,
                 &format!("- {}", event.title),
-                styles.event,
+                content,
+                y,
+                buf,
+                styles,
             );
-            y += 1;
         }
 
         y += 1;
@@ -851,22 +979,82 @@ fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles:
                 styles.muted,
             );
         } else {
-            for event in &agenda.timed_events {
+            for agenda_event in &agenda.timed_events {
                 if y >= content.bottom() {
                     return;
                 }
-                write_left(
-                    buf,
+                y = render_event_detail_lines(
+                    &agenda_event.event,
+                    &agenda_event_line(agenda_event),
+                    content,
                     y,
-                    content.x,
-                    content.width,
-                    &agenda_event_line(event),
-                    styles.event,
+                    buf,
+                    styles,
                 );
-                y += 1;
             }
         }
     }
+}
+
+fn render_event_detail_lines(
+    event: &Event,
+    first_line: &str,
+    content: Rect,
+    mut y: u16,
+    buf: &mut Buffer,
+    styles: DayViewStyles,
+) -> u16 {
+    write_left(buf, y, content.x, content.width, first_line, styles.event);
+    y += 1;
+
+    if let Some(location) = &event.location {
+        if y >= content.bottom() {
+            return y;
+        }
+        write_left(
+            buf,
+            y,
+            content.x,
+            content.width,
+            &format!("  @ {location}"),
+            styles.muted,
+        );
+        y += 1;
+    }
+
+    if !event.reminders.is_empty() {
+        if y >= content.bottom() {
+            return y;
+        }
+        write_left(
+            buf,
+            y,
+            content.x,
+            content.width,
+            &format!("  Reminders: {}", reminder_summary(event)),
+            styles.muted,
+        );
+        y += 1;
+    }
+
+    if let Some(notes) = &event.notes {
+        for line in notes.lines() {
+            if y >= content.bottom() {
+                return y;
+            }
+            write_left(
+                buf,
+                y,
+                content.x,
+                content.width,
+                &format!("  {line}"),
+                styles.muted,
+            );
+            y += 1;
+        }
+    }
+
+    y
 }
 
 fn render_timeline_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
@@ -1015,6 +1203,23 @@ fn agenda_event_line(event: &TimedAgendaEvent) -> String {
     }
 
     format!("{prefix} {}", event.event.title)
+}
+
+fn reminder_summary(event: &Event) -> String {
+    event
+        .reminders
+        .iter()
+        .map(|reminder| reminder_label(reminder.minutes_before))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn reminder_label(minutes: u16) -> String {
+    match minutes {
+        value if value % (24 * 60) == 0 => format!("{}d", value / (24 * 60)),
+        value if value % 60 == 0 => format!("{}h", value / 60),
+        value => format!("{value}m"),
+    }
 }
 
 fn month_preview_labels(agenda: &DayAgenda) -> Vec<String> {
@@ -1448,7 +1653,7 @@ mod tests {
     use time::{Month, Time};
 
     use crate::{
-        agenda::{Event, EventDateTime, Holiday, InMemoryAgendaSource, SourceMetadata},
+        agenda::{Event, EventDateTime, Holiday, InMemoryAgendaSource, Reminder, SourceMetadata},
         app::AppAction,
         calendar::CalendarDate,
     };
@@ -1691,6 +1896,34 @@ mod tests {
     }
 
     #[test]
+    fn create_modal_renders_over_month_view() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        app.apply(AppAction::OpenCreate);
+
+        let rendered = render_app_to_string(&app, 84, 26);
+
+        assert!(rendered.contains("Create"));
+        assert!(rendered.contains("Title"));
+        assert!(rendered.contains("Start date"));
+        assert!(rendered.contains("Reminder"));
+        assert!(rendered.contains("Ctrl-S save"));
+    }
+
+    #[test]
+    fn create_modal_uses_full_screen_area_when_tight() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        app.apply(AppAction::OpenCreate);
+
+        let rendered = render_app_to_string(&app, 40, 10);
+        let lines = rendered.lines().collect::<Vec<_>>();
+
+        assert_eq!(lines.len(), 10);
+        assert!(lines[1].contains("Create"));
+        assert!(rendered.contains("Title"));
+        assert!(rendered.contains("Ctrl-S save"));
+    }
+
+    #[test]
     fn hit_test_selects_date_in_month_grid() {
         let app = AppState::new(date(2026, Month::April, 23));
         let area = Rect::new(0, 0, 84, 26);
@@ -1900,6 +2133,31 @@ mod tests {
         assert!(rendered.contains("09:15-10:00 Review"));
         assert!(rendered.contains("23:00-24:00> Late deploy"));
         assert!(!rendered.contains("No timed events"));
+    }
+
+    #[test]
+    fn day_view_renders_event_details_when_space_allows() {
+        let day = date(2026, Month::April, 23);
+        let app = {
+            let mut app = AppState::new(day);
+            app.apply(AppAction::OpenDay);
+            app
+        };
+        let event = timed_event("planning", "Planning", at(day, 9, 0), at(day, 10, 0))
+            .with_location("War room")
+            .with_notes("Bring notes")
+            .with_reminders(vec![
+                Reminder::minutes_before(10),
+                Reminder::minutes_before(60),
+            ]);
+        let source = agenda_source(vec![event], Vec::new());
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 18, &source);
+
+        assert!(rendered.contains("09:00-10:00 Planning"));
+        assert!(rendered.contains("@ War room"));
+        assert!(rendered.contains("Reminders: 10m, 1h"));
+        assert!(rendered.contains("Bring notes"));
     }
 
     #[test]
