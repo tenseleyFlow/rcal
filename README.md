@@ -49,7 +49,9 @@ access.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.
 - `q` exits.
-- Digits jump to a day in the visible month.
+- Digits jump immediately to a day in the visible month. A quick second digit
+  refines the selected day, so `1` selects day 1 and `1` then `6` selects day
+  16.
 - Weekday initials jump within the selected week. Use `tu` for Tuesday, `th`
   for Thursday, `su` for Sunday, and `sa` for Saturday.
 - Left click selects a visible date; left click the selected date again to open

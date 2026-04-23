@@ -2,6 +2,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt,
     io::{self, IsTerminal, Write},
+    time::Duration,
 };
 
 use crossterm::{
@@ -37,7 +38,8 @@ const HELP: &str = concat!(
     "  -V, --version                       Show version.\n\n",
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
-    "  Digits jump to a day in the visible month; weekday initials jump within the selected week.\n\n",
+    "  Digits jump immediately; a quick second digit refines the selected day.\n",
+    "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",
     "  Left click selects a visible date; left click the selected date again to open day view.\n\n",
     "Notes:\n",
@@ -45,6 +47,7 @@ const HELP: &str = concat!(
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
+const DIGIT_JUMP_TIMEOUT: Duration = Duration::from_millis(900);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -392,7 +395,18 @@ where
             return Ok(());
         }
 
-        match event::read()? {
+        let event = if keyboard.is_waiting_for_digit() {
+            if event::poll(DIGIT_JUMP_TIMEOUT)? {
+                event::read()?
+            } else {
+                keyboard.clear_digit();
+                continue;
+            }
+        } else {
+            event::read()?
+        };
+
+        match event {
             Event::Key(key) => {
                 mouse.clear();
                 let action = keyboard.translate(key);

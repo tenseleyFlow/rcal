@@ -173,6 +173,16 @@ impl KeyboardInput {
         self.pending = PendingKey::None;
     }
 
+    pub const fn is_waiting_for_digit(&self) -> bool {
+        matches!(self.pending, PendingKey::Digit(_))
+    }
+
+    pub fn clear_digit(&mut self) {
+        if self.is_waiting_for_digit() {
+            self.clear();
+        }
+    }
+
     fn translate_char(&mut self, value: char) -> AppAction {
         if value.is_ascii_digit() {
             return self.translate_digit(value);
@@ -215,9 +225,13 @@ impl KeyboardInput {
                 self.clear();
                 AppAction::JumpToDay(first * 10 + digit)
             }
-            _ if digit <= 3 => {
+            _ if digit == 0 => {
                 self.pending = PendingKey::Digit(digit);
                 AppAction::Noop
+            }
+            _ if digit <= 3 => {
+                self.pending = PendingKey::Digit(digit);
+                AppAction::JumpToDay(digit)
             }
             _ => {
                 self.clear();
@@ -381,8 +395,15 @@ mod tests {
         let mut app = AppState::new(date(2026, Month::April, 23));
         let mut input = KeyboardInput::default();
 
-        apply_keys(&mut app, &mut input, [char_key('1'), char_key('8')]);
+        let action = input.translate(char_key('1'));
+        app.apply(action);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 1));
+        assert!(input.is_waiting_for_digit());
+
+        let action = input.translate(char_key('8'));
+        app.apply(action);
         assert_eq!(app.selected_date(), date(2026, Month::April, 18));
+        assert!(!input.is_waiting_for_digit());
 
         apply_keys(&mut app, &mut input, [char_key('0'), char_key('4')]);
         assert_eq!(app.selected_date(), date(2026, Month::April, 4));
@@ -392,12 +413,57 @@ mod tests {
     }
 
     #[test]
+    fn single_digit_jumps_cover_visible_day_digits() {
+        for day in 1..=9 {
+            let mut app = AppState::new(date(2026, Month::April, 23));
+            let mut input = KeyboardInput::default();
+            let digit = char::from_digit(day.into(), 10).expect("single digit");
+
+            let action = input.translate(char_key(digit));
+            app.apply(action);
+
+            assert_eq!(app.selected_date(), date(2026, Month::April, day));
+        }
+    }
+
+    #[test]
+    fn zero_prefix_can_still_jump_to_single_digit_days() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = KeyboardInput::default();
+
+        let action = input.translate(char_key('0'));
+        app.apply(action);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 23));
+        assert!(input.is_waiting_for_digit());
+
+        let action = input.translate(char_key('7'));
+        app.apply(action);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 7));
+    }
+
+    #[test]
+    fn numeric_jump_timeout_keeps_single_digit_selection() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = KeyboardInput::default();
+
+        let action = input.translate(char_key('1'));
+        app.apply(action);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 1));
+
+        input.clear_digit();
+
+        let action = input.translate(char_key('6'));
+        app.apply(action);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 6));
+    }
+
+    #[test]
     fn invalid_numeric_jump_leaves_selection_unchanged_and_clears_buffer() {
         let mut app = AppState::new(date(2026, Month::February, 10));
         let mut input = KeyboardInput::default();
 
         apply_keys(&mut app, &mut input, [char_key('3'), char_key('0')]);
-        assert_eq!(app.selected_date(), date(2026, Month::February, 10));
+        assert_eq!(app.selected_date(), date(2026, Month::February, 3));
 
         apply_keys(&mut app, &mut input, [char_key('1'), char_key('5')]);
         assert_eq!(app.selected_date(), date(2026, Month::February, 15));
