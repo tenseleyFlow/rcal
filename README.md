@@ -49,6 +49,8 @@ access.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.
 - `q` exits.
+- In day view, Left/Right move to the previous or next day while staying in day
+  view.
 - Digits jump immediately to a day in the visible month. A quick second digit
   refines the selected day, so `1` selects day 1 and `1` then `6` selects day
   16.

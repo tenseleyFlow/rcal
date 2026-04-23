@@ -1765,6 +1765,21 @@ mod tests {
     }
 
     #[test]
+    fn day_view_render_follows_arrow_selected_date() {
+        let app = {
+            let mut app = AppState::new(date(2026, Month::April, 23));
+            app.apply(AppAction::OpenDay);
+            app.apply(AppAction::MoveDays(-1));
+            app
+        };
+
+        let rendered = render_app_to_string(&app, 84, 14);
+
+        assert!(rendered.contains("Wednesday, April 22, 2026"));
+        assert!(!rendered.contains("Thursday, April 23, 2026"));
+    }
+
+    #[test]
     fn day_view_renders_holidays_events_and_timeline_blocks() {
         let app = {
             let mut app = AppState::new(date(2026, Month::April, 23));

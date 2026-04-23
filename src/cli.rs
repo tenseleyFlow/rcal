@@ -38,6 +38,7 @@ const HELP: &str = concat!(
     "  -V, --version                       Show version.\n\n",
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
+    "  In day view, Left/Right move to the previous or next day.\n",
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
     "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",

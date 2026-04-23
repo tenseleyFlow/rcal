@@ -72,6 +72,11 @@ impl AppState {
             AppAction::MoveDays(days) if self.view_mode == ViewMode::Month => {
                 self.selected_date = self.selected_date.add_days(days);
             }
+            AppAction::MoveDays(days)
+                if self.view_mode == ViewMode::Day && matches!(days, -1 | 1) =>
+            {
+                self.selected_date = self.selected_date.add_days(days);
+            }
             AppAction::SelectDate(date) if self.view_mode == ViewMode::Month => {
                 self.selected_date = date;
             }
@@ -506,11 +511,41 @@ mod tests {
         assert_eq!(app.view_mode(), ViewMode::Day);
         assert_eq!(app.selected_date(), date(2026, Month::April, 23));
 
-        apply_keys(&mut app, &mut input, [key(KeyCode::Left)]);
-        assert_eq!(app.selected_date(), date(2026, Month::April, 23));
-
         apply_keys(&mut app, &mut input, [key(KeyCode::Esc)]);
         assert_eq!(app.view_mode(), ViewMode::Month);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 23));
+    }
+
+    #[test]
+    fn day_view_left_and_right_move_between_days() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = KeyboardInput::default();
+
+        apply_keys(&mut app, &mut input, [key(KeyCode::Enter)]);
+        apply_keys(&mut app, &mut input, [key(KeyCode::Left)]);
+
+        assert_eq!(app.view_mode(), ViewMode::Day);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 22));
+
+        apply_keys(
+            &mut app,
+            &mut input,
+            [key(KeyCode::Right), key(KeyCode::Right)],
+        );
+
+        assert_eq!(app.view_mode(), ViewMode::Day);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 24));
+    }
+
+    #[test]
+    fn day_view_up_and_down_do_not_change_days() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = KeyboardInput::default();
+
+        apply_keys(&mut app, &mut input, [key(KeyCode::Enter)]);
+        apply_keys(&mut app, &mut input, [key(KeyCode::Up), key(KeyCode::Down)]);
+
+        assert_eq!(app.view_mode(), ViewMode::Day);
         assert_eq!(app.selected_date(), date(2026, Month::April, 23));
     }
 
