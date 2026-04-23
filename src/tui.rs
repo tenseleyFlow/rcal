@@ -807,7 +807,7 @@ fn render_create_event_modal(
         return;
     }
 
-    let modal = create_modal_area(area);
+    let modal = create_modal_area(area, form);
     fill_rect(buf, modal, styles.panel);
     draw_border(buf, modal, styles.border, BorderCharacters::normal());
 
@@ -825,29 +825,55 @@ fn render_create_event_modal(
         styles.title,
     );
     let label_width = 12.min(content.width.saturating_sub(1));
+    let rows_bottom = content.bottom().saturating_sub(2);
+    let mut y = content.y.saturating_add(2);
 
-    for (y, row) in (content.y.saturating_add(2)..).zip(form.rows()) {
-        if y >= content.bottom().saturating_sub(2) {
+    for row in form.rows() {
+        if y >= rows_bottom {
             break;
         }
 
-        let marker = if row.focused { ">" } else { " " };
-        write_padded_left(buf, y, content.x, 1, marker, styles.label);
         let label_x = content.x.saturating_add(2);
-        write_padded_left(buf, y, label_x, label_width, row.label, styles.label);
-
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
-        if value_x < content.right() {
-            let value_width = content.right() - value_x;
-            match row.kind {
-                CreateEventFormRowKind::Text => {
-                    write_padded_left(buf, y, value_x, value_width, &row.value, styles.value);
-                }
-                CreateEventFormRowKind::Toggle => {
-                    write_toggle_value(buf, y, value_x, value_width, &row.value, styles);
-                }
+        let value_width = content.right().saturating_sub(value_x);
+        let value_lines = create_modal_value_lines(row.kind, &row.value, value_width);
+        let row_height = u16::try_from(value_lines.len()).unwrap_or(u16::MAX);
+
+        for (line_index, value_line) in value_lines.iter().enumerate() {
+            let line_y = y.saturating_add(u16::try_from(line_index).unwrap_or(u16::MAX));
+            if line_y >= rows_bottom {
+                break;
             }
+
+            let marker = if line_index == 0 && row.focused {
+                ">"
+            } else {
+                " "
+            };
+            let label = if line_index == 0 { row.label } else { "" };
+            write_padded_left(buf, line_y, content.x, 1, marker, styles.label);
+            write_padded_left(buf, line_y, label_x, label_width, label, styles.label);
+
+            if value_x < content.right() {
+                match row.kind {
+                    CreateEventFormRowKind::Text | CreateEventFormRowKind::Multiline => {
+                        write_padded_left(
+                            buf,
+                            line_y,
+                            value_x,
+                            value_width,
+                            value_line,
+                            styles.value,
+                        );
+                    }
+                    CreateEventFormRowKind::Toggle => {
+                        write_toggle_value(buf, line_y, value_x, value_width, value_line, styles);
+                    }
+                }
+            };
         }
+
+        y = y.saturating_add(row_height);
     }
 
     if let Some(error) = form.error() {
@@ -861,24 +887,59 @@ fn render_create_event_modal(
         footer_y,
         content.x,
         content.width,
-        "Tab fields | Ctrl-S save | Esc cancel",
+        "Tab/Up/Down fields | Ctrl-S save | Esc cancel",
         styles.footer,
     );
 }
 
-fn create_modal_area(area: Rect) -> Rect {
+fn create_modal_area(area: Rect, form: &CreateEventForm) -> Rect {
     if area.width < 52 || area.height < 16 {
         return area;
     }
 
     let width = area.width.saturating_sub(4).min(72);
-    let height = area.height.saturating_sub(4).min(22);
+    let max_height = area.height.saturating_sub(4);
+    let height = desired_create_modal_height(form, width).min(max_height);
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
     )
+}
+
+fn desired_create_modal_height(form: &CreateEventForm, modal_width: u16) -> u16 {
+    let content_width = modal_width.saturating_sub(2);
+    let value_width = create_modal_value_width(content_width);
+    let rows_height = form
+        .rows()
+        .into_iter()
+        .map(|row| create_modal_row_height(row.kind, &row.value, value_width))
+        .fold(0_u16, u16::saturating_add);
+
+    rows_height.saturating_add(6).max(22)
+}
+
+fn create_modal_value_width(content_width: u16) -> u16 {
+    let label_width = 12.min(content_width.saturating_sub(1));
+    content_width.saturating_sub(label_width.saturating_add(3))
+}
+
+fn create_modal_row_height(kind: CreateEventFormRowKind, value: &str, value_width: u16) -> u16 {
+    u16::try_from(create_modal_value_lines(kind, value, value_width).len()).unwrap_or(u16::MAX)
+}
+
+fn create_modal_value_lines(
+    kind: CreateEventFormRowKind,
+    value: &str,
+    value_width: u16,
+) -> Vec<String> {
+    match kind {
+        CreateEventFormRowKind::Multiline => wrap_text_lines(value, value_width),
+        CreateEventFormRowKind::Text | CreateEventFormRowKind::Toggle => {
+            vec![value.to_string()]
+        }
+    }
 }
 
 fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
@@ -1643,6 +1704,36 @@ fn write_toggle_value(
     }
 }
 
+fn wrap_text_lines(text: &str, width: u16) -> Vec<String> {
+    let width = usize::from(width);
+    if width == 0 {
+        return vec![String::new()];
+    }
+
+    let mut lines = Vec::new();
+    for raw_line in text.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+
+        let mut line = String::new();
+        for character in raw_line.chars() {
+            if line.chars().count() == width {
+                lines.push(line);
+                line = String::new();
+            }
+            line.push(character);
+        }
+        lines.push(line);
+    }
+
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
 const fn inset_rect(area: Rect) -> Rect {
     Rect::new(
         area.x.saturating_add(1),
@@ -2012,7 +2103,7 @@ mod tests {
 
         let area = Rect::new(0, 0, 84, 26);
         let buffer = render_app_buffer(&app, area.width, area.height);
-        let modal = create_modal_area(area);
+        let modal = create_modal_area(area, app.create_form().expect("form stays open"));
         let content = inset_rect(modal);
         let row_y = content.y.saturating_add(2);
         let label_x = content.x.saturating_add(2);
@@ -2033,6 +2124,48 @@ mod tests {
         assert_styled_cell(&buffer, value_x + 1, row_y + 8, " ", Color::White);
         assert_styled_cell(&buffer, value_x + 2, row_y + 8, "]", Color::Yellow);
         assert_styled_text(&buffer, value_x + 4, row_y + 8, "5m", Color::Gray);
+    }
+
+    #[test]
+    fn create_modal_wraps_long_notes_and_shifts_following_rows() {
+        let selected = date(2026, Month::April, 23);
+        let mut app = AppState::new(selected);
+        app.apply(AppAction::OpenCreate);
+        for _ in 0..7 {
+            let _ = app.handle_create_key(key(KeyCode::Tab));
+        }
+        let notes = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        for character in notes.chars() {
+            let _ = app.handle_create_key(key(KeyCode::Char(character)));
+        }
+
+        let area = Rect::new(0, 0, 58, 32);
+        let buffer = render_app_buffer(&app, area.width, area.height);
+        let modal = create_modal_area(area, app.create_form().expect("form stays open"));
+        let content = inset_rect(modal);
+        let row_y = content.y.saturating_add(2);
+        let notes_y = row_y.saturating_add(7);
+        let label_x = content.x.saturating_add(2);
+        let label_width = 12.min(content.width.saturating_sub(1));
+        let value_x = label_x.saturating_add(label_width).saturating_add(1);
+
+        assert!(modal.height > 22);
+        assert_styled_text(&buffer, label_x, notes_y, "Notes", Color::White);
+        assert_styled_text(
+            &buffer,
+            value_x,
+            notes_y,
+            "abcdefghijklmnopqrstuvwxyz0123456789A",
+            Color::Gray,
+        );
+        assert_styled_text(
+            &buffer,
+            value_x,
+            notes_y + 1,
+            "BCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijkl",
+            Color::Gray,
+        );
+        assert_styled_text(&buffer, label_x, notes_y + 4, "Reminder", Color::White);
     }
 
     #[test]

@@ -250,6 +250,14 @@ impl CreateEventForm {
                 self.focus_previous();
                 CreateEventInputResult::Continue
             }
+            KeyCode::Up => {
+                self.focus_previous();
+                CreateEventInputResult::Continue
+            }
+            KeyCode::Down => {
+                self.focus_next();
+                CreateEventInputResult::Continue
+            }
             KeyCode::Backspace => {
                 self.edit_text_field(|value| {
                     value.pop();
@@ -355,7 +363,7 @@ impl CreateEventForm {
             CreateEventField::EndDate => self.end_date.clone(),
             CreateEventField::EndTime => self.end_time.clone(),
             CreateEventField::Location => self.location.clone(),
-            CreateEventField::Notes => self.notes.replace('\n', " / "),
+            CreateEventField::Notes => self.notes.clone(),
             CreateEventField::Reminder(index) => {
                 let preset = REMINDER_PRESETS[index];
                 format!("{} {}", checkbox(self.reminders[index]), preset.label)
@@ -424,6 +432,7 @@ pub struct CreateEventFormRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateEventFormRowKind {
     Text,
+    Multiline,
     Toggle,
 }
 
@@ -516,6 +525,7 @@ impl CreateEventField {
 
     const fn kind(self) -> CreateEventFormRowKind {
         match self {
+            Self::Notes => CreateEventFormRowKind::Multiline,
             Self::AllDay | Self::Reminder(_) => CreateEventFormRowKind::Toggle,
             _ => CreateEventFormRowKind::Text,
         }
@@ -1094,6 +1104,30 @@ mod tests {
             app.create_form().expect("form stays open").rows()[0].value,
             "1"
         );
+    }
+
+    #[test]
+    fn create_form_up_and_down_move_between_fields() {
+        let day = date(2026, Month::April, 23);
+        let mut app = AppState::new(day);
+        app.apply(AppAction::OpenCreate);
+
+        assert!(app.create_form().expect("form opens").rows()[0].focused);
+
+        assert_eq!(
+            app.handle_create_key(key(KeyCode::Down)),
+            CreateEventInputResult::Continue
+        );
+        let rows = app.create_form().expect("form stays open").rows();
+        assert!(rows[1].focused);
+        assert_eq!(app.selected_date(), day);
+
+        assert_eq!(
+            app.handle_create_key(key(KeyCode::Up)),
+            CreateEventInputResult::Continue
+        );
+        assert!(app.create_form().expect("form stays open").rows()[0].focused);
+        assert_eq!(app.selected_date(), day);
     }
 
     #[test]
