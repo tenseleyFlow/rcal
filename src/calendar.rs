@@ -16,7 +16,7 @@ pub const SUNDAY_FIRST_WEEKDAYS: [Weekday; DAYS_PER_WEEK] = [
     Weekday::Saturday,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CalendarDate(Date);
 
 impl CalendarDate {

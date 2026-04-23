@@ -1,7 +1,10 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use time::Weekday;
 
-use crate::calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK};
+use crate::{
+    agenda::{AgendaSource, DayAgenda},
+    calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK},
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -49,6 +52,13 @@ impl AppState {
 
     pub fn calendar_month(&self) -> CalendarMonth {
         CalendarMonth::from_dates(self.selected_date, self.today)
+    }
+
+    pub fn day_agenda<S>(&self, source: &S) -> DayAgenda
+    where
+        S: AgendaSource + ?Sized,
+    {
+        DayAgenda::from_source(self.selected_date, source)
     }
 
     pub fn apply(&mut self, action: AppAction) {
@@ -245,6 +255,8 @@ mod tests {
     use crossterm::event::KeyModifiers;
     use time::Month;
 
+    use crate::agenda::{Holiday, InMemoryAgendaSource, SourceMetadata};
+
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
     }
@@ -383,5 +395,33 @@ mod tests {
         apply_keys(&mut app, &mut input, [char_key('q')]);
 
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn selected_day_agenda_uses_selected_date() {
+        let app = AppState::from_dates(date(2026, Month::April, 23), date(2026, Month::April, 18));
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            Vec::new(),
+            vec![
+                Holiday::new(
+                    "selected",
+                    "Selected Day",
+                    date(2026, Month::April, 23),
+                    SourceMetadata::fixture(),
+                ),
+                Holiday::new(
+                    "today",
+                    "Today",
+                    date(2026, Month::April, 18),
+                    SourceMetadata::fixture(),
+                ),
+            ],
+        );
+
+        let agenda = app.day_agenda(&source);
+
+        assert_eq!(agenda.date, date(2026, Month::April, 23));
+        assert_eq!(agenda.holidays.len(), 1);
+        assert_eq!(agenda.holidays[0].name, "Selected Day");
     }
 }
