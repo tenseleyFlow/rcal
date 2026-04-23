@@ -12,7 +12,7 @@ use crate::{
     agenda::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
-    app::{AppState, CreateEventForm, CreateEventFormRowKind, ViewMode},
+    app::{AppState, CreateEventForm, ViewMode},
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
     },
@@ -478,8 +478,6 @@ struct CreateModalStyles {
     title: Style,
     label: Style,
     value: Style,
-    focused: Style,
-    toggle: Style,
     error: Style,
     footer: Style,
 }
@@ -495,11 +493,6 @@ impl CreateModalStyles {
                 .add_modifier(Modifier::BOLD),
             label: Style::new().fg(Color::Gray).bg(Color::Black),
             value: Style::new().fg(Color::White).bg(Color::Black),
-            focused: Style::new()
-                .fg(Color::White)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-            toggle: Style::new().fg(Color::Yellow).bg(Color::Black),
             error: Style::new()
                 .fg(Color::Red)
                 .bg(Color::Black)
@@ -835,21 +828,14 @@ fn render_create_event_modal(
         }
 
         let marker = if row.focused { ">" } else { " " };
-        write_left(buf, y, content.x, 1, marker, styles.label);
+        write_padded_left(buf, y, content.x, 1, marker, styles.label);
         let label_x = content.x.saturating_add(2);
-        write_left(buf, y, label_x, label_width, row.label, styles.label);
+        write_padded_left(buf, y, label_x, label_width, row.label, styles.label);
 
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
         if value_x < content.right() {
             let value_width = content.right() - value_x;
-            let style = if row.focused {
-                styles.focused
-            } else if row.kind == CreateEventFormRowKind::Toggle {
-                styles.toggle
-            } else {
-                styles.value
-            };
-            write_left(buf, y, value_x, value_width, &row.value, style);
+            write_padded_left(buf, y, value_x, value_width, &row.value, styles.value);
         }
     }
 
@@ -1581,6 +1567,7 @@ fn draw_border(buf: &mut Buffer, rect: Rect, style: Style, chars: BorderCharacte
 
 fn set_cell(buf: &mut Buffer, x: u16, y: u16, symbol: &str, style: Style) {
     if let Some(cell) = buf.cell_mut((x, y)) {
+        cell.reset();
         cell.set_symbol(symbol).set_style(style);
     }
 }
@@ -1608,6 +1595,17 @@ fn write_left(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, style: S
         return;
     }
 
+    buf.set_stringn(x, y, text, usize::from(width), style);
+}
+
+fn write_padded_left(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, style: Style) {
+    if width == 0 || !buf.area.contains((x, y).into()) {
+        return;
+    }
+
+    for column in x..x.saturating_add(width) {
+        set_cell(buf, column, y, " ", style);
+    }
     buf.set_stringn(x, y, text, usize::from(width), style);
 }
 
@@ -1684,6 +1682,13 @@ mod tests {
         buffer
     }
 
+    fn render_app_buffer(app: &AppState, width: u16, height: u16) -> Buffer {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        AppView::new(app).render(area, &mut buffer);
+        buffer
+    }
+
     fn buffer_lines(buffer: &Buffer) -> Vec<String> {
         buffer_to_string(buffer)
             .lines()
@@ -1720,6 +1725,19 @@ mod tests {
             assert_eq!(cell.fg, expected.fg);
             assert_eq!(cell.bg, expected.bg);
             assert!(cell.modifier.contains(expected.modifier));
+        }
+    }
+
+    fn assert_styled_text(buffer: &Buffer, x: u16, y: u16, text: &str, fg: Color) {
+        for (offset, character) in text.chars().enumerate() {
+            let cell = buffer
+                .cell((x + u16::try_from(offset).expect("offset fits"), y))
+                .expect("text cell exists");
+            assert_eq!(cell.symbol(), character.to_string());
+            assert_eq!(cell.fg, fg);
+            assert_eq!(cell.bg, Color::Black);
+            assert!(!cell.modifier.contains(Modifier::DIM));
+            assert!(!cell.modifier.contains(Modifier::BOLD));
         }
     }
 
@@ -1934,6 +1952,30 @@ mod tests {
         assert!(rendered.contains("Create"));
         assert!(!rendered.contains("Backdrop"));
         assert!(!rendered.contains("Ghost"));
+    }
+
+    #[test]
+    fn create_modal_uses_gray_labels_and_white_values() {
+        let selected = date(2026, Month::April, 23);
+        let mut app = AppState::new(selected);
+        app.apply(AppAction::OpenCreate);
+
+        let area = Rect::new(0, 0, 84, 26);
+        let buffer = render_app_buffer(&app, area.width, area.height);
+        let modal = create_modal_area(area);
+        let content = inset_rect(modal);
+        let row_y = content.y.saturating_add(2);
+        let label_x = content.x.saturating_add(2);
+        let label_width = 12.min(content.width.saturating_sub(1));
+        let value_x = label_x.saturating_add(label_width).saturating_add(1);
+
+        assert_styled_text(&buffer, content.x, row_y, ">", Color::Gray);
+        assert_styled_text(&buffer, label_x, row_y, "Title", Color::Gray);
+        assert_styled_text(&buffer, label_x, row_y + 2, "Start date", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 1, "[ ]", Color::White);
+        assert_styled_text(&buffer, value_x, row_y + 2, "2026-04-23", Color::White);
+        assert_styled_text(&buffer, value_x, row_y + 3, "09:00", Color::White);
+        assert_styled_text(&buffer, value_x, row_y + 8, "[ ] 5m", Color::White);
     }
 
     #[test]
