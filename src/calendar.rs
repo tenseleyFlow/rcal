@@ -47,6 +47,26 @@ impl CalendarDate {
     pub const fn weekday(self) -> Weekday {
         self.0.weekday()
     }
+
+    pub fn add_days(self, days: i32) -> Self {
+        let mut date = self.0;
+
+        if days >= 0 {
+            for _ in 0..days {
+                date = date
+                    .next_day()
+                    .expect("calendar navigation requires a representable next day");
+            }
+        } else {
+            for _ in 0..days.saturating_abs() {
+                date = date
+                    .previous_day()
+                    .expect("calendar navigation requires a representable previous day");
+            }
+        }
+
+        Self(date)
+    }
 }
 
 impl From<Date> for CalendarDate {
@@ -119,6 +139,10 @@ impl MonthId {
         };
 
         Self { year, month }
+    }
+
+    pub fn date(self, day: u8) -> Option<CalendarDate> {
+        CalendarDate::from_ymd(self.year, self.month, day).ok()
     }
 }
 
