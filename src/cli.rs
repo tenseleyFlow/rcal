@@ -13,9 +13,13 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
+    agenda::{AgendaSource, InMemoryAgendaSource},
     app::{AppState, KeyboardInput},
     calendar::CalendarDate,
-    tui::{AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, render_app_to_string},
+    tui::{
+        AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH,
+        render_app_to_string_with_agenda_source,
+    },
 };
 
 const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
@@ -77,8 +81,10 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
+            let agenda_source = InMemoryAgendaSource::development_fixture();
             let (width, height) = terminal_size();
-            let rendered = render_app_to_string(&app, width, height);
+            let rendered =
+                render_app_to_string_with_agenda_source(&app, width, height, &agenda_source);
             match write!(stdout, "{rendered}") {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
@@ -104,7 +110,8 @@ where
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
-            match run_interactive_terminal(stdout, app) {
+            let agenda_source = InMemoryAgendaSource::development_fixture();
+            match run_interactive_terminal(stdout, app, &agenda_source) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
@@ -172,33 +179,39 @@ fn terminal_size() -> (u16, u16) {
         .unwrap_or((DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT))
 }
 
-fn run_interactive_terminal<W>(mut stdout: W, app: AppState) -> io::Result<()>
+fn run_interactive_terminal<W, S>(mut stdout: W, app: AppState, agenda_source: &S) -> io::Result<()>
 where
     W: Write,
+    S: AgendaSource,
 {
     terminal::enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen)?;
 
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_event_loop(&mut terminal, app);
+    let result = run_event_loop(&mut terminal, app, agenda_source);
     let cleanup_result = restore_terminal(&mut terminal);
 
     result.and(cleanup_result)
 }
 
-fn run_event_loop<W>(
+fn run_event_loop<W, S>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     mut app: AppState,
+    agenda_source: &S,
 ) -> io::Result<()>
 where
     W: Write,
+    S: AgendaSource,
 {
     let mut keyboard = KeyboardInput::default();
 
     loop {
         terminal.draw(|frame| {
-            frame.render_widget(AppView::new(&app), frame.area());
+            frame.render_widget(
+                AppView::with_agenda_source(&app, agenda_source),
+                frame.area(),
+            );
         })?;
 
         if app.should_quit() {

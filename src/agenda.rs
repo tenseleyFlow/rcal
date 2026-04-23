@@ -44,6 +44,10 @@ impl DayMinute {
     pub const START: Self = Self(0);
     pub const END: Self = Self(24 * 60);
 
+    pub const fn from_minutes(minutes: u16) -> Self {
+        Self(minutes)
+    }
+
     pub fn from_time(time: Time) -> Self {
         Self(u16::from(time.hour()) * 60 + u16::from(time.minute()))
     }
@@ -310,6 +314,19 @@ pub trait AgendaSource {
     fn events_intersecting(&self, range: DateRange) -> Vec<Event>;
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday>;
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct EmptyAgendaSource;
+
+impl AgendaSource for EmptyAgendaSource {
+    fn events_intersecting(&self, _range: DateRange) -> Vec<Event> {
+        Vec::new()
+    }
+
+    fn holidays_in(&self, _range: DateRange) -> Vec<Holiday> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]

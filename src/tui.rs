@@ -9,6 +9,9 @@ use ratatui::{
 use time::Weekday;
 
 use crate::{
+    agenda::{
+        AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
+    },
     app::{AppState, ViewMode},
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
@@ -22,17 +25,27 @@ pub const DEFAULT_RENDER_HEIGHT: u16 = 26;
 const HEADER_HEIGHT: u16 = 2;
 const VERTICAL_GRID_LINES: u16 = DAYS_PER_WEEK as u16 + 1;
 const HORIZONTAL_GRID_LINES: u16 = MONTH_GRID_WEEKS as u16 + 1;
+static EMPTY_AGENDA_SOURCE: EmptyAgendaSource = EmptyAgendaSource;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct MonthGrid<'a> {
     month: &'a CalendarMonth,
+    agenda_source: &'a dyn AgendaSource,
     styles: MonthGridStyles,
 }
 
 impl<'a> MonthGrid<'a> {
-    pub const fn new(month: &'a CalendarMonth) -> Self {
+    pub fn new(month: &'a CalendarMonth) -> Self {
+        Self::with_agenda_source(month, &EMPTY_AGENDA_SOURCE)
+    }
+
+    pub fn with_agenda_source(
+        month: &'a CalendarMonth,
+        agenda_source: &'a dyn AgendaSource,
+    ) -> Self {
         Self {
             month,
+            agenda_source,
             styles: MonthGridStyles::new(),
         }
     }
@@ -40,18 +53,23 @@ impl<'a> MonthGrid<'a> {
 
 impl Widget for MonthGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_month_grid(self.month, area, buf, self.styles);
+        render_month_grid(self.month, self.agenda_source, area, buf, self.styles);
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct AppView<'a> {
     app: &'a AppState,
+    agenda_source: &'a dyn AgendaSource,
 }
 
 impl<'a> AppView<'a> {
-    pub const fn new(app: &'a AppState) -> Self {
-        Self { app }
+    pub fn new(app: &'a AppState) -> Self {
+        Self::with_agenda_source(app, &EMPTY_AGENDA_SOURCE)
+    }
+
+    pub fn with_agenda_source(app: &'a AppState, agenda_source: &'a dyn AgendaSource) -> Self {
+        Self { app, agenda_source }
     }
 }
 
@@ -60,37 +78,42 @@ impl Widget for AppView<'_> {
         match (self.app.view_mode(), ResponsiveLayout::for_area(area)) {
             (ViewMode::Month, layout) if layout.should_render_month_grid() => {
                 let month = self.app.calendar_month();
-                MonthGrid::new(&month).render(area, buf);
+                MonthGrid::with_agenda_source(&month, self.agenda_source).render(area, buf);
             }
             (ViewMode::Month, layout) if layout.should_render_week_view() => {
                 let month = self.app.calendar_month();
-                WeekGrid::new(&month).render(area, buf);
+                WeekGrid::with_agenda_source(&month, self.agenda_source).render(area, buf);
             }
-            (ViewMode::Month, _) => DayView::responsive_fallback(self.app).render(area, buf),
-            (ViewMode::Day, _) => DayView::focused(self.app).render(area, buf),
+            (ViewMode::Month, _) => {
+                DayView::responsive_fallback(self.app, self.agenda_source).render(area, buf)
+            }
+            (ViewMode::Day, _) => DayView::focused(self.app, self.agenda_source).render(area, buf),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct DayView<'a> {
     app: &'a AppState,
+    agenda_source: &'a dyn AgendaSource,
     context: DayViewContext,
     styles: DayViewStyles,
 }
 
 impl<'a> DayView<'a> {
-    pub const fn focused(app: &'a AppState) -> Self {
+    pub fn focused(app: &'a AppState, agenda_source: &'a dyn AgendaSource) -> Self {
         Self {
             app,
+            agenda_source,
             context: DayViewContext::Focused,
             styles: DayViewStyles::new(),
         }
     }
 
-    pub const fn responsive_fallback(app: &'a AppState) -> Self {
+    pub fn responsive_fallback(app: &'a AppState, agenda_source: &'a dyn AgendaSource) -> Self {
         Self {
             app,
+            agenda_source,
             context: DayViewContext::ResponsiveFallback,
             styles: DayViewStyles::new(),
         }
@@ -99,7 +122,14 @@ impl<'a> DayView<'a> {
 
 impl Widget for DayView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_day_view(self.app, self.context, area, buf, self.styles);
+        render_day_view(
+            self.app,
+            self.agenda_source,
+            self.context,
+            area,
+            buf,
+            self.styles,
+        );
     }
 }
 
@@ -109,16 +139,25 @@ enum DayViewContext {
     ResponsiveFallback,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct WeekGrid<'a> {
     month: &'a CalendarMonth,
+    agenda_source: &'a dyn AgendaSource,
     styles: MonthGridStyles,
 }
 
 impl<'a> WeekGrid<'a> {
-    pub const fn new(month: &'a CalendarMonth) -> Self {
+    pub fn new(month: &'a CalendarMonth) -> Self {
+        Self::with_agenda_source(month, &EMPTY_AGENDA_SOURCE)
+    }
+
+    pub fn with_agenda_source(
+        month: &'a CalendarMonth,
+        agenda_source: &'a dyn AgendaSource,
+    ) -> Self {
         Self {
             month,
+            agenda_source,
             styles: MonthGridStyles::new(),
         }
     }
@@ -126,7 +165,7 @@ impl<'a> WeekGrid<'a> {
 
 impl Widget for WeekGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_week_grid(self.month, area, buf, self.styles);
+        render_week_grid(self.month, self.agenda_source, area, buf, self.styles);
     }
 }
 
@@ -364,6 +403,8 @@ struct MonthGridStyles {
     today_border: Style,
     in_month: Style,
     in_month_border: Style,
+    preview: Style,
+    preview_summary: Style,
     filler: Style,
     filler_border: Style,
 }
@@ -387,6 +428,8 @@ impl MonthGridStyles {
             today_border: Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
             in_month: Style::new().fg(Color::White).add_modifier(Modifier::DIM),
             in_month_border: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            preview: Style::new().fg(Color::Gray),
+            preview_summary: Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
             filler: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             filler_border: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         }
@@ -402,6 +445,9 @@ struct DayViewStyles {
     content: Style,
     muted: Style,
     timeline_mark: Style,
+    timeline_event: Style,
+    holiday: Style,
+    event: Style,
 }
 
 impl DayViewStyles {
@@ -414,6 +460,9 @@ impl DayViewStyles {
             content: Style::new().fg(Color::White),
             muted: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             timeline_mark: Style::new().fg(Color::Yellow).add_modifier(Modifier::DIM),
+            timeline_event: Style::new().fg(Color::White).bg(Color::Blue),
+            holiday: Style::new().fg(Color::Yellow),
+            event: Style::new().fg(Color::White),
         }
     }
 }
@@ -426,9 +475,21 @@ pub fn render_month_to_string(month: &CalendarMonth, width: u16, height: u16) ->
 }
 
 pub fn render_app_to_string(app: &AppState, width: u16, height: u16) -> String {
+    render_app_to_string_with_agenda_source(app, width, height, &EMPTY_AGENDA_SOURCE)
+}
+
+pub fn render_app_to_string_with_agenda_source<S>(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    agenda_source: &S,
+) -> String
+where
+    S: AgendaSource,
+{
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
-    AppView::new(app).render(area, &mut buffer);
+    AppView::with_agenda_source(app, agenda_source).render(area, &mut buffer);
     buffer_to_string(&buffer)
 }
 
@@ -449,7 +510,13 @@ pub fn buffer_to_string(buffer: &Buffer) -> String {
     output
 }
 
-fn render_month_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles: MonthGridStyles) {
+fn render_month_grid(
+    month: &CalendarMonth,
+    agenda_source: &dyn AgendaSource,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
     let Some(layout) = MonthGridLayout::new(area) else {
         render_too_small_message(area, buf, styles);
         return;
@@ -460,15 +527,21 @@ fn render_month_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles
     render_weekdays(&layout, buf, styles);
 
     for cell in month.cells().filter(|cell| !cell.is_selected) {
-        render_cell(cell, &layout, buf, styles);
+        render_cell(cell, &layout, agenda_source, buf, styles);
     }
 
     if let Some(selected) = month.selected_cell() {
-        render_cell(selected, &layout, buf, styles);
+        render_cell(selected, &layout, agenda_source, buf, styles);
     }
 }
 
-fn render_week_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles: MonthGridStyles) {
+fn render_week_grid(
+    month: &CalendarMonth,
+    agenda_source: &dyn AgendaSource,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
     let Some(layout) = WeekGridLayout::new(area) else {
         render_too_small_message(area, buf, styles);
         return;
@@ -484,11 +557,11 @@ fn render_week_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles:
     render_weekdays_for_week(&layout, buf, styles);
 
     for cell in selected_week.cells.iter().filter(|cell| !cell.is_selected) {
-        render_week_cell(cell, &layout, buf, styles);
+        render_week_cell(cell, &layout, agenda_source, buf, styles);
     }
 
     if let Some(selected) = selected_week.cells.iter().find(|cell| cell.is_selected) {
-        render_week_cell(selected, &layout, buf, styles);
+        render_week_cell(selected, &layout, agenda_source, buf, styles);
     }
 }
 
@@ -518,6 +591,7 @@ fn render_too_small_message(area: Rect, buf: &mut Buffer, styles: MonthGridStyle
 
 fn render_day_view(
     app: &AppState,
+    agenda_source: &dyn AgendaSource,
     context: DayViewContext,
     area: Rect,
     buf: &mut Buffer,
@@ -528,36 +602,35 @@ fn render_day_view(
     }
 
     let layout = DayViewLayout::new(area);
+    let agenda = app.day_agenda(agenda_source);
     buf.set_style(area, Style::default());
-    render_day_header(app.selected_date(), context, &layout, buf, styles);
+    render_day_header(&agenda, context, &layout, buf, styles);
 
     match layout.mode {
         DayViewLayoutMode::Split | DayViewLayoutMode::Stacked => {
             if let Some(agenda_area) = layout.agenda_area {
-                render_empty_agenda_panel(agenda_area, buf, styles);
+                render_agenda_panel(&agenda, agenda_area, buf, styles);
             }
 
             if let Some(timeline_area) = layout.timeline_area {
-                render_empty_timeline_panel(timeline_area, buf, styles);
+                render_timeline_panel(&agenda, timeline_area, buf, styles);
             }
         }
         DayViewLayoutMode::Minimal => {
             if area.height > 2 {
-                write_centered(
-                    buf,
-                    area.y + 2,
-                    area.x,
-                    area.width,
-                    "No agenda loaded",
-                    styles.content,
-                );
+                let text = if agenda.is_empty() {
+                    "No agenda loaded".to_string()
+                } else {
+                    agenda_summary(&agenda)
+                };
+                write_centered(buf, area.y + 2, area.x, area.width, &text, styles.content);
             }
         }
     }
 }
 
 fn render_day_header(
-    date: CalendarDate,
+    agenda: &DayAgenda,
     context: DayViewContext,
     layout: &DayViewLayout,
     buf: &mut Buffer,
@@ -568,7 +641,7 @@ fn render_day_header(
         layout.title_y,
         layout.area.x,
         layout.area.width,
-        &day_title(date),
+        &day_title(agenda.date),
         styles.title,
     );
 
@@ -577,20 +650,20 @@ fn render_day_header(
     };
 
     let summary = match context {
-        DayViewContext::Focused => "0 holidays | 0 events | Esc returns to month",
-        DayViewContext::ResponsiveFallback => "0 holidays | 0 events",
+        DayViewContext::Focused => format!("{} | Esc returns to month", agenda_summary(agenda)),
+        DayViewContext::ResponsiveFallback => agenda_summary(agenda),
     };
     write_centered(
         buf,
         summary_y,
         layout.area.x,
         layout.area.width,
-        summary,
+        &summary,
         styles.summary,
     );
 }
 
-fn render_empty_agenda_panel(area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
+fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
     render_panel(area, "Agenda", buf, styles);
 
     let content = inset_rect(area);
@@ -609,8 +682,55 @@ fn render_empty_agenda_panel(area: Rect, buf: &mut Buffer, styles: DayViewStyles
     );
     y += 1;
     if y < content.bottom() {
-        write_left(buf, y, content.x, content.width, "None", styles.muted);
-        y += 2;
+        if agenda.holidays.is_empty() {
+            write_left(buf, y, content.x, content.width, "None", styles.muted);
+            y += 2;
+        } else {
+            for holiday in &agenda.holidays {
+                if y >= content.bottom() {
+                    return;
+                }
+                write_left(
+                    buf,
+                    y,
+                    content.x,
+                    content.width,
+                    &format!("* {}", holiday.name),
+                    styles.holiday,
+                );
+                y += 1;
+            }
+            y += 1;
+        }
+    }
+
+    if !agenda.all_day_events.is_empty() && y < content.bottom() {
+        write_left(
+            buf,
+            y,
+            content.x,
+            content.width,
+            "All day",
+            styles.panel_title,
+        );
+        y += 1;
+
+        for event in &agenda.all_day_events {
+            if y >= content.bottom() {
+                return;
+            }
+            write_left(
+                buf,
+                y,
+                content.x,
+                content.width,
+                &format!("- {}", event.title),
+                styles.event,
+            );
+            y += 1;
+        }
+
+        y += 1;
     }
 
     if y < content.bottom() {
@@ -626,18 +746,35 @@ fn render_empty_agenda_panel(area: Rect, buf: &mut Buffer, styles: DayViewStyles
     }
 
     if y < content.bottom() {
-        write_left(
-            buf,
-            y,
-            content.x,
-            content.width,
-            "No events scheduled",
-            styles.muted,
-        );
+        if agenda.timed_events.is_empty() {
+            write_left(
+                buf,
+                y,
+                content.x,
+                content.width,
+                "No events scheduled",
+                styles.muted,
+            );
+        } else {
+            for event in &agenda.timed_events {
+                if y >= content.bottom() {
+                    return;
+                }
+                write_left(
+                    buf,
+                    y,
+                    content.x,
+                    content.width,
+                    &agenda_event_line(event),
+                    styles.event,
+                );
+                y += 1;
+            }
+        }
     }
 }
 
-fn render_empty_timeline_panel(area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
+fn render_timeline_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
     render_panel(area, "24-hour timeline", buf, styles);
 
     let content = inset_rect(area);
@@ -662,15 +799,20 @@ fn render_empty_timeline_panel(area: Rect, buf: &mut Buffer, styles: DayViewStyl
         }
     }
 
-    let message_y = content.y + content.height / 2;
-    write_centered(
-        buf,
-        message_y,
-        content.x,
-        content.width,
-        "No timed events",
-        styles.muted,
-    );
+    if agenda.timed_events.is_empty() {
+        let message_y = content.y + content.height / 2;
+        write_centered(
+            buf,
+            message_y,
+            content.x,
+            content.width,
+            "No timed events",
+            styles.muted,
+        );
+        return;
+    }
+
+    render_timeline_events(&agenda.timed_events, content, buf, styles);
 }
 
 fn render_panel(area: Rect, title: &str, buf: &mut Buffer, styles: DayViewStyles) {
@@ -688,6 +830,137 @@ fn render_panel(area: Rect, title: &str, buf: &mut Buffer, styles: DayViewStyles
         title,
         styles.panel_title,
     );
+}
+
+fn render_timeline_events(
+    events: &[TimedAgendaEvent],
+    content: Rect,
+    buf: &mut Buffer,
+    styles: DayViewStyles,
+) {
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    let event_x = content.x + content.width.min(7);
+    if event_x >= content.right() {
+        return;
+    }
+
+    let mut label_rows = Vec::new();
+
+    for event in events {
+        let start_y = timeline_y_for_minutes(content, event.visible_start.as_minutes());
+        let end_minute = event.visible_end.as_minutes().saturating_sub(1);
+        let end_y = timeline_y_for_minutes(content, end_minute);
+        let group_offset = u16::try_from(event.overlap_group)
+            .unwrap_or(u16::MAX)
+            .saturating_mul(2);
+        let block_x = event_x
+            .saturating_add(group_offset)
+            .min(content.right().saturating_sub(1));
+
+        for y in start_y..=end_y.max(start_y) {
+            set_cell(buf, block_x, y, "|", styles.timeline_event);
+        }
+
+        let label_x = block_x.saturating_add(2);
+        if label_x < content.right() {
+            let label_y = available_label_y(start_y, content, &mut label_rows);
+            write_left(
+                buf,
+                label_y,
+                label_x,
+                content.right() - label_x,
+                &agenda_event_line(event),
+                styles.timeline_event,
+            );
+        }
+    }
+}
+
+fn available_label_y(start_y: u16, content: Rect, used: &mut Vec<u16>) -> u16 {
+    let mut y = start_y;
+    while used.contains(&y) && y + 1 < content.bottom() {
+        y += 1;
+    }
+    used.push(y);
+    y
+}
+
+fn timeline_y_for_minutes(content: Rect, minute: u16) -> u16 {
+    let clamped = u32::from(minute.min(DayMinute::END.as_minutes()));
+    let height = u32::from(content.height.saturating_sub(1));
+    let offset = (clamped * height) / u32::from(DayMinute::END.as_minutes());
+    content.y + u16::try_from(offset).expect("timeline offset fits in terminal height")
+}
+
+fn agenda_summary(agenda: &DayAgenda) -> String {
+    format!(
+        "{} holidays | {} events",
+        agenda.holidays.len(),
+        agenda.all_day_events.len() + agenda.timed_events.len()
+    )
+}
+
+fn agenda_event_line(event: &TimedAgendaEvent) -> String {
+    let mut prefix = String::new();
+    if event.starts_before_day {
+        prefix.push('<');
+    }
+
+    prefix.push_str(&format!(
+        "{}-{}",
+        day_minute_label(event.visible_start),
+        day_minute_label(event.visible_end)
+    ));
+
+    if event.ends_after_day {
+        prefix.push('>');
+    }
+
+    format!("{prefix} {}", event.event.title)
+}
+
+fn month_preview_labels(agenda: &DayAgenda) -> Vec<String> {
+    agenda
+        .holidays
+        .iter()
+        .map(|holiday| holiday.name.clone())
+        .chain(
+            agenda
+                .all_day_events
+                .iter()
+                .map(|event| event.title.clone()),
+        )
+        .chain(
+            agenda
+                .timed_events
+                .iter()
+                .map(|event| month_event_preview_label(&event.event)),
+        )
+        .collect()
+}
+
+fn month_event_preview_label(event: &Event) -> String {
+    match event.timing {
+        EventTiming::Timed { start, .. } => {
+            format!(
+                "{} {}",
+                day_minute_label(DayMinute::from_time(start.time)),
+                event.title
+            )
+        }
+        EventTiming::AllDay { .. } => event.title.clone(),
+    }
+}
+
+fn month_preview_summary(count: usize, width: u16) -> String {
+    if width >= 9 {
+        format!("+{count} Events")
+    } else {
+        format!("+{count}")
+    }
 }
 
 fn render_title(
@@ -755,29 +1028,32 @@ fn render_week_title(
 fn render_cell(
     cell: &CalendarCell,
     layout: &MonthGridLayout,
+    agenda_source: &dyn AgendaSource,
     buf: &mut Buffer,
     styles: MonthGridStyles,
 ) {
     let rect = layout.cell_rect(cell.week_index, cell.weekday_index);
     let content = layout.cell_content_rect(cell.week_index, cell.weekday_index);
-    render_cell_in_rect(cell, rect, content, buf, styles);
+    render_cell_in_rect(cell, rect, content, agenda_source, buf, styles);
 }
 
 fn render_week_cell(
     cell: &CalendarCell,
     layout: &WeekGridLayout,
+    agenda_source: &dyn AgendaSource,
     buf: &mut Buffer,
     styles: MonthGridStyles,
 ) {
     let rect = layout.cell_rect(cell.weekday_index);
     let content = layout.cell_content_rect(cell.weekday_index);
-    render_cell_in_rect(cell, rect, content, buf, styles);
+    render_cell_in_rect(cell, rect, content, agenda_source, buf, styles);
 }
 
 fn render_cell_in_rect(
     cell: &CalendarCell,
     rect: Rect,
     content: Rect,
+    agenda_source: &dyn AgendaSource,
     buf: &mut Buffer,
     styles: MonthGridStyles,
 ) {
@@ -799,6 +1075,51 @@ fn render_cell_in_rect(
         usize::from(content.width),
         content_style,
     );
+    render_cell_previews(cell, content, agenda_source, buf, styles);
+}
+
+fn render_cell_previews(
+    cell: &CalendarCell,
+    content: Rect,
+    agenda_source: &dyn AgendaSource,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
+    if !cell.is_in_visible_month || content.width == 0 || content.height <= 1 {
+        return;
+    }
+
+    let agenda = DayAgenda::from_source(cell.date, agenda_source);
+    let previews = month_preview_labels(&agenda);
+    if previews.is_empty() {
+        return;
+    }
+
+    let capacity = usize::from(content.height - 1);
+    let first_y = content.y + 1;
+    if previews.len() > capacity {
+        let summary = month_preview_summary(previews.len(), content.width);
+        write_left(
+            buf,
+            first_y,
+            content.x,
+            content.width,
+            &summary,
+            styles.preview_summary,
+        );
+        return;
+    }
+
+    for (index, preview) in previews.into_iter().enumerate() {
+        write_left(
+            buf,
+            first_y + u16::try_from(index).expect("preview index fits in u16"),
+            content.x,
+            content.width,
+            &preview,
+            styles.preview,
+        );
+    }
 }
 
 fn week_title(week: &CalendarWeek) -> String {
@@ -845,6 +1166,11 @@ fn day_title(date: CalendarDate) -> String {
         date.day(),
         date.year()
     )
+}
+
+fn day_minute_label(minute: DayMinute) -> String {
+    let minutes = minute.as_minutes();
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
 }
 
 fn cell_style(cell: &CalendarCell, styles: MonthGridStyles) -> (Style, Style, BorderCharacters) {
@@ -1024,9 +1350,13 @@ fn distribute<const N: usize>(total: u16) -> [u16; N] {
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
-    use time::Month;
+    use time::{Month, Time};
 
-    use crate::calendar::CalendarDate;
+    use crate::{
+        agenda::{Event, EventDateTime, Holiday, InMemoryAgendaSource, SourceMetadata},
+        app::AppAction,
+        calendar::CalendarDate,
+    };
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
@@ -1058,6 +1388,25 @@ mod tests {
         let left = padding / 2;
         let right = padding - left;
         format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
+    }
+
+    fn source_metadata() -> SourceMetadata {
+        SourceMetadata::fixture()
+    }
+
+    fn at(date: CalendarDate, hour: u8, minute: u8) -> EventDateTime {
+        EventDateTime::new(
+            date,
+            Time::from_hms(hour, minute, 0).expect("valid test time"),
+        )
+    }
+
+    fn timed_event(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
+        Event::timed(id, title, start, end, source_metadata()).expect("valid test event")
+    }
+
+    fn agenda_source(events: Vec<Event>, holidays: Vec<Holiday>) -> InMemoryAgendaSource {
+        InMemoryAgendaSource::with_events_and_holidays(events, holidays)
     }
 
     #[test]
@@ -1254,7 +1603,7 @@ mod tests {
     fn app_view_renders_focused_empty_day_shell() {
         let app = {
             let mut app = AppState::new(date(2026, Month::April, 23));
-            app.apply(crate::app::AppAction::OpenDay);
+            app.apply(AppAction::OpenDay);
             app
         };
         let rendered = render_app_to_string(&app, 84, 14);
@@ -1271,6 +1620,88 @@ mod tests {
         assert!(rendered.contains("24-hour timeline"));
         assert!(rendered.contains("No timed events"));
         assert!(!rendered.contains("April 2026"));
+    }
+
+    #[test]
+    fn day_view_renders_holidays_events_and_timeline_blocks() {
+        let app = {
+            let mut app = AppState::new(date(2026, Month::April, 23));
+            app.apply(AppAction::OpenDay);
+            app
+        };
+        let source = InMemoryAgendaSource::development_fixture();
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 16, &source);
+
+        assert!(rendered.contains("1 holidays | 4 events | Esc returns to month"));
+        assert!(rendered.contains("* Earth Day"));
+        assert!(rendered.contains("- Release day"));
+        assert!(rendered.contains("09:00-09:30 Standup"));
+        assert!(rendered.contains("09:15-10:00 Review"));
+        assert!(rendered.contains("23:00-24:00> Late deploy"));
+        assert!(!rendered.contains("No timed events"));
+    }
+
+    #[test]
+    fn overlapping_timeline_events_keep_distinct_labels() {
+        let day = date(2026, Month::April, 23);
+        let app = {
+            let mut app = AppState::new(day);
+            app.apply(AppAction::OpenDay);
+            app
+        };
+        let source = agenda_source(
+            vec![
+                timed_event("alpha", "Alpha", at(day, 9, 0), at(day, 10, 0)),
+                timed_event("beta", "Beta", at(day, 9, 30), at(day, 10, 30)),
+            ],
+            Vec::new(),
+        );
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 14, &source);
+        let lines = rendered.lines().collect::<Vec<_>>();
+        let alpha_line = lines
+            .iter()
+            .position(|line| line.contains("09:00-10:00 Alpha"))
+            .expect("alpha appears on timeline");
+        let beta_line = lines
+            .iter()
+            .position(|line| line.contains("09:30-10:30 Beta"))
+            .expect("beta appears on timeline");
+
+        assert_ne!(alpha_line, beta_line);
+        assert!(rendered.contains("0 holidays | 2 events | Esc returns to month"));
+    }
+
+    #[test]
+    fn month_cells_render_previews_when_space_allows() {
+        let day = date(2026, Month::April, 23);
+        let app = AppState::new(day);
+        let source = agenda_source(
+            vec![timed_event("call", "Call", at(day, 9, 0), at(day, 9, 30))],
+            vec![Holiday::new("holiday", "Holiday", day, source_metadata())],
+        );
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Holiday"));
+        assert!(rendered.contains("09:00 Call"));
+        assert!(!rendered.contains("+2 Events"));
+    }
+
+    #[test]
+    fn month_cells_use_compact_summary_when_event_count_exceeds_space() {
+        let day = date(2026, Month::April, 23);
+        let app = AppState::new(day);
+        let source = agenda_source(
+            vec![
+                timed_event("one", "One", at(day, 9, 0), at(day, 9, 30)),
+                timed_event("two", "Two", at(day, 10, 0), at(day, 10, 30)),
+                timed_event("three", "Three", at(day, 11, 0), at(day, 11, 30)),
+            ],
+            Vec::new(),
+        );
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("+3 Events"));
+        assert!(!rendered.contains("09:00 One"));
     }
 
     #[test]
