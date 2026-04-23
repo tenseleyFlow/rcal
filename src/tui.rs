@@ -10,7 +10,8 @@ use time::Weekday;
 
 use crate::{
     app::{AppState, ViewMode},
-    calendar::{CalendarCell, CalendarMonth, DAYS_PER_WEEK, MONTH_GRID_WEEKS},
+    calendar::{CalendarCell, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS},
+    layout::ResponsiveLayout,
 };
 
 pub const DEFAULT_RENDER_WIDTH: u16 = 84;
@@ -54,13 +55,40 @@ impl<'a> AppView<'a> {
 
 impl Widget for AppView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        match self.app.view_mode() {
-            ViewMode::Month => {
+        match (self.app.view_mode(), ResponsiveLayout::for_area(area)) {
+            (ViewMode::Month, layout) if layout.should_render_month_grid() => {
                 let month = self.app.calendar_month();
                 MonthGrid::new(&month).render(area, buf);
             }
-            ViewMode::DayPlaceholder => render_day_placeholder(self.app, area, buf),
+            (ViewMode::Month, layout) if layout.should_render_week_view() => {
+                let month = self.app.calendar_month();
+                WeekGrid::new(&month).render(area, buf);
+            }
+            (ViewMode::Month | ViewMode::DayPlaceholder, _) => {
+                render_day_placeholder(self.app, area, buf)
+            }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WeekGrid<'a> {
+    month: &'a CalendarMonth,
+    styles: MonthGridStyles,
+}
+
+impl<'a> WeekGrid<'a> {
+    pub const fn new(month: &'a CalendarMonth) -> Self {
+        Self {
+            month,
+            styles: MonthGridStyles::new(),
+        }
+    }
+}
+
+impl Widget for WeekGrid<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        render_week_grid(self.month, area, buf, self.styles);
     }
 }
 
@@ -74,6 +102,66 @@ pub struct MonthGridLayout {
     row_heights: [u16; MONTH_GRID_WEEKS],
     column_bounds: [u16; DAYS_PER_WEEK + 1],
     row_bounds: [u16; MONTH_GRID_WEEKS + 1],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeekGridLayout {
+    pub area: Rect,
+    pub title_y: u16,
+    pub weekday_y: u16,
+    pub grid_area: Rect,
+    column_widths: [u16; DAYS_PER_WEEK],
+    column_bounds: [u16; DAYS_PER_WEEK + 1],
+}
+
+impl WeekGridLayout {
+    pub fn new(area: Rect) -> Option<Self> {
+        if area.width < VERTICAL_GRID_LINES || area.height < HEADER_HEIGHT + 2 {
+            return None;
+        }
+
+        let grid_area = Rect::new(
+            area.x,
+            area.y + HEADER_HEIGHT,
+            area.width,
+            area.height - HEADER_HEIGHT,
+        );
+        let column_widths = distribute::<DAYS_PER_WEEK>(grid_area.width - VERTICAL_GRID_LINES);
+
+        let mut column_bounds = [0; DAYS_PER_WEEK + 1];
+        column_bounds[0] = grid_area.x;
+        for index in 0..DAYS_PER_WEEK {
+            column_bounds[index + 1] = column_bounds[index] + column_widths[index] + 1;
+        }
+
+        Some(Self {
+            area,
+            title_y: area.y,
+            weekday_y: area.y + 1,
+            grid_area,
+            column_widths,
+            column_bounds,
+        })
+    }
+
+    pub fn cell_rect(&self, weekday_index: usize) -> Rect {
+        Rect::new(
+            self.column_bounds[weekday_index],
+            self.grid_area.y,
+            self.column_widths[weekday_index] + 2,
+            self.grid_area.height,
+        )
+    }
+
+    pub fn cell_content_rect(&self, weekday_index: usize) -> Rect {
+        let cell = self.cell_rect(weekday_index);
+        Rect::new(
+            cell.x + 1,
+            cell.y + 1,
+            cell.width.saturating_sub(2),
+            cell.height.saturating_sub(2),
+        )
+    }
 }
 
 impl MonthGridLayout {
@@ -181,6 +269,13 @@ pub fn render_month_to_string(month: &CalendarMonth, width: u16, height: u16) ->
     buffer_to_string(&buffer)
 }
 
+pub fn render_app_to_string(app: &AppState, width: u16, height: u16) -> String {
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    AppView::new(app).render(area, &mut buffer);
+    buffer_to_string(&buffer)
+}
+
 pub fn buffer_to_string(buffer: &Buffer) -> String {
     let mut output =
         String::with_capacity(usize::from(buffer.area.width + 1) * usize::from(buffer.area.height));
@@ -215,6 +310,35 @@ fn render_month_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles
     if let Some(selected) = month.selected_cell() {
         render_cell(selected, &layout, buf, styles);
     }
+}
+
+fn render_week_grid(month: &CalendarMonth, area: Rect, buf: &mut Buffer, styles: MonthGridStyles) {
+    let Some(layout) = WeekGridLayout::new(area) else {
+        render_too_small_message(area, buf, styles);
+        return;
+    };
+
+    let Some(selected_week) = selected_week(month) else {
+        render_too_small_message(area, buf, styles);
+        return;
+    };
+
+    buf.set_style(area, Style::default());
+    render_week_title(selected_week, &layout, buf, styles);
+    render_weekdays_for_week(&layout, buf, styles);
+
+    for cell in selected_week.cells.iter().filter(|cell| !cell.is_selected) {
+        render_week_cell(cell, &layout, buf, styles);
+    }
+
+    if let Some(selected) = selected_week.cells.iter().find(|cell| cell.is_selected) {
+        render_week_cell(selected, &layout, buf, styles);
+    }
+}
+
+fn selected_week(month: &CalendarMonth) -> Option<&CalendarWeek> {
+    let selected = month.selected_cell()?;
+    month.weeks.get(selected.week_index)
 }
 
 fn render_too_small_message(area: Rect, buf: &mut Buffer, styles: MonthGridStyles) {
@@ -307,6 +431,37 @@ fn render_weekdays(layout: &MonthGridLayout, buf: &mut Buffer, styles: MonthGrid
     }
 }
 
+fn render_weekdays_for_week(layout: &WeekGridLayout, buf: &mut Buffer, styles: MonthGridStyles) {
+    for (index, weekday) in weekday_labels().into_iter().enumerate() {
+        let content = layout.cell_content_rect(index);
+        write_centered(
+            buf,
+            layout.weekday_y,
+            content.x,
+            content.width,
+            weekday,
+            styles.weekday,
+        );
+    }
+}
+
+fn render_week_title(
+    week: &CalendarWeek,
+    layout: &WeekGridLayout,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
+    let title = week_title(week);
+    write_centered(
+        buf,
+        layout.title_y,
+        layout.area.x,
+        layout.area.width,
+        &title,
+        styles.title,
+    );
+}
+
 fn render_cell(
     cell: &CalendarCell,
     layout: &MonthGridLayout,
@@ -315,6 +470,27 @@ fn render_cell(
 ) {
     let rect = layout.cell_rect(cell.week_index, cell.weekday_index);
     let content = layout.cell_content_rect(cell.week_index, cell.weekday_index);
+    render_cell_in_rect(cell, rect, content, buf, styles);
+}
+
+fn render_week_cell(
+    cell: &CalendarCell,
+    layout: &WeekGridLayout,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
+    let rect = layout.cell_rect(cell.weekday_index);
+    let content = layout.cell_content_rect(cell.weekday_index);
+    render_cell_in_rect(cell, rect, content, buf, styles);
+}
+
+fn render_cell_in_rect(
+    cell: &CalendarCell,
+    rect: Rect,
+    content: Rect,
+    buf: &mut Buffer,
+    styles: MonthGridStyles,
+) {
     let (content_style, border_style, border_chars) = cell_style(cell, styles);
 
     buf.set_style(rect, content_style);
@@ -333,6 +509,42 @@ fn render_cell(
         usize::from(content.width),
         content_style,
     );
+}
+
+fn week_title(week: &CalendarWeek) -> String {
+    let first = week.cells[0].date;
+    let last = week.cells[DAYS_PER_WEEK - 1].date;
+
+    if first.year() != last.year() {
+        return format!(
+            "{} {}, {} - {} {}, {}",
+            first.month(),
+            first.day(),
+            first.year(),
+            last.month(),
+            last.day(),
+            last.year()
+        );
+    }
+
+    if first.month() != last.month() {
+        return format!(
+            "{} {} - {} {}, {}",
+            first.month(),
+            first.day(),
+            last.month(),
+            last.day(),
+            last.year()
+        );
+    }
+
+    format!(
+        "{} {}-{}, {}",
+        first.month(),
+        first.day(),
+        last.day(),
+        last.year()
+    )
 }
 
 fn cell_style(cell: &CalendarCell, styles: MonthGridStyles) -> (Style, Style, BorderCharacters) {
@@ -621,6 +833,70 @@ mod tests {
         assert!(rendered.contains("April 2026"));
         assert!(rendered.contains("Sun"));
         assert!(rendered.contains("[23*]"));
+    }
+
+    #[test]
+    fn app_view_prefers_month_grid_when_full_month_fits() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let rendered = render_app_to_string(&app, 49, 20);
+
+        assert!(rendered.contains("April 2026"));
+        assert!(rendered.contains("Sun"));
+        assert!(rendered.contains("[23*]"));
+        assert!(rendered.contains("30"));
+    }
+
+    #[test]
+    fn app_view_uses_week_fallback_under_height_pressure() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let rendered = render_app_to_string(&app, 84, 8);
+
+        assert!(rendered.contains("April 19-25, 2026"));
+        assert!(rendered.contains("Sun"));
+        assert!(rendered.contains("[23*]"));
+        assert!(!rendered.contains("April 2026"));
+        assert!(!rendered.contains("29"));
+    }
+
+    #[test]
+    fn app_view_uses_day_fallback_when_week_cannot_fit() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let rendered = render_app_to_string(&app, 35, 10);
+
+        assert!(rendered.contains("April 23, 2026"));
+        assert!(rendered.contains("No agenda loaded"));
+        assert!(!rendered.contains("Sun"));
+    }
+
+    #[test]
+    fn constrained_week_fallback_has_stable_ascii_snapshot() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let rendered = render_app_to_string(&app, 36, 6);
+        let lines: Vec<_> = rendered.lines().collect();
+
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0], "         April 19-25, 2026          ");
+        assert_eq!(lines[1], " Sun  Mon  Tue  Wed  Thu  Fri  Sat  ");
+        assert!(rendered.contains("23*"));
+        assert!(rendered.contains("#"));
+        assert!(rendered.contains("+----+"));
+    }
+
+    #[test]
+    fn responsive_resize_recomputes_without_changing_selection() {
+        let app = AppState::from_dates(date(2026, Month::April, 18), date(2026, Month::April, 23));
+        let selected = app.selected_date();
+
+        let month = render_app_to_string(&app, 84, 26);
+        let week = render_app_to_string(&app, 84, 8);
+        let day = render_app_to_string(&app, 35, 10);
+
+        assert_eq!(app.selected_date(), selected);
+        assert!(month.contains("April 2026"));
+        assert!(month.contains("[18]"));
+        assert!(week.contains("April 12-18, 2026"));
+        assert!(week.contains("[18]"));
+        assert!(day.contains("April 18, 2026"));
     }
 
     #[test]

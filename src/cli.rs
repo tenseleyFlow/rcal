@@ -14,8 +14,8 @@ use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
     app::{AppState, KeyboardInput},
-    calendar::{CalendarDate, CalendarMonth},
-    tui::{AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, render_month_to_string},
+    calendar::CalendarDate,
+    tui::{AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, render_app_to_string},
 };
 
 const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
@@ -76,9 +76,9 @@ where
 {
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
-            let month = CalendarMonth::for_launch_date(config.start_date);
+            let app = AppState::new(config.start_date);
             let (width, height) = terminal_size();
-            let rendered = render_month_to_string(&month, width, height);
+            let rendered = render_app_to_string(&app, width, height);
             match write!(stdout, "{rendered}") {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
@@ -205,9 +205,13 @@ where
             return Ok(());
         }
 
-        if let Event::Key(key) = event::read()? {
-            let action = keyboard.translate(key);
-            app.apply(action);
+        match event::read()? {
+            Event::Key(key) => {
+                let action = keyboard.translate(key);
+                app.apply(action);
+            }
+            Event::Resize(_, _) => keyboard.clear(),
+            _ => {}
         }
     }
 }
