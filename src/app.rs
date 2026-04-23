@@ -6,7 +6,7 @@ use crate::calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     Month,
-    DayPlaceholder,
+    Day,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,7 @@ impl AppState {
         match action {
             AppAction::Noop => {}
             AppAction::Quit => self.should_quit = true,
-            AppAction::OpenDay => self.view_mode = ViewMode::DayPlaceholder,
+            AppAction::OpenDay => self.view_mode = ViewMode::Day,
             AppAction::CloseDay => self.view_mode = ViewMode::Month,
             AppAction::MoveDays(days) if self.view_mode == ViewMode::Month => {
                 self.selected_date = self.selected_date.add_days(days);
@@ -359,12 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_day_placeholder_and_escape_returns_to_month() {
+    fn enter_opens_day_view_and_escape_returns_to_month() {
         let mut app = AppState::new(date(2026, Month::April, 23));
         let mut input = KeyboardInput::default();
 
         apply_keys(&mut app, &mut input, [key(KeyCode::Enter)]);
-        assert_eq!(app.view_mode(), ViewMode::DayPlaceholder);
+        assert_eq!(app.view_mode(), ViewMode::Day);
         assert_eq!(app.selected_date(), date(2026, Month::April, 23));
 
         apply_keys(&mut app, &mut input, [key(KeyCode::Left)]);
@@ -372,6 +372,7 @@ mod tests {
 
         apply_keys(&mut app, &mut input, [key(KeyCode::Esc)]);
         assert_eq!(app.view_mode(), ViewMode::Month);
+        assert_eq!(app.selected_date(), date(2026, Month::April, 23));
     }
 
     #[test]
