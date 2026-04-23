@@ -12,7 +12,7 @@ use crate::{
     agenda::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
-    app::{AppState, CreateEventForm, ViewMode},
+    app::{AppState, CreateEventForm, CreateEventFormRowKind, ViewMode},
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
     },
@@ -478,6 +478,8 @@ struct CreateModalStyles {
     title: Style,
     label: Style,
     value: Style,
+    checkbox: Style,
+    checkbox_mark: Style,
     error: Style,
     footer: Style,
 }
@@ -491,8 +493,10 @@ impl CreateModalStyles {
                 .fg(Color::Cyan)
                 .bg(Color::Black)
                 .add_modifier(Modifier::BOLD),
-            label: Style::new().fg(Color::Gray).bg(Color::Black),
-            value: Style::new().fg(Color::White).bg(Color::Black),
+            label: Style::new().fg(Color::White).bg(Color::Black),
+            value: Style::new().fg(Color::Gray).bg(Color::Black),
+            checkbox: Style::new().fg(Color::Yellow).bg(Color::Black),
+            checkbox_mark: Style::new().fg(Color::White).bg(Color::Black),
             error: Style::new()
                 .fg(Color::Red)
                 .bg(Color::Black)
@@ -835,7 +839,14 @@ fn render_create_event_modal(
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
         if value_x < content.right() {
             let value_width = content.right() - value_x;
-            write_padded_left(buf, y, value_x, value_width, &row.value, styles.value);
+            match row.kind {
+                CreateEventFormRowKind::Text => {
+                    write_padded_left(buf, y, value_x, value_width, &row.value, styles.value);
+                }
+                CreateEventFormRowKind::Toggle => {
+                    write_toggle_value(buf, y, value_x, value_width, &row.value, styles);
+                }
+            }
         }
     }
 
@@ -1609,6 +1620,29 @@ fn write_padded_left(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, s
     buf.set_stringn(x, y, text, usize::from(width), style);
 }
 
+fn write_toggle_value(
+    buf: &mut Buffer,
+    y: u16,
+    x: u16,
+    width: u16,
+    value: &str,
+    styles: CreateModalStyles,
+) {
+    write_padded_left(buf, y, x, width, value, styles.value);
+    if width == 0 || !value.starts_with('[') {
+        return;
+    }
+
+    set_cell(buf, x, y, "[", styles.checkbox);
+    if width > 1 {
+        let mark = value.get(1..2).unwrap_or(" ");
+        set_cell(buf, x.saturating_add(1), y, mark, styles.checkbox_mark);
+    }
+    if width > 2 && value.get(2..3) == Some("]") {
+        set_cell(buf, x.saturating_add(2), y, "]", styles.checkbox);
+    }
+}
+
 const fn inset_rect(area: Rect) -> Rect {
     Rect::new(
         area.x.saturating_add(1),
@@ -1652,6 +1686,7 @@ fn distribute<const N: usize>(total: u16) -> [u16; N] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::style::Modifier;
     use time::{Month, Time};
 
@@ -1673,6 +1708,10 @@ mod tests {
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
     }
 
     fn render_test_buffer(month: &CalendarMonth, width: u16, height: u16) -> Buffer {
@@ -1728,16 +1767,24 @@ mod tests {
         }
     }
 
+    fn assert_styled_cell(buffer: &Buffer, x: u16, y: u16, symbol: &str, fg: Color) {
+        let cell = buffer.cell((x, y)).expect("text cell exists");
+        assert_eq!(cell.symbol(), symbol);
+        assert_eq!(cell.fg, fg);
+        assert_eq!(cell.bg, Color::Black);
+        assert!(!cell.modifier.contains(Modifier::DIM));
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+    }
+
     fn assert_styled_text(buffer: &Buffer, x: u16, y: u16, text: &str, fg: Color) {
         for (offset, character) in text.chars().enumerate() {
-            let cell = buffer
-                .cell((x + u16::try_from(offset).expect("offset fits"), y))
-                .expect("text cell exists");
-            assert_eq!(cell.symbol(), character.to_string());
-            assert_eq!(cell.fg, fg);
-            assert_eq!(cell.bg, Color::Black);
-            assert!(!cell.modifier.contains(Modifier::DIM));
-            assert!(!cell.modifier.contains(Modifier::BOLD));
+            assert_styled_cell(
+                buffer,
+                x + u16::try_from(offset).expect("offset fits"),
+                y,
+                &character.to_string(),
+                fg,
+            );
         }
     }
 
@@ -1955,10 +2002,13 @@ mod tests {
     }
 
     #[test]
-    fn create_modal_uses_gray_labels_and_white_values() {
+    fn create_modal_uses_bright_labels_gray_values_and_checkbox_styles() {
         let selected = date(2026, Month::April, 23);
         let mut app = AppState::new(selected);
         app.apply(AppAction::OpenCreate);
+        let _ = app.handle_create_key(key(KeyCode::Char('A')));
+        let _ = app.handle_create_key(key(KeyCode::Tab));
+        let _ = app.handle_create_key(key(KeyCode::Enter));
 
         let area = Rect::new(0, 0, 84, 26);
         let buffer = render_app_buffer(&app, area.width, area.height);
@@ -1969,13 +2019,20 @@ mod tests {
         let label_width = 12.min(content.width.saturating_sub(1));
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
 
-        assert_styled_text(&buffer, content.x, row_y, ">", Color::Gray);
-        assert_styled_text(&buffer, label_x, row_y, "Title", Color::Gray);
-        assert_styled_text(&buffer, label_x, row_y + 2, "Start date", Color::Gray);
-        assert_styled_text(&buffer, value_x, row_y + 1, "[ ]", Color::White);
-        assert_styled_text(&buffer, value_x, row_y + 2, "2026-04-23", Color::White);
-        assert_styled_text(&buffer, value_x, row_y + 3, "09:00", Color::White);
-        assert_styled_text(&buffer, value_x, row_y + 8, "[ ] 5m", Color::White);
+        assert_styled_text(&buffer, content.x, row_y + 1, ">", Color::White);
+        assert_styled_text(&buffer, label_x, row_y, "Title", Color::White);
+        assert_styled_text(&buffer, label_x, row_y + 1, "All day", Color::White);
+        assert_styled_text(&buffer, label_x, row_y + 2, "Start date", Color::White);
+        assert_styled_text(&buffer, value_x, row_y, "A", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 2, "2026-04-23", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 3, "09:00", Color::Gray);
+        assert_styled_cell(&buffer, value_x, row_y + 1, "[", Color::Yellow);
+        assert_styled_cell(&buffer, value_x + 1, row_y + 1, "x", Color::White);
+        assert_styled_cell(&buffer, value_x + 2, row_y + 1, "]", Color::Yellow);
+        assert_styled_cell(&buffer, value_x, row_y + 8, "[", Color::Yellow);
+        assert_styled_cell(&buffer, value_x + 1, row_y + 8, " ", Color::White);
+        assert_styled_cell(&buffer, value_x + 2, row_y + 8, "]", Color::Yellow);
+        assert_styled_text(&buffer, value_x + 4, row_y + 8, "5m", Color::Gray);
     }
 
     #[test]
