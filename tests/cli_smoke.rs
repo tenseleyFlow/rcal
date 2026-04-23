@@ -15,7 +15,9 @@ fn deterministic_date_flag_succeeds() {
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("2026-04-23"));
+    assert!(stdout.contains("April 2026"));
+    assert!(stdout.contains("Sun"));
+    assert!(stdout.contains("[23*]"));
 }
 
 #[test]

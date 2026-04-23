@@ -1,12 +1,17 @@
 use std::{
     ffi::{OsStr, OsString},
     fmt,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
 };
 
+use crossterm::terminal;
+use ratatui::{Terminal, backend::CrosstermBackend};
 use time::{Date, OffsetDateTime, format_description};
 
-use crate::calendar::CalendarDate;
+use crate::{
+    calendar::{CalendarDate, CalendarMonth},
+    tui::{DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, MonthGrid, render_month_to_string},
+};
 
 const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD]\n";
 
@@ -44,6 +49,20 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
+pub fn run_terminal<I>(args: I) -> std::process::ExitCode
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let stdout = io::stdout();
+    let stderr = io::stderr();
+
+    if stdout.is_terminal() {
+        run_styled_terminal(args, stdout, stderr)
+    } else {
+        run(args, stdout, stderr)
+    }
+}
+
 pub fn run<I, W, E>(args: I, mut stdout: W, mut stderr: E) -> std::process::ExitCode
 where
     I: IntoIterator<Item = OsString>,
@@ -52,7 +71,35 @@ where
 {
     match parse_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
-            match writeln!(stdout, "rcal will open focused on {}", config.start_date) {
+            let month = CalendarMonth::for_launch_date(config.start_date);
+            let (width, height) = terminal_size();
+            let rendered = render_month_to_string(&month, width, height);
+            match write!(stdout, "{rendered}") {
+                Ok(()) => std::process::ExitCode::SUCCESS,
+                Err(err) => io_error_exit(&mut stderr, err),
+            }
+        }
+        Ok(CliAction::Help) => match write!(stdout, "{USAGE}") {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => io_error_exit(&mut stderr, err),
+        },
+        Err(err) => {
+            let _ = writeln!(stderr, "error: {err}\n\n{USAGE}");
+            std::process::ExitCode::from(2)
+        }
+    }
+}
+
+fn run_styled_terminal<I, W, E>(args: I, mut stdout: W, mut stderr: E) -> std::process::ExitCode
+where
+    I: IntoIterator<Item = OsString>,
+    W: Write,
+    E: Write,
+{
+    match parse_args(args, default_start_date()) {
+        Ok(CliAction::Run(config)) => {
+            let month = CalendarMonth::for_launch_date(config.start_date);
+            match draw_month_to_terminal(stdout, &month) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
@@ -111,6 +158,25 @@ fn default_start_date() -> Date {
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
         .date()
+}
+
+fn terminal_size() -> (u16, u16) {
+    terminal::size()
+        .ok()
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .unwrap_or((DEFAULT_RENDER_WIDTH, DEFAULT_RENDER_HEIGHT))
+}
+
+fn draw_month_to_terminal<W>(stdout: W, month: &CalendarMonth) -> io::Result<()>
+where
+    W: Write,
+{
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|frame| {
+        frame.render_widget(MonthGrid::new(month), frame.area());
+    })?;
+    Ok(())
 }
 
 fn parse_date_arg(value: &OsStr) -> Result<Date, CliError> {
