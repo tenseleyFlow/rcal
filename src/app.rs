@@ -1,4 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use time::Weekday;
 
 use crate::{
@@ -70,6 +72,9 @@ impl AppState {
             AppAction::MoveDays(days) if self.view_mode == ViewMode::Month => {
                 self.selected_date = self.selected_date.add_days(days);
             }
+            AppAction::SelectDate(date) if self.view_mode == ViewMode::Month => {
+                self.selected_date = date;
+            }
             AppAction::JumpToDay(day) if self.view_mode == ViewMode::Month => {
                 if let Some(date) = self.calendar_month().current.date(day) {
                     self.selected_date = date;
@@ -80,7 +85,10 @@ impl AppState {
                     self.selected_date = date;
                 }
             }
-            AppAction::MoveDays(_) | AppAction::JumpToDay(_) | AppAction::JumpToWeekday(_) => {}
+            AppAction::MoveDays(_)
+            | AppAction::SelectDate(_)
+            | AppAction::JumpToDay(_)
+            | AppAction::JumpToWeekday(_) => {}
         }
     }
 
@@ -101,6 +109,7 @@ impl AppState {
 pub enum AppAction {
     Noop,
     MoveDays(i32),
+    SelectDate(CalendarDate),
     JumpToDay(u8),
     JumpToWeekday(Weekday),
     OpenDay,
@@ -237,6 +246,45 @@ impl KeyboardInput {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MouseInput {
+    pending_open_date: Option<CalendarDate>,
+}
+
+impl MouseInput {
+    pub fn translate(
+        &mut self,
+        mouse: MouseEvent,
+        target_date: Option<CalendarDate>,
+        selected_date: CalendarDate,
+    ) -> AppAction {
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(target_date) = target_date else {
+                    self.clear();
+                    return AppAction::Noop;
+                };
+
+                if self.pending_open_date == Some(target_date) && selected_date == target_date {
+                    self.clear();
+                    AppAction::OpenDay
+                } else {
+                    self.pending_open_date = Some(target_date);
+                    AppAction::SelectDate(target_date)
+                }
+            }
+            _ => {
+                self.clear();
+                AppAction::Noop
+            }
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.pending_open_date = None;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 enum PendingKey {
     #[default]
     None,
@@ -252,7 +300,7 @@ fn ctrl_c(value: char, modifiers: KeyModifiers) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use time::Month;
 
     use crate::agenda::{Holiday, InMemoryAgendaSource, SourceMetadata};
@@ -267,6 +315,19 @@ mod tests {
 
     fn char_key(value: char) -> KeyEvent {
         key(KeyCode::Char(value))
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    fn mouse_down(column: u16, row: u16) -> MouseEvent {
+        mouse_event(MouseEventKind::Down(MouseButton::Left), column, row)
     }
 
     fn apply_keys(
@@ -395,6 +456,70 @@ mod tests {
         apply_keys(&mut app, &mut input, [char_key('q')]);
 
         assert!(app.should_quit());
+    }
+
+    #[test]
+    fn select_date_action_can_pick_adjacent_month_cells() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+
+        app.apply(AppAction::SelectDate(date(2026, Month::May, 1)));
+
+        assert_eq!(app.selected_date(), date(2026, Month::May, 1));
+    }
+
+    #[test]
+    fn mouse_click_selects_then_second_click_opens_day() {
+        let target = date(2026, Month::April, 18);
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = MouseInput::default();
+
+        let action = input.translate(mouse_down(10, 10), Some(target), app.selected_date());
+        app.apply(action);
+
+        assert_eq!(app.selected_date(), target);
+        assert_eq!(app.view_mode(), ViewMode::Month);
+
+        let action = input.translate(mouse_down(10, 10), Some(target), app.selected_date());
+        app.apply(action);
+
+        assert_eq!(app.view_mode(), ViewMode::Day);
+    }
+
+    #[test]
+    fn mouse_clicks_without_a_date_target_are_ignored() {
+        let mut input = MouseInput::default();
+        let selected = date(2026, Month::April, 23);
+
+        let action = input.translate(mouse_down(0, 0), None, selected);
+
+        assert_eq!(action, AppAction::Noop);
+    }
+
+    #[test]
+    fn non_left_mouse_actions_clear_pending_open() {
+        let target = date(2026, Month::April, 18);
+        let mut input = MouseInput::default();
+
+        assert_eq!(
+            input.translate(
+                mouse_down(10, 10),
+                Some(target),
+                date(2026, Month::April, 23),
+            ),
+            AppAction::SelectDate(target)
+        );
+        assert_eq!(
+            input.translate(
+                mouse_event(MouseEventKind::Down(MouseButton::Right), 10, 10),
+                Some(target),
+                target,
+            ),
+            AppAction::Noop
+        );
+        assert_eq!(
+            input.translate(mouse_down(10, 10), Some(target), target),
+            AppAction::SelectDate(target)
+        );
     }
 
     #[test]

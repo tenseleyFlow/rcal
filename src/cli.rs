@@ -5,19 +5,19 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
     agenda::{AgendaSource, ConfiguredAgendaSource, HolidayProvider},
-    app::{AppState, KeyboardInput},
+    app::{AppState, KeyboardInput, MouseInput},
     calendar::CalendarDate,
     tui::{
-        AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH,
+        AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
         render_app_to_string_with_agenda_source,
     },
 };
@@ -287,16 +287,35 @@ fn agenda_source(config: &AppConfig) -> ConfiguredAgendaSource {
     ConfiguredAgendaSource::development(holidays)
 }
 
-fn run_interactive_terminal<W, S>(mut stdout: W, app: AppState, agenda_source: &S) -> io::Result<()>
+fn run_interactive_terminal<W, S>(stdout: W, app: AppState, agenda_source: &S) -> io::Result<()>
 where
     W: Write,
     S: AgendaSource,
 {
     terminal::enable_raw_mode()?;
-    execute!(stdout, EnterAlternateScreen)?;
-
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    let mut terminal = match Terminal::new(backend) {
+        Ok(terminal) => terminal,
+        Err(err) => {
+            let _ = terminal::disable_raw_mode();
+            return Err(err);
+        }
+    };
+
+    if let Err(err) = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ) {
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
+        let _ = terminal::disable_raw_mode();
+        return Err(err);
+    }
+
     let result = run_event_loop(&mut terminal, app, agenda_source);
     let cleanup_result = restore_terminal(&mut terminal);
 
@@ -313,6 +332,7 @@ where
     S: AgendaSource,
 {
     let mut keyboard = KeyboardInput::default();
+    let mut mouse = MouseInput::default();
 
     loop {
         terminal.draw(|frame| {
@@ -328,10 +348,23 @@ where
 
         match event::read()? {
             Event::Key(key) => {
+                mouse.clear();
                 let action = keyboard.translate(key);
                 app.apply(action);
             }
-            Event::Resize(_, _) => keyboard.clear(),
+            Event::Mouse(mouse_event) => {
+                keyboard.clear();
+                let size = terminal.size()?;
+                let area = Rect::new(0, 0, size.width, size.height);
+                let target_date =
+                    hit_test_app_date(&app, area, mouse_event.column, mouse_event.row);
+                let action = mouse.translate(mouse_event, target_date, app.selected_date());
+                app.apply(action);
+            }
+            Event::Resize(_, _) => {
+                keyboard.clear();
+                mouse.clear();
+            }
             _ => {}
         }
     }
@@ -341,9 +374,17 @@ fn restore_terminal<W>(terminal: &mut Terminal<CrosstermBackend<W>>) -> io::Resu
 where
     W: Write,
 {
-    terminal::disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    let raw_result = terminal::disable_raw_mode();
+    let screen_result = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    let cursor_result = terminal.show_cursor();
+
+    raw_result?;
+    screen_result?;
+    cursor_result?;
     Ok(())
 }
 

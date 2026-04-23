@@ -2,7 +2,7 @@ use std::array;
 
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     widgets::Widget,
 };
@@ -493,6 +493,28 @@ where
     buffer_to_string(&buffer)
 }
 
+pub fn hit_test_app_date(
+    app: &AppState,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<CalendarDate> {
+    if !contains_position(area, column, row) {
+        return None;
+    }
+
+    let month = app.calendar_month();
+    match (app.view_mode(), ResponsiveLayout::for_area(area)) {
+        (ViewMode::Month, layout) if layout.should_render_month_grid() => {
+            hit_test_month_grid_date(&month, area, column, row)
+        }
+        (ViewMode::Month, layout) if layout.should_render_week_view() => {
+            hit_test_week_grid_date(&month, area, column, row)
+        }
+        _ => None,
+    }
+}
+
 pub fn buffer_to_string(buffer: &Buffer) -> String {
     let mut output =
         String::with_capacity(usize::from(buffer.area.width + 1) * usize::from(buffer.area.height));
@@ -508,6 +530,57 @@ pub fn buffer_to_string(buffer: &Buffer) -> String {
     }
 
     output
+}
+
+fn hit_test_month_grid_date(
+    month: &CalendarMonth,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<CalendarDate> {
+    let layout = MonthGridLayout::new(area)?;
+    if !contains_position(layout.grid_area, column, row) {
+        return None;
+    }
+
+    let week_index = hit_test_bounds(&layout.row_bounds, row)?;
+    let weekday_index = hit_test_bounds(&layout.column_bounds, column)?;
+    Some(month.weeks[week_index].cells[weekday_index].date)
+}
+
+fn hit_test_week_grid_date(
+    month: &CalendarMonth,
+    area: Rect,
+    column: u16,
+    row: u16,
+) -> Option<CalendarDate> {
+    let layout = WeekGridLayout::new(area)?;
+    let week = selected_week(month)?;
+    if !contains_position(layout.grid_area, column, row) {
+        return None;
+    }
+
+    let weekday_index = hit_test_bounds(&layout.column_bounds, column)?;
+    Some(week.cells[weekday_index].date)
+}
+
+fn hit_test_bounds(bounds: &[u16], coordinate: u16) -> Option<usize> {
+    let final_index = bounds.len().checked_sub(2)?;
+
+    for index in 0..=final_index {
+        let start = bounds[index];
+        let end = bounds[index + 1];
+        if coordinate >= start && (coordinate < end || (index == final_index && coordinate == end))
+        {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn contains_position(area: Rect, column: u16, row: u16) -> bool {
+    area.contains(Position { x: column, y: row })
 }
 
 fn render_month_grid(
@@ -1520,6 +1593,39 @@ mod tests {
     }
 
     #[test]
+    fn hit_test_selects_date_in_month_grid() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let area = Rect::new(0, 0, 84, 26);
+        let month = app.calendar_month();
+        let layout = MonthGridLayout::new(area).expect("supported layout");
+        let target = cell_for_day(&month, 18);
+        let content = layout.cell_content_rect(target.week_index, target.weekday_index);
+
+        assert_eq!(
+            hit_test_app_date(&app, area, content.x, content.y),
+            Some(date(2026, Month::April, 18))
+        );
+        assert_eq!(
+            hit_test_app_date(
+                &app,
+                area,
+                layout.cell_rect(target.week_index, target.weekday_index).x,
+                layout.cell_rect(target.week_index, target.weekday_index).y,
+            ),
+            Some(date(2026, Month::April, 18))
+        );
+    }
+
+    #[test]
+    fn hit_test_ignores_month_grid_chrome() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let area = Rect::new(0, 0, 84, 26);
+
+        assert_eq!(hit_test_app_date(&app, area, 0, 0), None);
+        assert_eq!(hit_test_app_date(&app, area, 83, 1), None);
+    }
+
+    #[test]
     fn app_view_uses_week_fallback_under_height_pressure() {
         let app = AppState::new(date(2026, Month::April, 23));
         let rendered = render_app_to_string(&app, 84, 8);
@@ -1532,6 +1638,26 @@ mod tests {
     }
 
     #[test]
+    fn hit_test_selects_date_in_week_fallback() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let area = Rect::new(0, 0, 84, 8);
+        let month = app.calendar_month();
+        let week = selected_week(&month).expect("selected week exists");
+        let target = week
+            .cells
+            .iter()
+            .find(|cell| cell.date.day() == 21)
+            .expect("target date appears in selected week");
+        let layout = WeekGridLayout::new(area).expect("supported week layout");
+        let content = layout.cell_content_rect(target.weekday_index);
+
+        assert_eq!(
+            hit_test_app_date(&app, area, content.x, content.y),
+            Some(date(2026, Month::April, 21))
+        );
+    }
+
+    #[test]
     fn app_view_uses_day_fallback_when_week_cannot_fit() {
         let app = AppState::new(date(2026, Month::April, 23));
         let rendered = render_app_to_string(&app, 35, 10);
@@ -1539,6 +1665,22 @@ mod tests {
         assert!(rendered.contains("April 23, 2026"));
         assert!(rendered.contains("No agenda loaded"));
         assert!(!rendered.contains("Sun"));
+    }
+
+    #[test]
+    fn hit_test_ignores_day_fallback_and_focused_day_view() {
+        let month_app = AppState::new(date(2026, Month::April, 23));
+        assert_eq!(
+            hit_test_app_date(&month_app, Rect::new(0, 0, 35, 10), 10, 2),
+            None
+        );
+
+        let mut day_app = AppState::new(date(2026, Month::April, 23));
+        day_app.apply(AppAction::OpenDay);
+        assert_eq!(
+            hit_test_app_date(&day_app, Rect::new(0, 0, 84, 14), 10, 2),
+            None
+        );
     }
 
     #[test]
