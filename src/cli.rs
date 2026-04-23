@@ -22,7 +22,29 @@ use crate::{
     },
 };
 
-const USAGE: &str = "Usage: rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n";
+const HELP: &str = concat!(
+    "rcal ",
+    env!("CARGO_PKG_VERSION"),
+    "\n\n",
+    "Usage:\n",
+    "  rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n\n",
+    "Options:\n",
+    "  --date YYYY-MM-DD                   Open with the given date selected.\n",
+    "  --holiday-source off|us-federal|nager\n",
+    "                                      Choose holiday data. Default: us-federal.\n",
+    "  --holiday-country CC                Country code for --holiday-source nager. Default: US.\n",
+    "  -h, --help                          Show this help.\n",
+    "  -V, --version                       Show version.\n\n",
+    "Keys:\n",
+    "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
+    "  Digits jump to a day in the visible month; weekday initials jump within the selected week.\n\n",
+    "Mouse:\n",
+    "  Left click selects a visible date; left click the selected date again to open day view.\n\n",
+    "Notes:\n",
+    "  Real calendar-account integration and event editing are not in this milestone.\n",
+);
+
+const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppConfig {
@@ -52,6 +74,7 @@ pub enum HolidaySourceConfig {
 pub enum CliAction {
     Run(AppConfig),
     Help,
+    Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +87,7 @@ pub enum CliError {
     DuplicateHolidayCountry,
     MissingHolidayCountryValue,
     InvalidHolidayCountry(String),
+    HolidayCountryRequiresNager,
     UnknownArgument(String),
     InvalidDate { input: String, reason: String },
 }
@@ -92,6 +116,12 @@ impl fmt::Display for CliError {
                 write!(
                     f,
                     "invalid --holiday-country value '{value}'; expected two ASCII letters"
+                )
+            }
+            Self::HolidayCountryRequiresNager => {
+                write!(
+                    f,
+                    "--holiday-country may only be used with --holiday-source nager"
                 )
             }
             Self::UnknownArgument(arg) => write!(f, "unknown argument: {arg}"),
@@ -136,12 +166,16 @@ where
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
-        Ok(CliAction::Help) => match write!(stdout, "{USAGE}") {
+        Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => io_error_exit(&mut stderr, err),
+        },
+        Ok(CliAction::Version) => match write!(stdout, "{VERSION}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
         },
         Err(err) => {
-            let _ = writeln!(stderr, "error: {err}\n\n{USAGE}");
+            let _ = writeln!(stderr, "error: {err}\n\n{HELP}");
             std::process::ExitCode::from(2)
         }
     }
@@ -162,12 +196,16 @@ where
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
-        Ok(CliAction::Help) => match write!(stdout, "{USAGE}") {
+        Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(err) => io_error_exit(&mut stderr, err),
+        },
+        Ok(CliAction::Version) => match write!(stdout, "{VERSION}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
         },
         Err(err) => {
-            let _ = writeln!(stderr, "error: {err}\n\n{USAGE}");
+            let _ = writeln!(stderr, "error: {err}\n\n{HELP}");
             std::process::ExitCode::from(2)
         }
     }
@@ -185,6 +223,10 @@ where
     while let Some(arg) = args.next() {
         if arg == "--help" || arg == "-h" {
             return Ok(CliAction::Help);
+        }
+
+        if arg == "--version" || arg == "-V" {
+            return Ok(CliAction::Version);
         }
 
         if arg == "--date" {
@@ -253,12 +295,16 @@ where
         return Err(CliError::UnknownArgument(display_arg(&arg)));
     }
 
+    let holiday_country_was_provided = holiday_country.is_some();
     let mut config = AppConfig::new(CalendarDate::from(start_date.unwrap_or(today)));
     if let Some(holiday_source) = holiday_source {
         config.holiday_source = holiday_source;
     }
     if let Some(holiday_country) = holiday_country {
         config.holiday_country = holiday_country;
+    }
+    if holiday_country_was_provided && config.holiday_source != HolidaySourceConfig::Nager {
+        return Err(CliError::HolidayCountryRequiresNager);
     }
 
     Ok(CliAction::Run(config))
@@ -542,6 +588,30 @@ mod tests {
     }
 
     #[test]
+    fn nager_holiday_country_can_precede_source() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [
+                arg("--holiday-country=ca"),
+                arg("--holiday-source"),
+                arg("nager"),
+            ],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Run(AppConfig {
+                start_date: today,
+                holiday_source: HolidaySourceConfig::Nager,
+                holiday_country: "CA".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn invalid_holiday_options_are_rejected() {
         let today = date(2026, Month::April, 23);
 
@@ -554,6 +624,30 @@ mod tests {
             parse_args([arg("--holiday-country"), arg("USA")], today.into())
                 .expect_err("invalid country fails"),
             CliError::InvalidHolidayCountry("USA".to_string())
+        );
+    }
+
+    #[test]
+    fn holiday_country_requires_nager_source() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_args([arg("--holiday-country"), arg("GB")], today.into())
+                .expect_err("country without Nager fails"),
+            CliError::HolidayCountryRequiresNager
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    arg("--holiday-source"),
+                    arg("off"),
+                    arg("--holiday-country"),
+                    arg("GB"),
+                ],
+                today.into(),
+            )
+            .expect_err("country with non-Nager source fails"),
+            CliError::HolidayCountryRequiresNager
         );
     }
 

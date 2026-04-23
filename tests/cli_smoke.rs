@@ -32,7 +32,8 @@ fn invalid_date_flag_fails() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid --date value '2026-02-30'"));
-    assert!(stderr.contains("Usage: rcal [--date YYYY-MM-DD]"));
+    assert!(stderr.contains("Usage:"));
+    assert!(stderr.contains("rcal [--date YYYY-MM-DD]"));
 }
 
 #[test]
@@ -41,8 +42,32 @@ fn help_flag_succeeds() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "Usage: rcal [--date YYYY-MM-DD] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n"
-    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("rcal 0.1.0"));
+    assert!(stdout.contains("Usage:"));
+    assert!(stdout.contains("--holiday-source off|us-federal|nager"));
+    assert!(stdout.contains("Left click selects a visible date"));
+}
+
+#[test]
+fn version_flag_succeeds() {
+    let output = rcal().arg("--version").output().expect("rcal binary runs");
+
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "rcal 0.1.0\n");
+}
+
+#[test]
+fn holiday_country_without_nager_fails() {
+    let output = rcal()
+        .args(["--holiday-country", "GB"])
+        .output()
+        .expect("rcal binary runs");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--holiday-country may only be used with --holiday-source nager"));
 }
