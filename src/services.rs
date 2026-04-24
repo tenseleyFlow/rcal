@@ -150,9 +150,11 @@ impl fmt::Display for ServiceStatus {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Debug)]
 struct MacLaunchAgent;
 
+#[cfg(target_os = "macos")]
 impl MacLaunchAgent {
     fn plist_path() -> Result<PathBuf, ServiceError> {
         Ok(home_dir()?
@@ -162,6 +164,7 @@ impl MacLaunchAgent {
     }
 }
 
+#[cfg(target_os = "macos")]
 impl ServiceInstaller for MacLaunchAgent {
     fn install(
         &self,
