@@ -51,6 +51,7 @@ access.
 - Arrow keys move the selected date.
 - `?` opens contextual help.
 - `+` opens the Create event modal.
+- In day view, `c` opens the Copy confirmation for the selected local event.
 - In day view, `d` opens the Delete confirmation for the selected local event.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.

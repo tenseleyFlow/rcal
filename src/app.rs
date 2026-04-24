@@ -30,6 +30,7 @@ pub struct AppState {
     create_form: Option<CreateEventForm>,
     recurrence_choice: Option<RecurrenceEditChoice>,
     delete_choice: Option<EventDeleteChoice>,
+    copy_choice: Option<EventCopyChoice>,
     help_open: bool,
     selected_day_event_id: Option<String>,
     should_quit: bool,
@@ -48,6 +49,7 @@ impl AppState {
             create_form: None,
             recurrence_choice: None,
             delete_choice: None,
+            copy_choice: None,
             help_open: false,
             selected_day_event_id: None,
             should_quit: false,
@@ -82,6 +84,10 @@ impl AppState {
         self.delete_choice.as_ref()
     }
 
+    pub const fn copy_choice(&self) -> Option<&EventCopyChoice> {
+        self.copy_choice.as_ref()
+    }
+
     pub fn selected_day_event_id(&self) -> Option<&str> {
         self.selected_day_event_id.as_deref()
     }
@@ -96,6 +102,10 @@ impl AppState {
 
     pub const fn is_confirming_delete(&self) -> bool {
         self.delete_choice.is_some()
+    }
+
+    pub const fn is_copying_event(&self) -> bool {
+        self.copy_choice.is_some()
     }
 
     pub const fn is_showing_help(&self) -> bool {
@@ -114,12 +124,22 @@ impl AppState {
         self.delete_choice = None;
     }
 
+    pub fn close_copy_choice(&mut self) {
+        self.copy_choice = None;
+    }
+
     pub fn close_help(&mut self) {
         self.help_open = false;
     }
 
     pub fn set_delete_error(&mut self, message: impl Into<String>) {
         if let Some(choice) = &mut self.delete_choice {
+            choice.error = Some(message.into());
+        }
+    }
+
+    pub fn set_copy_error(&mut self, message: impl Into<String>) {
+        if let Some(choice) = &mut self.copy_choice {
             choice.error = Some(message.into());
         }
     }
@@ -243,6 +263,54 @@ impl AppState {
         }
     }
 
+    pub fn handle_copy_choice_key(&mut self, key: KeyEvent) -> EventCopyInputResult {
+        if key.kind == KeyEventKind::Release {
+            return EventCopyInputResult::Continue;
+        }
+
+        let Some(choice) = &mut self.copy_choice else {
+            return EventCopyInputResult::Continue;
+        };
+
+        match key.code {
+            KeyCode::Esc => EventCopyInputResult::Cancel,
+            KeyCode::Up => {
+                choice.select_previous();
+                EventCopyInputResult::Continue
+            }
+            KeyCode::Down => {
+                choice.select_next();
+                EventCopyInputResult::Continue
+            }
+            KeyCode::Enter => match choice.selected_action() {
+                EventCopyChoiceAction::Cancel => EventCopyInputResult::Cancel,
+                EventCopyChoiceAction::CopyEvent => {
+                    EventCopyInputResult::Submit(EventCopySubmission::Event {
+                        event_id: choice.event_id().to_string(),
+                    })
+                }
+                EventCopyChoiceAction::CopyThisOccurrence => {
+                    let EventCopyTarget::Occurrence { series_id, anchor } = &choice.target else {
+                        return EventCopyInputResult::Continue;
+                    };
+                    EventCopyInputResult::Submit(EventCopySubmission::Occurrence {
+                        series_id: series_id.clone(),
+                        anchor: *anchor,
+                    })
+                }
+                EventCopyChoiceAction::CopySeries => {
+                    let EventCopyTarget::Occurrence { series_id, .. } = &choice.target else {
+                        return EventCopyInputResult::Continue;
+                    };
+                    EventCopyInputResult::Submit(EventCopySubmission::Series {
+                        series_id: series_id.clone(),
+                    })
+                }
+            },
+            _ => EventCopyInputResult::Continue,
+        }
+    }
+
     pub fn handle_help_key(&mut self, key: KeyEvent) -> HelpInputResult {
         if key.kind == KeyEventKind::Release {
             return HelpInputResult::Continue;
@@ -307,7 +375,8 @@ impl AppState {
             AppAction::OpenHelp
                 if self.create_form.is_none()
                     && self.recurrence_choice.is_none()
-                    && self.delete_choice.is_none() =>
+                    && self.delete_choice.is_none()
+                    && self.copy_choice.is_none() =>
             {
                 self.help_open = true;
             }
@@ -328,12 +397,14 @@ impl AppState {
                 self.selected_day_event_id = None;
                 self.recurrence_choice = None;
                 self.delete_choice = None;
+                self.copy_choice = None;
                 self.help_open = false;
             }
             AppAction::OpenCreate => {
                 if self.create_form.is_none()
                     && self.recurrence_choice.is_none()
                     && self.delete_choice.is_none()
+                    && self.copy_choice.is_none()
                     && !self.help_open
                 {
                     let context = match self.view_mode {
@@ -347,10 +418,22 @@ impl AppState {
                 if self.create_form.is_none()
                     && self.recurrence_choice.is_none()
                     && self.delete_choice.is_none()
+                    && self.copy_choice.is_none()
                     && !self.help_open
                     && let Some(source) = source
                 {
                     self.open_selected_event_for_delete(source);
+                }
+            }
+            AppAction::OpenCopy if self.view_mode == ViewMode::Day => {
+                if self.create_form.is_none()
+                    && self.recurrence_choice.is_none()
+                    && self.delete_choice.is_none()
+                    && self.copy_choice.is_none()
+                    && !self.help_open
+                    && let Some(source) = source
+                {
+                    self.open_selected_event_for_copy(source);
                 }
             }
             AppAction::MoveDays(days) if self.view_mode == ViewMode::Month => {
@@ -394,6 +477,7 @@ impl AppState {
             | AppAction::JumpToDay(_)
             | AppAction::JumpToWeekday(_)
             | AppAction::OpenDelete
+            | AppAction::OpenCopy
             | AppAction::OpenHelp => {}
         }
     }
@@ -452,6 +536,25 @@ impl AppState {
         }
     }
 
+    fn open_selected_event_for_copy(&mut self, source: &dyn AgendaSource) {
+        self.reconcile_day_event_selection(source);
+        let Some(selected_id) = self.selected_day_event_id.as_deref() else {
+            return;
+        };
+        if let Some(event) = selectable_day_events(self.selected_date, source)
+            .into_iter()
+            .find(|event| event.id == selected_id)
+        {
+            self.copy_choice = Some(EventCopyChoice::for_event(&event));
+        }
+    }
+
+    pub fn select_day_event_id(&mut self, event_id: impl Into<String>) {
+        if self.view_mode == ViewMode::Day {
+            self.selected_day_event_id = Some(event_id.into());
+        }
+    }
+
     fn weekday_in_selected_week(&self, weekday: Weekday) -> Option<CalendarDate> {
         let month = self.calendar_month();
         let selected = month.selected_cell()?;
@@ -476,6 +579,7 @@ pub enum AppAction {
     CloseDay,
     OpenCreate,
     OpenDelete,
+    OpenCopy,
     OpenHelp,
     Quit,
 }
@@ -726,6 +830,153 @@ pub enum EventDeleteInputResult {
     Continue,
     Cancel,
     Submit(EventDeleteSubmission),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventCopyChoice {
+    target: EventCopyTarget,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl EventCopyChoice {
+    fn for_event(event: &Event) -> Self {
+        let target = if let Some(occurrence) = event.occurrence() {
+            EventCopyTarget::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                anchor: occurrence.anchor,
+            }
+        } else {
+            EventCopyTarget::Event {
+                event_id: event.id.clone(),
+            }
+        };
+
+        Self {
+            target,
+            selected: 0,
+            error: None,
+        }
+    }
+
+    pub fn heading(&self) -> &'static str {
+        "Copy"
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn rows(&self) -> Vec<EventCopyChoiceRow> {
+        self.actions()
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| EventCopyChoiceRow {
+                label: action.label(),
+                selected: index == self.selected,
+            })
+            .collect()
+    }
+
+    fn actions(&self) -> Vec<EventCopyChoiceAction> {
+        match self.target {
+            EventCopyTarget::Event { .. } => {
+                vec![
+                    EventCopyChoiceAction::CopyEvent,
+                    EventCopyChoiceAction::Cancel,
+                ]
+            }
+            EventCopyTarget::Occurrence { .. } => vec![
+                EventCopyChoiceAction::CopyThisOccurrence,
+                EventCopyChoiceAction::CopySeries,
+                EventCopyChoiceAction::Cancel,
+            ],
+        }
+    }
+
+    fn selected_action(&self) -> EventCopyChoiceAction {
+        self.actions()[self.selected]
+    }
+
+    fn select_next(&mut self) {
+        let len = self.actions().len();
+        self.selected = (self.selected + 1) % len;
+        self.error = None;
+    }
+
+    fn select_previous(&mut self) {
+        let len = self.actions().len();
+        self.selected = if self.selected == 0 {
+            len - 1
+        } else {
+            self.selected - 1
+        };
+        self.error = None;
+    }
+
+    fn event_id(&self) -> &str {
+        match &self.target {
+            EventCopyTarget::Event { event_id } => event_id,
+            EventCopyTarget::Occurrence { series_id, .. } => series_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EventCopyTarget {
+    Event {
+        event_id: String,
+    },
+    Occurrence {
+        series_id: String,
+        anchor: OccurrenceAnchor,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventCopyChoiceRow {
+    pub label: &'static str,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventCopyChoiceAction {
+    CopyEvent,
+    CopyThisOccurrence,
+    CopySeries,
+    Cancel,
+}
+
+impl EventCopyChoiceAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::CopyEvent => "Copy event",
+            Self::CopyThisOccurrence => "Copy this occurrence",
+            Self::CopySeries => "Copy series",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventCopySubmission {
+    Event {
+        event_id: String,
+    },
+    Occurrence {
+        series_id: String,
+        anchor: OccurrenceAnchor,
+    },
+    Series {
+        series_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventCopyInputResult {
+    Continue,
+    Cancel,
+    Submit(EventCopySubmission),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1743,6 +1994,11 @@ impl KeyboardInput {
             return AppAction::OpenDelete;
         }
 
+        if value.eq_ignore_ascii_case(&'c') {
+            self.clear();
+            return AppAction::OpenCopy;
+        }
+
         if value.is_ascii_digit() {
             return self.translate_digit(value);
         }
@@ -2411,6 +2667,86 @@ mod tests {
                 anchor: OccurrenceAnchor::Timed {
                     start: at(day, 9, 0)
                 },
+            })
+        );
+    }
+
+    #[test]
+    fn day_view_c_opens_copy_choice_for_selected_local_event() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![local_timed_event(
+                "local-time",
+                "Standup",
+                at(day, 9, 0),
+                at(day, 9, 30),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), char_key('c')],
+        );
+
+        let choice = app.copy_choice().expect("copy modal opens");
+        assert_eq!(choice.rows()[0].label, "Copy event");
+        assert_eq!(
+            app.handle_copy_choice_key(key(KeyCode::Enter)),
+            EventCopyInputResult::Submit(EventCopySubmission::Event {
+                event_id: "local-time".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn day_view_c_opens_recurring_copy_choices() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), char_key('c')],
+        );
+
+        let choice = app.copy_choice().expect("copy modal opens");
+        let rows = choice.rows();
+        assert_eq!(rows[0].label, "Copy this occurrence");
+        assert_eq!(rows[1].label, "Copy series");
+        assert_eq!(
+            app.handle_copy_choice_key(key(KeyCode::Enter)),
+            EventCopyInputResult::Submit(EventCopySubmission::Occurrence {
+                series_id: "series".to_string(),
+                anchor: OccurrenceAnchor::Timed {
+                    start: at(day, 9, 0)
+                },
+            })
+        );
+        assert_eq!(
+            app.handle_copy_choice_key(key(KeyCode::Down)),
+            EventCopyInputResult::Continue
+        );
+        assert_eq!(
+            app.handle_copy_choice_key(key(KeyCode::Enter)),
+            EventCopyInputResult::Submit(EventCopySubmission::Series {
+                series_id: "series".to_string()
             })
         );
     }

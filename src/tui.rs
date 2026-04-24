@@ -13,8 +13,8 @@ use crate::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
     app::{
-        AppState, CreateEventForm, CreateEventFormRowKind, EventDeleteChoice, RecurrenceEditChoice,
-        ViewMode,
+        AppState, CreateEventForm, CreateEventFormRowKind, EventCopyChoice, EventDeleteChoice,
+        RecurrenceEditChoice, ViewMode,
     },
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
@@ -102,6 +102,9 @@ impl Widget for AppView<'_> {
         }
         if let Some(choice) = self.app.delete_choice() {
             render_delete_choice_modal(choice, area, buf, CreateModalStyles::new());
+        }
+        if let Some(choice) = self.app.copy_choice() {
+            render_copy_choice_modal(choice, area, buf, CreateModalStyles::new());
         }
         if self.app.is_showing_help() {
             render_help_modal(self.app.view_mode(), area, buf, CreateModalStyles::new());
@@ -1063,6 +1066,77 @@ fn render_delete_choice_modal(
     );
 }
 
+fn render_copy_choice_modal(
+    choice: &EventCopyChoice,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: CreateModalStyles,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let modal = recurrence_choice_modal_area(area);
+    fill_rect(buf, modal, styles.panel);
+    draw_border(buf, modal, styles.border, BorderCharacters::normal());
+
+    let content = inset_rect(modal);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    write_centered(
+        buf,
+        content.y,
+        content.x,
+        content.width,
+        choice.heading(),
+        styles.title,
+    );
+
+    let mut y = content.y.saturating_add(2);
+    for row in choice.rows() {
+        if y >= content.bottom().saturating_sub(2) {
+            break;
+        }
+        let marker = if row.selected { ">" } else { " " };
+        write_padded_left(buf, y, content.x, 1, marker, styles.label);
+        write_left(
+            buf,
+            y,
+            content.x.saturating_add(2),
+            content.width.saturating_sub(2),
+            row.label,
+            if row.selected {
+                styles.title
+            } else {
+                styles.value
+            },
+        );
+        y = y.saturating_add(1);
+    }
+
+    if let Some(error) = choice.error() {
+        write_left(
+            buf,
+            content.bottom().saturating_sub(2),
+            content.x,
+            content.width,
+            error,
+            styles.error,
+        );
+    }
+
+    write_centered(
+        buf,
+        content.bottom().saturating_sub(1),
+        content.x,
+        content.width,
+        "Enter select | Esc cancel",
+        styles.footer,
+    );
+}
+
 fn render_help_modal(view_mode: ViewMode, area: Rect, buf: &mut Buffer, styles: CreateModalStyles) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -1174,6 +1248,7 @@ fn help_rows(view_mode: ViewMode) -> &'static [(&'static str, &'static str)] {
             ("Left/Right", "Move to the previous or next day"),
             ("Up/Down", "Select a local event"),
             ("Enter", "Edit the selected local event"),
+            ("c", "Copy the selected local event"),
             ("d", "Delete the selected local event"),
             ("+", "Create an event on this day"),
             ("Esc", "Return to month view"),
@@ -2522,6 +2597,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_choice_modal_renders_over_day_view() {
+        let day = date(2026, Month::April, 23);
+        let source = agenda_source(
+            vec![local_timed_event(
+                "planning",
+                "Planning",
+                at(day, 9, 0),
+                at(day, 10, 0),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        app.apply_with_agenda_source(AppAction::OpenCopy, &source);
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Copy"));
+        assert!(rendered.contains("Copy event"));
+        assert!(rendered.contains("Enter select"));
+    }
+
+    #[test]
     fn help_modal_shows_month_week_keys_in_month_mode() {
         let mut app = AppState::new(date(2026, Month::April, 23));
         app.apply(AppAction::OpenHelp);
@@ -2543,6 +2641,7 @@ mod tests {
         let rendered = render_app_to_string(&app, 84, 26);
 
         assert!(rendered.contains("Day keys"));
+        assert!(rendered.contains("Copy the selected local event"));
         assert!(rendered.contains("Delete the selected local event"));
         assert!(rendered.contains("Move to the previous or next day"));
     }

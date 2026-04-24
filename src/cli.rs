@@ -17,8 +17,9 @@ use time::{Date, OffsetDateTime, format_description};
 use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
     app::{
-        AppState, CreateEventInputResult, EventDeleteInputResult, EventDeleteSubmission,
-        EventFormMode, HelpInputResult, KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
+        AppState, CreateEventInputResult, EventCopyInputResult, EventCopySubmission,
+        EventDeleteInputResult, EventDeleteSubmission, EventFormMode, HelpInputResult,
+        KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
     },
     calendar::CalendarDate,
     tui::{
@@ -45,6 +46,7 @@ const HELP: &str = concat!(
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
     "  ? opens contextual help.\n",
     "  + opens the Create event modal.\n",
+    "  In day view, c opens the Copy confirmation for the selected local event.\n",
     "  In day view, d opens the Delete confirmation for the selected local event.\n",
     "  In day view, Left/Right move to the previous or next day.\n",
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
@@ -447,6 +449,7 @@ where
         let event = if !app.is_creating_event()
             && !app.is_choosing_recurring_edit()
             && !app.is_confirming_delete()
+            && !app.is_copying_event()
             && !app.is_showing_help()
             && keyboard.is_waiting_for_digit()
         {
@@ -492,6 +495,30 @@ where
                                 }
                             }
                         },
+                    }
+                } else if app.is_copying_event() {
+                    match app.handle_copy_choice_key(key) {
+                        EventCopyInputResult::Continue => {}
+                        EventCopyInputResult::Cancel => app.close_copy_choice(),
+                        EventCopyInputResult::Submit(submission) => {
+                            let result = match submission {
+                                EventCopySubmission::Event { event_id }
+                                | EventCopySubmission::Series {
+                                    series_id: event_id,
+                                } => agenda_source.duplicate_event(&event_id),
+                                EventCopySubmission::Occurrence { series_id, anchor } => {
+                                    agenda_source.duplicate_occurrence(&series_id, anchor)
+                                }
+                            };
+                            match result {
+                                Ok(event) => {
+                                    app.close_copy_choice();
+                                    app.select_day_event_id(event.id);
+                                    app.reconcile_day_event_selection(&agenda_source);
+                                }
+                                Err(err) => app.set_copy_error(err.to_string()),
+                            }
+                        }
                     }
                 } else if app.is_choosing_recurring_edit() {
                     match app.handle_recurrence_choice_key(key, &agenda_source) {
@@ -548,6 +575,7 @@ where
                 if app.is_creating_event()
                     || app.is_choosing_recurring_edit()
                     || app.is_confirming_delete()
+                    || app.is_copying_event()
                     || app.is_showing_help()
                 {
                     continue;

@@ -379,6 +379,20 @@ pub struct CreateEventDraft {
 }
 
 impl CreateEventDraft {
+    pub fn from_event(event: &Event) -> Self {
+        Self {
+            title: event.title.clone(),
+            timing: match event.timing {
+                EventTiming::AllDay { date } => CreateEventTiming::AllDay { date },
+                EventTiming::Timed { start, end } => CreateEventTiming::Timed { start, end },
+            },
+            location: event.location.clone(),
+            notes: event.notes.clone(),
+            reminders: event.reminders.clone(),
+            recurrence: event.recurrence.clone(),
+        }
+    }
+
     pub fn into_event(self, id: String) -> Result<Event, AgendaError> {
         let source = SourceMetadata::local().with_external_id(id.clone());
         let mut event = match self.timing {
@@ -705,6 +719,42 @@ impl ConfiguredAgendaSource {
         Ok(deleted)
     }
 
+    pub fn duplicate_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
+        let event = self
+            .events
+            .local_event_by_id(id)
+            .ok_or_else(|| LocalEventStoreError::EventNotFound { id: id.to_string() })?;
+        self.insert_event_copy(event)
+    }
+
+    pub fn duplicate_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+    ) -> Result<Event, LocalEventStoreError> {
+        let series = self.events.local_event_by_id(series_id).ok_or_else(|| {
+            LocalEventStoreError::EventNotFound {
+                id: series_id.to_string(),
+            }
+        })?;
+        if !series.is_recurring_series() {
+            return Err(LocalEventStoreError::EventNotEditable {
+                id: series_id.to_string(),
+            });
+        }
+        if !event_generates_anchor(&series, anchor) {
+            return Err(LocalEventStoreError::OccurrenceNotFound {
+                id: series_id.to_string(),
+                anchor: anchor.storage_key(),
+            });
+        }
+
+        let occurrence = occurrence_override_event(&series, anchor)
+            .unwrap_or_else(|| generated_occurrence_event(&series, anchor));
+        let draft = CreateEventDraft::from_event(&occurrence).without_recurrence();
+        self.create_event(draft)
+    }
+
     pub fn delete_occurrence(
         &mut self,
         series_id: &str,
@@ -740,6 +790,21 @@ impl ConfiguredAgendaSource {
         }
         self.events.events = events;
         Ok(())
+    }
+
+    fn insert_event_copy(&mut self, mut event: Event) -> Result<Event, LocalEventStoreError> {
+        let id = self.next_local_event_id(&event.title);
+        event.id = id.clone();
+        event.source = SourceMetadata::local().with_external_id(id);
+        event.occurrence = None;
+
+        if let Some(path) = &self.events_file {
+            let mut events = self.events.events().to_vec();
+            events.push(event.clone());
+            write_events_file(path, &events)?;
+        }
+        self.events.push_event(event.clone());
+        Ok(event)
     }
 
     fn next_local_event_id(&self, title: &str) -> String {
@@ -3163,6 +3228,141 @@ mod tests {
         assert_eq!(agenda.all_day_events[0].id, event.id);
         assert_eq!(agenda.all_day_events[0].title, "Updated planning");
         assert_eq!(agenda.all_day_events[0].location.as_deref(), Some("Room 2"));
+    }
+
+    #[test]
+    fn local_event_store_duplicates_single_event_and_persists() {
+        let path = temp_events_path("duplicate-event");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Planning".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 10, 0),
+                },
+                location: Some("Room 1".to_string()),
+                notes: Some("Bring notes".to_string()),
+                reminders: vec![Reminder::minutes_before(15)],
+                recurrence: None,
+            })
+            .expect("event saves");
+
+        let copied = source.duplicate_event(&event.id).expect("event copies");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day, &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_ne!(copied.id, event.id);
+        assert!(copied.is_local());
+        assert_eq!(copied.title, "Planning");
+        assert_eq!(copied.location.as_deref(), Some("Room 1"));
+        assert_eq!(agenda.timed_events.len(), 2);
+    }
+
+    #[test]
+    fn local_event_store_duplicates_occurrence_as_standalone_event() {
+        let path = temp_events_path("duplicate-occurrence");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(2),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+        let anchor = OccurrenceAnchor::Timed {
+            start: at(day.add_days(1), 9, 0),
+        };
+
+        let copied = source
+            .duplicate_occurrence(&event.id, anchor)
+            .expect("occurrence copies");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day.add_days(1), &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_ne!(copied.id, event.id);
+        assert!(copied.occurrence().is_none());
+        assert!(copied.recurrence.is_none());
+        assert_eq!(agenda.timed_events.len(), 2);
+        assert!(
+            agenda
+                .timed_events
+                .iter()
+                .any(|agenda_event| agenda_event.event.id == copied.id)
+        );
+    }
+
+    #[test]
+    fn local_event_store_duplicates_recurring_series() {
+        let path = temp_events_path("duplicate-series");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(2),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+
+        let copied = source
+            .duplicate_event(&event.id)
+            .expect("recurring series copies");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day.add_days(1), &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_ne!(copied.id, event.id);
+        assert!(copied.recurrence.is_some());
+        assert_eq!(agenda.timed_events.len(), 2);
+        assert!(
+            agenda
+                .timed_events
+                .iter()
+                .any(|agenda_event| agenda_event.event.id.starts_with(&copied.id))
+        );
     }
 
     #[test]
