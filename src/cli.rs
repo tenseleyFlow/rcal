@@ -50,7 +50,7 @@ const HELP: &str = concat!(
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
     "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",
-    "  Left click selects a visible date; left click the selected date again to open day view.\n\n",
+    "  Left click selects a visible date; double-click a visible date to open day view.\n\n",
     "Notes:\n",
     "  Real calendar-account integration and reminder notifications are not in this milestone.\n",
 );

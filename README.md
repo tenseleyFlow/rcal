@@ -62,8 +62,8 @@ access.
   16.
 - Weekday initials jump within the selected week. Use `tu` for Tuesday, `th`
   for Thursday, `su` for Sunday, and `sa` for Saturday.
-- Left click selects a visible date; left click the selected date again to open
-  day view.
+- Left click selects a visible date; double-click a visible date to open day
+  view.
 
 Created events are stored locally as JSON and are shown immediately in month,
 week, and day views. The create/edit modal supports timed events, single-day

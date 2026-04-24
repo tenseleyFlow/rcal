@@ -1166,7 +1166,7 @@ fn help_rows(view_mode: ViewMode) -> &'static [(&'static str, &'static str)] {
             ("Weekdays", "Jump within the selected week"),
             ("Enter", "Open the focused day view"),
             ("+", "Create an event on the selected date"),
-            ("Mouse", "Select a date; click it again to open"),
+            ("Mouse", "Select a date; double-click to open"),
             ("?", "Close this help"),
             ("q", "Quit"),
         ],

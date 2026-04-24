@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -11,6 +13,8 @@ use crate::{
     },
     calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK},
 };
+
+const MOUSE_DOUBLE_CLICK_TIMEOUT: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
@@ -1816,7 +1820,13 @@ impl KeyboardInput {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MouseInput {
-    pending_open_date: Option<CalendarDate>,
+    last_left_click: Option<MouseClick>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MouseClick {
+    date: CalendarDate,
+    at: Instant,
 }
 
 impl MouseInput {
@@ -1826,6 +1836,16 @@ impl MouseInput {
         target_date: Option<CalendarDate>,
         selected_date: CalendarDate,
     ) -> AppAction {
+        self.translate_at(mouse, target_date, selected_date, Instant::now())
+    }
+
+    fn translate_at(
+        &mut self,
+        mouse: MouseEvent,
+        target_date: Option<CalendarDate>,
+        selected_date: CalendarDate,
+        now: Instant,
+    ) -> AppAction {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(target_date) = target_date else {
@@ -1833,14 +1853,27 @@ impl MouseInput {
                     return AppAction::Noop;
                 };
 
-                if self.pending_open_date == Some(target_date) && selected_date == target_date {
+                let is_double_click = self
+                    .last_left_click
+                    .map(|click| {
+                        click.date == target_date
+                            && now.saturating_duration_since(click.at) <= MOUSE_DOUBLE_CLICK_TIMEOUT
+                    })
+                    .unwrap_or(false);
+
+                self.last_left_click = Some(MouseClick {
+                    date: target_date,
+                    at: now,
+                });
+
+                if is_double_click && selected_date == target_date {
                     self.clear();
                     AppAction::OpenDay
                 } else {
-                    self.pending_open_date = Some(target_date);
                     AppAction::SelectDate(target_date)
                 }
             }
+            MouseEventKind::Up(_) => AppAction::Noop,
             _ => {
                 self.clear();
                 AppAction::Noop
@@ -1849,7 +1882,7 @@ impl MouseInput {
     }
 
     pub fn clear(&mut self) {
-        self.pending_open_date = None;
+        self.last_left_click = None;
     }
 }
 
@@ -2785,21 +2818,59 @@ mod tests {
     }
 
     #[test]
-    fn mouse_click_selects_then_second_click_opens_day() {
+    fn mouse_double_click_selects_then_opens_day() {
         let target = date(2026, Month::April, 18);
         let mut app = AppState::new(date(2026, Month::April, 23));
         let mut input = MouseInput::default();
+        let start = Instant::now();
 
-        let action = input.translate(mouse_down(10, 10), Some(target), app.selected_date());
+        let action =
+            input.translate_at(mouse_down(10, 10), Some(target), app.selected_date(), start);
         app.apply(action);
 
         assert_eq!(app.selected_date(), target);
         assert_eq!(app.view_mode(), ViewMode::Month);
 
-        let action = input.translate(mouse_down(10, 10), Some(target), app.selected_date());
+        let action = input.translate_at(
+            mouse_event(MouseEventKind::Up(MouseButton::Left), 10, 10),
+            Some(target),
+            app.selected_date(),
+            start + Duration::from_millis(40),
+        );
+        app.apply(action);
+        assert_eq!(app.view_mode(), ViewMode::Month);
+
+        let action = input.translate_at(
+            mouse_down(10, 10),
+            Some(target),
+            app.selected_date(),
+            start + Duration::from_millis(120),
+        );
         app.apply(action);
 
         assert_eq!(app.view_mode(), ViewMode::Day);
+    }
+
+    #[test]
+    fn slow_second_mouse_click_only_reselects_date() {
+        let target = date(2026, Month::April, 18);
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        let mut input = MouseInput::default();
+        let start = Instant::now();
+
+        let action =
+            input.translate_at(mouse_down(10, 10), Some(target), app.selected_date(), start);
+        app.apply(action);
+        let action = input.translate_at(
+            mouse_down(10, 10),
+            Some(target),
+            app.selected_date(),
+            start + MOUSE_DOUBLE_CLICK_TIMEOUT + Duration::from_millis(1),
+        );
+        app.apply(action);
+
+        assert_eq!(app.selected_date(), target);
+        assert_eq!(app.view_mode(), ViewMode::Month);
     }
 
     #[test]
