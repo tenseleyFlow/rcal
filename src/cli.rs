@@ -22,6 +22,14 @@ use crate::{
         KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
     },
     calendar::CalendarDate,
+    reminders::{
+        ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file, run_daemon,
+        run_once, test_notification,
+    },
+    services::{
+        ServiceConfig, ServiceError, SystemCommandRunner, install_service, service_status,
+        uninstall_service,
+    },
     tui::{
         AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
         render_app_to_string_with_agenda_source,
@@ -34,6 +42,11 @@ const HELP: &str = concat!(
     "\n\n",
     "Usage:\n",
     "  rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n\n",
+    "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
+    "  rcal reminders install [--events-file PATH]\n",
+    "  rcal reminders uninstall\n",
+    "  rcal reminders status\n",
+    "  rcal reminders test\n\n",
     "Options:\n",
     "  --date YYYY-MM-DD                   Open with the given date selected.\n",
     "  --events-file PATH                  Read and write local user events at PATH.\n",
@@ -54,7 +67,7 @@ const HELP: &str = concat!(
     "Mouse:\n",
     "  Left click selects a visible date; double-click a visible date to open day view.\n\n",
     "Notes:\n",
-    "  Real calendar-account integration and reminder notifications are not in this milestone.\n",
+    "  Reminder services are user-level background jobs. Provider account integration is not in this milestone.\n",
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -89,8 +102,25 @@ pub enum HolidaySourceConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliAction {
     Run(AppConfig),
+    Reminders(ReminderCliAction),
     Help,
     Version,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReminderCliAction {
+    Run(ReminderRunConfig),
+    Install { events_file: PathBuf },
+    Uninstall,
+    Status,
+    Test,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReminderRunConfig {
+    pub events_file: PathBuf,
+    pub state_file: PathBuf,
+    pub once: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,6 +136,10 @@ pub enum CliError {
     MissingHolidayCountryValue,
     InvalidHolidayCountry(String),
     HolidayCountryRequiresNager,
+    MissingReminderCommand,
+    UnknownReminderCommand(String),
+    DuplicateStateFile,
+    MissingStateFileValue,
     UnknownArgument(String),
     InvalidDate { input: String, reason: String },
 }
@@ -144,6 +178,15 @@ impl fmt::Display for CliError {
                     "--holiday-country may only be used with --holiday-source nager"
                 )
             }
+            Self::MissingReminderCommand => write!(
+                f,
+                "reminders requires one of: run, install, uninstall, status, test"
+            ),
+            Self::UnknownReminderCommand(command) => {
+                write!(f, "unknown reminders command: {command}")
+            }
+            Self::DuplicateStateFile => write!(f, "--state-file may only be provided once"),
+            Self::MissingStateFileValue => write!(f, "--state-file requires a path"),
             Self::UnknownArgument(arg) => write!(f, "unknown argument: {arg}"),
             Self::InvalidDate { input, reason } => {
                 write!(f, "invalid --date value '{input}': {reason}")
@@ -189,6 +232,7 @@ where
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
+        Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -222,6 +266,7 @@ where
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
+        Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -238,6 +283,20 @@ where
 }
 
 pub fn parse_args<I>(args: I, today: Date) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if let Some(first) = args.first()
+        && first == "reminders"
+    {
+        return parse_reminder_args(args.into_iter().skip(1));
+    }
+
+    parse_calendar_args(args, today)
+}
+
+fn parse_calendar_args<I>(args: I, today: Date) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -362,6 +421,140 @@ where
     Ok(CliAction::Run(config))
 }
 
+fn parse_reminder_args<I>(args: I) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingReminderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownReminderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "run" => parse_reminder_run_args(args),
+        "install" => parse_reminder_install_args(args),
+        "uninstall" => no_extra_reminder_args(args, ReminderCliAction::Uninstall),
+        "status" => no_extra_reminder_args(args, ReminderCliAction::Status),
+        "test" => no_extra_reminder_args(args, ReminderCliAction::Test),
+        "--help" | "-h" => Ok(CliAction::Help),
+        _ => Err(CliError::UnknownReminderCommand(command.to_string())),
+    }
+}
+
+fn parse_reminder_run_args<I>(args: I) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut events_file = None;
+    let mut state_file = None;
+    let mut once = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--events-file" {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+            events_file = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingEventsFileValue)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--events-file="))
+        {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+            events_file = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--state-file" {
+            if state_file.is_some() {
+                return Err(CliError::DuplicateStateFile);
+            }
+            state_file = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingStateFileValue)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--state-file="))
+        {
+            if state_file.is_some() {
+                return Err(CliError::DuplicateStateFile);
+            }
+            state_file = Some(PathBuf::from(value));
+            continue;
+        }
+        if arg == "--once" {
+            once = true;
+            continue;
+        }
+
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+
+    Ok(CliAction::Reminders(ReminderCliAction::Run(
+        ReminderRunConfig {
+            events_file: events_file.unwrap_or_else(default_events_file),
+            state_file: state_file.unwrap_or_else(default_state_file),
+            once,
+        },
+    )))
+}
+
+fn parse_reminder_install_args<I>(args: I) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut events_file = None;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--events-file" {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+            events_file = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingEventsFileValue)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--events-file="))
+        {
+            if events_file.is_some() {
+                return Err(CliError::DuplicateEventsFile);
+            }
+            events_file = Some(PathBuf::from(value));
+            continue;
+        }
+
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+
+    Ok(CliAction::Reminders(ReminderCliAction::Install {
+        events_file: events_file.unwrap_or_else(default_events_file),
+    }))
+}
+
+fn no_extra_reminder_args<I>(args: I, action: ReminderCliAction) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if let Some(arg) = args.next() {
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+
+    Ok(CliAction::Reminders(action))
+}
+
 fn default_start_date() -> Date {
     OffsetDateTime::now_local()
         .unwrap_or_else(|_| OffsetDateTime::now_utc())
@@ -383,6 +576,85 @@ fn agenda_source(config: &AppConfig) -> Result<ConfiguredAgendaSource, LocalEven
     };
 
     ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays)
+}
+
+fn run_reminder_action(
+    action: ReminderCliAction,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::process::ExitCode {
+    match action {
+        ReminderCliAction::Run(config) => {
+            let daemon_config = ReminderDaemonConfig::new(config.events_file, config.state_file);
+            let mut notifier = SystemNotifier;
+            if config.once {
+                match run_once(
+                    &daemon_config,
+                    crate::reminders::current_local_datetime(),
+                    &mut notifier,
+                ) {
+                    Ok(summary) => {
+                        let _ = writeln!(
+                            stdout,
+                            "delivered={} skipped={} failed={}",
+                            summary.delivered, summary.skipped, summary.failed
+                        );
+                        std::process::ExitCode::SUCCESS
+                    }
+                    Err(err) => reminder_error_exit(stderr, err),
+                }
+            } else {
+                match run_daemon(daemon_config, &mut notifier) {
+                    Ok(()) => std::process::ExitCode::SUCCESS,
+                    Err(err) => reminder_error_exit(stderr, err),
+                }
+            }
+        }
+        ReminderCliAction::Install { events_file } => {
+            let config = match ServiceConfig::new(events_file) {
+                Ok(config) => config,
+                Err(err) => return service_error_exit(stderr, err),
+            };
+            let mut runner = SystemCommandRunner;
+            match install_service(&config, &mut runner) {
+                Ok(()) => {
+                    let _ = writeln!(stdout, "installed reminder service");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(err) => service_error_exit(stderr, err),
+            }
+        }
+        ReminderCliAction::Uninstall => {
+            let mut runner = SystemCommandRunner;
+            match uninstall_service(&mut runner) {
+                Ok(()) => {
+                    let _ = writeln!(stdout, "uninstalled reminder service");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(err) => service_error_exit(stderr, err),
+            }
+        }
+        ReminderCliAction::Status => {
+            let mut runner = SystemCommandRunner;
+            match service_status(&mut runner) {
+                Ok(status) => {
+                    let _ = writeln!(stdout, "{status}");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(err) => service_error_exit(stderr, err),
+            }
+        }
+        ReminderCliAction::Test => {
+            let mut notifier = SystemNotifier;
+            match test_notification(&mut notifier) {
+                Ok(()) => {
+                    let _ = writeln!(stdout, "sent test reminder notification");
+                    std::process::ExitCode::SUCCESS
+                }
+                Err(err) => reminder_error_exit(stderr, err),
+            }
+        }
+    }
 }
 
 fn run_interactive_terminal<W>(
@@ -687,6 +959,16 @@ fn local_event_error_exit(
     std::process::ExitCode::from(2)
 }
 
+fn reminder_error_exit(stderr: &mut impl Write, err: ReminderError) -> std::process::ExitCode {
+    let _ = writeln!(stderr, "error: {err}");
+    std::process::ExitCode::FAILURE
+}
+
+fn service_error_exit(stderr: &mut impl Write, err: ServiceError) -> std::process::ExitCode {
+    let _ = writeln!(stderr, "error: {err}");
+    std::process::ExitCode::FAILURE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -843,6 +1125,84 @@ mod tests {
             )
             .expect_err("duplicate path fails"),
             CliError::DuplicateEventsFile
+        );
+    }
+
+    #[test]
+    fn reminder_run_args_set_events_and_state_paths() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [
+                arg("reminders"),
+                arg("run"),
+                arg("--events-file"),
+                arg("/tmp/events.json"),
+                arg("--state-file=/tmp/state.json"),
+                arg("--once"),
+            ],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
+                events_file: PathBuf::from("/tmp/events.json"),
+                state_file: PathBuf::from("/tmp/state.json"),
+                once: true,
+            }))
+        );
+    }
+
+    #[test]
+    fn reminder_install_args_set_events_path() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [
+                arg("reminders"),
+                arg("install"),
+                arg("--events-file=/tmp/events.json"),
+            ],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Reminders(ReminderCliAction::Install {
+                events_file: PathBuf::from("/tmp/events.json"),
+            })
+        );
+    }
+
+    #[test]
+    fn reminder_args_are_rejected_when_invalid() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_args([arg("reminders")], today.into()).expect_err("missing command fails"),
+            CliError::MissingReminderCommand
+        );
+        assert_eq!(
+            parse_args([arg("reminders"), arg("bogus")], today.into())
+                .expect_err("unknown command fails"),
+            CliError::UnknownReminderCommand("bogus".to_string())
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    arg("reminders"),
+                    arg("run"),
+                    arg("--state-file"),
+                    arg("/tmp/one.json"),
+                    arg("--state-file=/tmp/two.json"),
+                ],
+                today.into(),
+            )
+            .expect_err("duplicate state path fails"),
+            CliError::DuplicateStateFile
         );
     }
 

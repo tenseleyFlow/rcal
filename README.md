@@ -26,6 +26,11 @@ cargo run -- --date 2026-04-23
 
 ```sh
 rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]
+rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
+rcal reminders install [--events-file PATH]
+rcal reminders uninstall
+rcal reminders status
+rcal reminders test
 ```
 
 Options:
@@ -69,7 +74,9 @@ access.
 Created events are stored locally as JSON and are shown immediately in month,
 week, and day views. The create/edit modal supports timed events, single-day
 all-day events, recurrence, location, notes, and multiple reminder offsets.
-Reminder notifications are not delivered yet.
+Reminder notifications are delivered by a user-level background service. Use
+`rcal reminders install` to install it, `rcal reminders status` to inspect it,
+and `rcal reminders test` to send a test notification.
 
 ## Layout
 
@@ -81,7 +88,6 @@ back to a focused day summary.
 
 - Real account integrations for Outlook, Google Calendar, Exchange, and similar
   providers are not implemented yet.
-- Reminder offsets are stored but do not trigger notifications yet.
 - Packaging is currently source-based through Cargo.
 
 ## Development
