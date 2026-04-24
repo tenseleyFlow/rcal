@@ -167,6 +167,21 @@ Manual sync remains available:
 rcal providers microsoft sync --account work
 ```
 
+Deprecated manual onboarding flow, pending deletion:
+
+```sh
+rcal config init
+# edit ~/.config/rcal/config.toml with providers.microsoft account/calendar data
+rcal providers microsoft auth login --account work --browser
+rcal providers microsoft calendars list --account work
+# copy an editable calendar ID into default_calendar and calendars
+rcal providers microsoft sync --account work
+```
+
+Use `rcal providers microsoft setup --account work --browser` instead. The
+manual flow is kept temporarily for advanced custom-app testing and for users
+upgrading from early provider builds.
+
 Use `rcal providers microsoft auth inspect --account work` to inspect safe
 token claims such as audience, scopes, tenant, and expiry. The command does not
 print the token body.
