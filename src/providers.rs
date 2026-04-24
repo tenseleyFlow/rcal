@@ -373,10 +373,10 @@ impl MicrosoftProviderRuntime {
 
     pub fn default_write_target(&self) -> Option<EventWriteTargetId> {
         let (account, calendar_id) = self.config.default_calendar()?;
-        Some(EventWriteTargetId::Microsoft {
-            account_id: account.id.clone(),
-            calendar_id: calendar_id.to_string(),
-        })
+        Some(EventWriteTargetId::microsoft(
+            account.id.clone(),
+            calendar_id.to_string(),
+        ))
     }
 
     pub fn status(&self, token_store: &dyn MicrosoftTokenStore) -> MicrosoftProviderStatus {
@@ -466,11 +466,7 @@ impl MicrosoftProviderRuntime {
         http: &dyn MicrosoftHttpClient,
         token_store: &dyn MicrosoftTokenStore,
     ) -> Result<Event, ProviderError> {
-        let EventWriteTargetId::Microsoft {
-            account_id,
-            calendar_id,
-        } = target
-        else {
+        let Some((account_id, calendar_id)) = target.microsoft_parts() else {
             return Err(ProviderError::Config(
                 "Microsoft provider requires a Microsoft calendar target".to_string(),
             ));
@@ -506,8 +502,8 @@ impl MicrosoftProviderRuntime {
         let value = parse_graph_success_json(response)?;
         let calendar =
             fetch_calendar(http, &token, calendar_id).unwrap_or(MicrosoftCalendarRecord {
-                id: calendar_id.clone(),
-                name: calendar_id.clone(),
+                id: calendar_id.to_string(),
+                name: calendar_id.to_string(),
                 can_edit: true,
                 is_default: false,
             });
@@ -2882,10 +2878,7 @@ mod tests {
         assert_eq!(targets[1].label, "Microsoft work: team");
         assert_eq!(
             runtime.default_write_target(),
-            Some(EventWriteTargetId::Microsoft {
-                account_id: "work".to_string(),
-                calendar_id: "team".to_string(),
-            })
+            Some(EventWriteTargetId::microsoft("work", "team"))
         );
     }
 
@@ -2930,10 +2923,7 @@ mod tests {
             reminders: Vec::new(),
             recurrence: None,
         };
-        let target = EventWriteTargetId::Microsoft {
-            account_id: "work".to_string(),
-            calendar_id: "personal".to_string(),
-        };
+        let target = EventWriteTargetId::microsoft("work", "personal");
 
         let event = runtime
             .create_event_in_target(draft, &target, &http, &store)

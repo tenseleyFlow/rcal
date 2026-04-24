@@ -147,25 +147,32 @@ impl EventWriteTarget {
         }
     }
 
-    pub fn microsoft(
+    pub fn provider(
+        provider_id: impl Into<String>,
         account_id: impl Into<String>,
         calendar_id: impl Into<String>,
         label: impl Into<String>,
     ) -> Self {
         Self {
-            id: EventWriteTargetId::Microsoft {
-                account_id: account_id.into(),
-                calendar_id: calendar_id.into(),
-            },
+            id: EventWriteTargetId::provider(provider_id, account_id, calendar_id),
             label: label.into(),
         }
+    }
+
+    pub fn microsoft(
+        account_id: impl Into<String>,
+        calendar_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        Self::provider("microsoft", account_id, calendar_id, label)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventWriteTargetId {
     Local,
-    Microsoft {
+    Provider {
+        provider_id: String,
         account_id: String,
         calendar_id: String,
     },
@@ -176,18 +183,84 @@ impl EventWriteTargetId {
         matches!(self, Self::Local)
     }
 
+    pub fn provider(
+        provider_id: impl Into<String>,
+        account_id: impl Into<String>,
+        calendar_id: impl Into<String>,
+    ) -> Self {
+        Self::Provider {
+            provider_id: provider_id.into(),
+            account_id: account_id.into(),
+            calendar_id: calendar_id.into(),
+        }
+    }
+
+    pub fn microsoft(account_id: impl Into<String>, calendar_id: impl Into<String>) -> Self {
+        Self::provider("microsoft", account_id, calendar_id)
+    }
+
+    pub fn provider_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Provider { provider_id, .. } => Some(provider_id),
+        }
+    }
+
+    pub fn account_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Provider { account_id, .. } => Some(account_id),
+        }
+    }
+
+    pub fn calendar_id(&self) -> Option<&str> {
+        match self {
+            Self::Local => None,
+            Self::Provider { calendar_id, .. } => Some(calendar_id),
+        }
+    }
+
+    pub fn provider_parts(&self) -> Option<(&str, &str, &str)> {
+        match self {
+            Self::Local => None,
+            Self::Provider {
+                provider_id,
+                account_id,
+                calendar_id,
+            } => Some((provider_id, account_id, calendar_id)),
+        }
+    }
+
+    pub fn is_provider(&self, provider: &str) -> bool {
+        self.provider_id() == Some(provider)
+    }
+
+    pub fn is_microsoft(&self) -> bool {
+        self.is_provider("microsoft")
+    }
+
+    pub fn microsoft_parts(&self) -> Option<(&str, &str)> {
+        let (provider, account, calendar) = self.provider_parts()?;
+        (provider == "microsoft").then_some((account, calendar))
+    }
+
+    pub fn source_id(&self) -> Option<String> {
+        self.provider_parts()
+            .map(|(provider, account, calendar)| format!("{provider}:{account}:{calendar}"))
+    }
+
     pub fn from_event(event: &Event) -> Option<Self> {
         if event.is_local() {
             return Some(Self::Local);
         }
         let mut parts = event.source.source_id.splitn(3, ':');
-        match (parts.next(), parts.next(), parts.next()) {
-            (Some("microsoft"), Some(account_id), Some(calendar_id)) => Some(Self::Microsoft {
-                account_id: account_id.to_string(),
-                calendar_id: calendar_id.to_string(),
-            }),
-            _ => None,
+        let provider_id = parts.next()?;
+        let account_id = parts.next()?;
+        let calendar_id = parts.next()?;
+        if provider_id.is_empty() || account_id.is_empty() || calendar_id.is_empty() {
+            return None;
         }
+        Some(Self::provider(provider_id, account_id, calendar_id))
     }
 }
 
@@ -440,8 +513,14 @@ impl Event {
         self.source.source_id.starts_with("microsoft:")
     }
 
+    pub fn is_provider_backed(&self) -> bool {
+        EventWriteTargetId::from_event(self)
+            .as_ref()
+            .is_some_and(|target| !target.is_local())
+    }
+
     pub fn is_editable(&self) -> bool {
-        self.is_local() || self.is_microsoft()
+        self.is_local() || self.is_provider_backed()
     }
 
     pub const fn is_recurring_series(&self) -> bool {
@@ -728,19 +807,17 @@ impl ConfiguredAgendaSource {
         draft: CreateEventDraft,
         target: &EventWriteTargetId,
     ) -> Result<Event, LocalEventStoreError> {
-        if let EventWriteTargetId::Microsoft { .. } = target
-            && let Some(microsoft) = &mut self.microsoft
-        {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .create_event_in_target(draft, target, &http, &token_store)
-                .map_err(provider_error);
-        }
-        if matches!(target, EventWriteTargetId::Microsoft { .. }) {
-            return Err(LocalEventStoreError::Provider {
-                reason: "Microsoft provider is not configured".to_string(),
-            });
+        if let Some(provider_id) = target.provider_id() {
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .create_event_in_target(draft, target, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         self.create_local_event(draft)
@@ -794,14 +871,18 @@ impl ConfiguredAgendaSource {
         }
 
         if self.events.local_event_by_id(id).is_none()
-            && id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .update_event(id, draft, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .update_event(id, draft, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let mut events = self.events.events().to_vec();
@@ -845,14 +926,18 @@ impl ConfiguredAgendaSource {
         draft: CreateEventDraft,
     ) -> Result<Event, LocalEventStoreError> {
         if self.events.local_event_by_id(series_id).is_none()
-            && series_id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(series_id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .update_occurrence(series_id, anchor, draft, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .update_occurrence(series_id, anchor, draft, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let mut events = self.events.events().to_vec();
@@ -906,14 +991,18 @@ impl ConfiguredAgendaSource {
 
     pub fn delete_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
         if self.events.local_event_by_id(id).is_none()
-            && id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .delete_event(id, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .delete_event(id, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let mut events = self.events.events().to_vec();
@@ -934,14 +1023,18 @@ impl ConfiguredAgendaSource {
 
     pub fn duplicate_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
         if self.events.local_event_by_id(id).is_none()
-            && id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .duplicate_event(id, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .duplicate_event(id, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let event = self
@@ -957,14 +1050,18 @@ impl ConfiguredAgendaSource {
         anchor: OccurrenceAnchor,
     ) -> Result<Event, LocalEventStoreError> {
         if self.events.local_event_by_id(series_id).is_none()
-            && series_id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(series_id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .duplicate_occurrence(series_id, anchor, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .duplicate_occurrence(series_id, anchor, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let series = self.events.local_event_by_id(series_id).ok_or_else(|| {
@@ -996,14 +1093,18 @@ impl ConfiguredAgendaSource {
         anchor: OccurrenceAnchor,
     ) -> Result<(), LocalEventStoreError> {
         if self.events.local_event_by_id(series_id).is_none()
-            && series_id.starts_with("microsoft:")
-            && let Some(microsoft) = &mut self.microsoft
+            && let Some(provider_id) = event_id_provider(series_id)
         {
-            let http = ReqwestMicrosoftHttpClient;
-            let token_store = KeyringMicrosoftTokenStore;
-            return microsoft
-                .delete_occurrence(series_id, anchor, &http, &token_store)
-                .map_err(provider_error);
+            if provider_id == "microsoft"
+                && let Some(microsoft) = &mut self.microsoft
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringMicrosoftTokenStore;
+                return microsoft
+                    .delete_occurrence(series_id, anchor, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            return Err(provider_not_configured(provider_id));
         }
 
         let mut events = self.events.events().to_vec();
@@ -1135,6 +1236,18 @@ fn provider_error(err: ProviderError) -> LocalEventStoreError {
     LocalEventStoreError::Provider {
         reason: err.to_string(),
     }
+}
+
+fn provider_not_configured(provider_id: &str) -> LocalEventStoreError {
+    LocalEventStoreError::Provider {
+        reason: format!("provider '{provider_id}' is not configured"),
+    }
+}
+
+fn event_id_provider(id: &str) -> Option<&str> {
+    id.split_once(':')
+        .map(|(provider, _)| provider)
+        .filter(|provider| !provider.is_empty())
 }
 
 #[derive(Debug)]
@@ -2987,6 +3100,74 @@ mod tests {
 
     fn timed(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
         Event::timed(id, title, start, end, source()).expect("valid timed event")
+    }
+
+    #[test]
+    fn event_write_target_ids_support_provider_calendar_identity() {
+        let target = EventWriteTargetId::provider("google", "personal", "primary");
+
+        assert!(!target.is_local());
+        assert!(target.is_provider("google"));
+        assert!(!target.is_microsoft());
+        assert_eq!(target.provider_id(), Some("google"));
+        assert_eq!(target.account_id(), Some("personal"));
+        assert_eq!(target.calendar_id(), Some("primary"));
+        assert_eq!(
+            target.source_id().as_deref(),
+            Some("google:personal:primary")
+        );
+    }
+
+    #[test]
+    fn event_write_target_ids_are_recovered_from_provider_source_metadata() {
+        let day = date(23);
+        let event = Event::timed(
+            "google:personal:primary:event-1",
+            "Planning",
+            at(day, 9, 0),
+            at(day, 10, 0),
+            SourceMetadata::new("google:personal:primary", "Google personal: Primary"),
+        )
+        .expect("valid provider event");
+
+        assert_eq!(
+            EventWriteTargetId::from_event(&event),
+            Some(EventWriteTargetId::provider(
+                "google", "personal", "primary"
+            ))
+        );
+        assert!(event.is_provider_backed());
+        assert!(event.is_editable());
+    }
+
+    #[test]
+    fn configured_source_reports_unknown_provider_targets_clearly() {
+        let day = date(23);
+        let mut source =
+            ConfiguredAgendaSource::new(InMemoryAgendaSource::new(), HolidayProvider::off());
+        let draft = CreateEventDraft {
+            title: "Planning".to_string(),
+            timing: CreateEventTiming::Timed {
+                start: at(day, 9, 0),
+                end: at(day, 10, 0),
+            },
+            location: None,
+            notes: None,
+            reminders: Vec::new(),
+            recurrence: None,
+        };
+
+        let err = source
+            .create_event_with_target(
+                draft,
+                &EventWriteTargetId::provider("google", "personal", "primary"),
+            )
+            .expect_err("unknown provider target fails");
+
+        assert!(
+            err.to_string()
+                .contains("provider 'google' is not configured")
+        );
     }
 
     #[test]
