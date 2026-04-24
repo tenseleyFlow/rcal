@@ -12,8 +12,9 @@ use time::{Month, Time, Weekday};
 use crate::{
     agenda::{
         AgendaSource, CreateEventDraft, CreateEventTiming, DayAgenda, Event, EventDateTime,
-        EventTiming, OccurrenceAnchor, RecurrenceEnd, RecurrenceFrequency, RecurrenceMonthlyRule,
-        RecurrenceRule, RecurrenceYearlyRule, Reminder, recurrence_ordinal_for_date,
+        EventTiming, EventWriteTarget, EventWriteTargetId, OccurrenceAnchor, RecurrenceEnd,
+        RecurrenceFrequency, RecurrenceMonthlyRule, RecurrenceRule, RecurrenceYearlyRule, Reminder,
+        recurrence_ordinal_for_date,
     },
     calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK},
 };
@@ -201,7 +202,10 @@ impl AppState {
                                 .unwrap_or(false)
                         })
                     {
-                        self.create_form = Some(CreateEventForm::edit_occurrence(&event));
+                        self.create_form = Some(CreateEventForm::edit_occurrence_with_targets(
+                            &event,
+                            source.event_write_targets(),
+                        ));
                     }
                     RecurrenceChoiceInputResult::Continue
                 }
@@ -209,7 +213,10 @@ impl AppState {
                     let series_id = choice.series_id.clone();
                     self.recurrence_choice = None;
                     if let Some(event) = source.editable_event_by_id(&series_id) {
-                        self.create_form = Some(CreateEventForm::edit(&event));
+                        self.create_form = Some(CreateEventForm::edit_with_targets(
+                            &event,
+                            source.event_write_targets(),
+                        ));
                     }
                     RecurrenceChoiceInputResult::Continue
                 }
@@ -415,7 +422,18 @@ impl AppState {
                         ViewMode::Month => CreateEventContext::EditableDate,
                         ViewMode::Day => CreateEventContext::FixedDate,
                     };
-                    self.create_form = Some(CreateEventForm::new(self.selected_date, context));
+                    let targets = source
+                        .map(AgendaSource::event_write_targets)
+                        .unwrap_or_else(|| vec![EventWriteTarget::local()]);
+                    let selected_target = source
+                        .map(AgendaSource::default_event_write_target)
+                        .unwrap_or(EventWriteTargetId::Local);
+                    self.create_form = Some(CreateEventForm::new_with_targets(
+                        self.selected_date,
+                        context,
+                        targets,
+                        selected_target,
+                    ));
                 }
             }
             AppAction::OpenDelete if self.view_mode == ViewMode::Day => {
@@ -522,7 +540,10 @@ impl AppState {
                     occurrence.anchor,
                 ));
             } else {
-                self.create_form = Some(CreateEventForm::edit(&event));
+                self.create_form = Some(CreateEventForm::edit_with_targets(
+                    &event,
+                    source.event_write_targets(),
+                ));
             }
         }
     }
@@ -993,6 +1014,8 @@ pub enum HelpInputResult {
 pub struct CreateEventForm {
     mode: EventFormMode,
     context: CreateEventContext,
+    targets: Vec<EventWriteTarget>,
+    selected_target: usize,
     selected_date: CalendarDate,
     title: String,
     all_day: bool,
@@ -1015,11 +1038,55 @@ pub struct CreateEventForm {
     error: Option<String>,
 }
 
+fn normalize_write_targets(
+    targets: Vec<EventWriteTarget>,
+    current: Option<EventWriteTarget>,
+) -> Vec<EventWriteTarget> {
+    let mut normalized = Vec::new();
+    for target in targets.into_iter().chain(current) {
+        if !normalized
+            .iter()
+            .any(|existing: &EventWriteTarget| existing.id == target.id)
+        {
+            normalized.push(target);
+        }
+    }
+    if normalized.is_empty() {
+        normalized.push(EventWriteTarget::local());
+    }
+    normalized
+}
+
+fn selected_target_index(targets: &[EventWriteTarget], selected: &EventWriteTargetId) -> usize {
+    targets
+        .iter()
+        .position(|target| &target.id == selected)
+        .unwrap_or_default()
+}
+
 impl CreateEventForm {
     pub fn new(selected_date: CalendarDate, context: CreateEventContext) -> Self {
+        Self::new_with_targets(
+            selected_date,
+            context,
+            vec![EventWriteTarget::local()],
+            EventWriteTargetId::Local,
+        )
+    }
+
+    pub fn new_with_targets(
+        selected_date: CalendarDate,
+        context: CreateEventContext,
+        targets: Vec<EventWriteTarget>,
+        selected_target: EventWriteTargetId,
+    ) -> Self {
+        let targets = normalize_write_targets(targets, None);
+        let selected_target = selected_target_index(&targets, &selected_target);
         Self {
             mode: EventFormMode::Create,
             context,
+            targets,
+            selected_target,
             selected_date,
             title: String::new(),
             all_day: false,
@@ -1044,6 +1111,10 @@ impl CreateEventForm {
     }
 
     pub fn edit(event: &Event) -> Self {
+        Self::edit_with_targets(event, vec![EventWriteTarget::local()])
+    }
+
+    pub fn edit_with_targets(event: &Event, targets: Vec<EventWriteTarget>) -> Self {
         let (all_day, start_date, start_time, end_date, end_time, selected_date) =
             match event.timing {
                 EventTiming::AllDay { date } => (
@@ -1072,12 +1143,26 @@ impl CreateEventForm {
                 reminders[index] = true;
             }
         }
+        let current_target = EventWriteTargetId::from_event(event);
+        let targets = normalize_write_targets(
+            targets,
+            current_target.as_ref().map(|target| EventWriteTarget {
+                id: target.clone(),
+                label: event.source.source_name.clone(),
+            }),
+        );
+        let selected_target = current_target
+            .as_ref()
+            .map(|target| selected_target_index(&targets, target))
+            .unwrap_or_default();
 
         let mut form = Self {
             mode: EventFormMode::Edit {
                 event_id: event.id.clone(),
             },
             context: CreateEventContext::EditableDate,
+            targets,
+            selected_target,
             selected_date,
             title: event.title.clone(),
             all_day,
@@ -1104,10 +1189,14 @@ impl CreateEventForm {
     }
 
     pub fn edit_occurrence(event: &Event) -> Self {
+        Self::edit_occurrence_with_targets(event, vec![EventWriteTarget::local()])
+    }
+
+    pub fn edit_occurrence_with_targets(event: &Event, targets: Vec<EventWriteTarget>) -> Self {
         let Some(occurrence) = event.occurrence() else {
-            return Self::edit(event);
+            return Self::edit_with_targets(event, targets);
         };
-        let mut form = Self::edit(event);
+        let mut form = Self::edit_with_targets(event, targets);
         form.mode = EventFormMode::EditOccurrence {
             series_id: occurrence.series_id.clone(),
             anchor: occurrence.anchor,
@@ -1158,6 +1247,7 @@ impl CreateEventForm {
                 Ok(draft) => CreateEventInputResult::Submit(Box::new(EventFormSubmission {
                     mode: self.mode.clone(),
                     draft,
+                    target: self.selected_target_id(),
                 })),
                 Err(err) => {
                     self.error = Some(err.to_string());
@@ -1182,6 +1272,14 @@ impl CreateEventForm {
             }
             KeyCode::Down => {
                 self.focus_next();
+                CreateEventInputResult::Continue
+            }
+            KeyCode::Left => {
+                self.cycle_focused_field(-1);
+                CreateEventInputResult::Continue
+            }
+            KeyCode::Right => {
+                self.cycle_focused_field(1);
                 CreateEventInputResult::Continue
             }
             KeyCode::Backspace => {
@@ -1378,7 +1476,11 @@ impl CreateEventForm {
     }
 
     fn visible_fields(&self) -> Vec<CreateEventField> {
-        let mut fields = vec![CreateEventField::Title, CreateEventField::AllDay];
+        let mut fields = vec![CreateEventField::Title];
+        if !matches!(self.mode, EventFormMode::EditOccurrence { .. }) {
+            fields.push(CreateEventField::Calendar);
+        }
+        fields.push(CreateEventField::AllDay);
         if self.context == CreateEventContext::EditableDate {
             fields.push(CreateEventField::StartDate);
         }
@@ -1418,6 +1520,7 @@ impl CreateEventForm {
     fn field_value(&self, field: CreateEventField) -> String {
         match field {
             CreateEventField::Title => self.title.clone(),
+            CreateEventField::Calendar => self.targets[self.selected_target].label.clone(),
             CreateEventField::AllDay => checkbox(self.all_day).to_string(),
             CreateEventField::StartDate => self.start_date.clone(),
             CreateEventField::StartTime => self.start_time.clone(),
@@ -1469,6 +1572,7 @@ impl CreateEventForm {
     fn activate_focused_field(&mut self) {
         match self.focused_field() {
             CreateEventField::AllDay => self.all_day = !self.all_day,
+            CreateEventField::Calendar => self.cycle_target(1),
             CreateEventField::Reminder(index) => self.reminders[index] = !self.reminders[index],
             CreateEventField::Notes => self.notes.push('\n'),
             CreateEventField::Repeat => self.repeat = self.repeat.next(),
@@ -1481,6 +1585,61 @@ impl CreateEventForm {
             _ => {}
         }
         self.error = None;
+    }
+
+    fn cycle_focused_field(&mut self, delta: i32) {
+        match self.focused_field() {
+            CreateEventField::Calendar => self.cycle_target(delta),
+            CreateEventField::Repeat => {
+                self.repeat = if delta < 0 {
+                    self.repeat.previous()
+                } else {
+                    self.repeat.next()
+                };
+            }
+            CreateEventField::MonthlyMode => {
+                self.monthly_mode = if delta < 0 {
+                    self.monthly_mode.previous()
+                } else {
+                    self.monthly_mode.next()
+                };
+            }
+            CreateEventField::YearlyMode => {
+                self.yearly_mode = if delta < 0 {
+                    self.yearly_mode.previous()
+                } else {
+                    self.yearly_mode.next()
+                };
+            }
+            CreateEventField::RecurrenceEnd => {
+                self.recurrence_end = if delta < 0 {
+                    self.recurrence_end.previous()
+                } else {
+                    self.recurrence_end.next()
+                };
+            }
+            _ => {}
+        }
+        self.error = None;
+    }
+
+    fn cycle_target(&mut self, delta: i32) {
+        let len = self.targets.len();
+        if len <= 1 {
+            return;
+        }
+        self.selected_target = if delta < 0 {
+            (self.selected_target + len - 1) % len
+        } else {
+            (self.selected_target + 1) % len
+        };
+    }
+
+    fn selected_target_id(&self) -> EventWriteTargetId {
+        self.targets
+            .get(self.selected_target)
+            .map(|target| target.id.clone())
+            .unwrap_or(EventWriteTargetId::Local)
     }
 
     fn edit_text_field(&mut self, edit: impl FnOnce(&mut String)) {
@@ -1497,6 +1656,7 @@ impl CreateEventForm {
             CreateEventField::UntilDate => Some(&mut self.recurrence_until_date),
             CreateEventField::OccurrenceCount => Some(&mut self.recurrence_count),
             CreateEventField::AllDay
+            | CreateEventField::Calendar
             | CreateEventField::Reminder(_)
             | CreateEventField::Repeat
             | CreateEventField::WeeklyDay(_)
@@ -1525,12 +1685,14 @@ pub enum CreateEventFormRowKind {
     Text,
     Multiline,
     Toggle,
+    Selector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventFormSubmission {
     pub mode: EventFormMode,
     pub draft: CreateEventDraft,
+    pub target: EventWriteTargetId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1626,6 +1788,16 @@ impl RepeatFrequency {
         }
     }
 
+    const fn previous(self) -> Self {
+        match self {
+            Self::None => Self::Yearly,
+            Self::Daily => Self::None,
+            Self::Weekly => Self::Daily,
+            Self::Monthly => Self::Weekly,
+            Self::Yearly => Self::Monthly,
+        }
+    }
+
     const fn frequency(self) -> Option<RecurrenceFrequency> {
         match self {
             Self::None => None,
@@ -1666,6 +1838,10 @@ impl RecurrenceMonthlyFormMode {
             Self::WeekdayOrdinal => Self::DayOfMonth,
         }
     }
+
+    const fn previous(self) -> Self {
+        self.next()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1687,6 +1863,10 @@ impl RecurrenceYearlyFormMode {
             Self::Date => Self::WeekdayOrdinal,
             Self::WeekdayOrdinal => Self::Date,
         }
+    }
+
+    const fn previous(self) -> Self {
+        self.next()
     }
 }
 
@@ -1713,11 +1893,20 @@ impl RecurrenceEndFormMode {
             Self::Count => Self::Never,
         }
     }
+
+    const fn previous(self) -> Self {
+        match self {
+            Self::Never => Self::Count,
+            Self::Until => Self::Never,
+            Self::Count => Self::Until,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateEventField {
     Title,
+    Calendar,
     AllDay,
     StartDate,
     StartTime,
@@ -1740,6 +1929,7 @@ impl CreateEventField {
     const fn label(self) -> &'static str {
         match self {
             Self::Title => "Title",
+            Self::Calendar => "Calendar",
             Self::AllDay => "All day",
             Self::StartDate => "Start date",
             Self::StartTime => "Start time",
@@ -1763,6 +1953,11 @@ impl CreateEventField {
         match self {
             Self::Notes => CreateEventFormRowKind::Multiline,
             Self::AllDay | Self::Reminder(_) | Self::WeeklyDay(_) => CreateEventFormRowKind::Toggle,
+            Self::Calendar
+            | Self::Repeat
+            | Self::MonthlyMode
+            | Self::YearlyMode
+            | Self::RecurrenceEnd => CreateEventFormRowKind::Selector,
             _ => CreateEventFormRowKind::Text,
         }
     }
@@ -2678,7 +2873,9 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use time::{Month, Time};
 
-    use crate::agenda::{Holiday, InMemoryAgendaSource, RecurrenceOrdinal, SourceMetadata};
+    use crate::agenda::{
+        DateRange, Holiday, InMemoryAgendaSource, RecurrenceOrdinal, SourceMetadata,
+    };
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
@@ -2756,6 +2953,37 @@ mod tests {
             let action = input.translate(key);
             app.apply_with_agenda_source(action, source);
         }
+    }
+
+    struct WriteTargetSource {
+        targets: Vec<EventWriteTarget>,
+        default: EventWriteTargetId,
+    }
+
+    impl AgendaSource for WriteTargetSource {
+        fn events_intersecting(&self, _range: DateRange) -> Vec<Event> {
+            Vec::new()
+        }
+
+        fn holidays_in(&self, _range: DateRange) -> Vec<Holiday> {
+            Vec::new()
+        }
+
+        fn event_write_targets(&self) -> Vec<EventWriteTarget> {
+            self.targets.clone()
+        }
+
+        fn default_event_write_target(&self) -> EventWriteTargetId {
+            self.default.clone()
+        }
+    }
+
+    fn form_value(form: &CreateEventForm, label: &str) -> String {
+        form.rows()
+            .into_iter()
+            .find(|row| row.label == label)
+            .map(|row| row.value)
+            .expect("form row exists")
     }
 
     #[test]
@@ -3449,6 +3677,24 @@ mod tests {
     }
 
     #[test]
+    fn plus_opens_create_form_with_agenda_source_default_calendar_target() {
+        let day = date(2026, Month::April, 23);
+        let target = EventWriteTarget::microsoft("work", "cal", "Microsoft work: Calendar");
+        let source = WriteTargetSource {
+            targets: vec![EventWriteTarget::local(), target.clone()],
+            default: target.id.clone(),
+        };
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        app.apply_with_agenda_source(input.translate(char_key('+')), &source);
+
+        let form = app.create_form().expect("form opens");
+        assert_eq!(form.context(), CreateEventContext::EditableDate);
+        assert_eq!(form_value(form, "Calendar"), "Microsoft work: Calendar");
+    }
+
+    #[test]
     fn question_mark_opens_help_and_esc_closes_it() {
         let day = date(2026, Month::April, 23);
         let mut app = AppState::new(day);
@@ -3525,6 +3771,43 @@ mod tests {
     }
 
     #[test]
+    fn create_form_calendar_selector_cycles_and_submits_target() {
+        let day = date(2026, Month::April, 23);
+        let calendar = EventWriteTarget::microsoft("work", "cal", "Microsoft work: Calendar");
+        let personal = EventWriteTarget::microsoft("work", "personal", "Microsoft work: Personal");
+        let mut form = CreateEventForm::new_with_targets(
+            day,
+            CreateEventContext::EditableDate,
+            vec![
+                EventWriteTarget::local(),
+                calendar.clone(),
+                personal.clone(),
+            ],
+            calendar.id.clone(),
+        );
+
+        form.title = "Planning".to_string();
+        let _ = form.handle_key(key(KeyCode::Tab));
+        assert_eq!(form_value(&form, "Calendar"), "Microsoft work: Calendar");
+
+        let _ = form.handle_key(key(KeyCode::Right));
+        assert_eq!(form_value(&form, "Calendar"), "Microsoft work: Personal");
+        let _ = form.handle_key(key(KeyCode::Left));
+        assert_eq!(form_value(&form, "Calendar"), "Microsoft work: Calendar");
+        let _ = form.handle_key(key(KeyCode::Left));
+        assert_eq!(form_value(&form, "Calendar"), "Local");
+        let _ = form.handle_key(key(KeyCode::Right));
+        let _ = form.handle_key(key(KeyCode::Right));
+
+        let result = form.handle_key(ctrl_char_key('s'));
+
+        let CreateEventInputResult::Submit(submission) = result else {
+            panic!("form should submit");
+        };
+        assert_eq!(submission.target, personal.id);
+    }
+
+    #[test]
     fn create_form_validates_required_title() {
         let mut form = CreateEventForm::new(
             date(2026, Month::April, 23),
@@ -3566,6 +3849,25 @@ mod tests {
         assert_eq!(form.notes, "Bring notes");
         assert!(form.reminders[1]);
         assert!(form.reminders[4]);
+    }
+
+    #[test]
+    fn edit_form_preloads_provider_calendar_target() {
+        let day = date(2026, Month::April, 23);
+        let target = EventWriteTarget::microsoft("work", "cal", "Microsoft work: Calendar");
+        let event = Event::timed(
+            "microsoft:work:cal:remote-1",
+            "Sync",
+            at(day, 9, 0),
+            at(day, 9, 30),
+            SourceMetadata::new("microsoft:work:cal", "Microsoft work: Calendar"),
+        )
+        .expect("valid provider event");
+
+        let form =
+            CreateEventForm::edit_with_targets(&event, vec![EventWriteTarget::local(), target]);
+
+        assert_eq!(form_value(&form, "Calendar"), "Microsoft work: Calendar");
     }
 
     #[test]

@@ -170,9 +170,12 @@ daemon does not sync remote calendars itself.
 - Left click selects a visible date; double-click a visible date to open day
   view.
 
-Created events are stored locally as JSON and are shown immediately in month,
-week, and day views. The create/edit modal supports timed events, single-day
-all-day events, recurrence, location, notes, and multiple reminder offsets.
+The create/edit modal supports timed events, single-day all-day events,
+recurrence, location, notes, and multiple reminder offsets. Its `Calendar`
+field controls where the event is saved; use Left/Right on that field to cycle
+between local storage and configured editable provider calendars. Local events
+are stored as JSON, while Microsoft events are written through Graph and then
+shown immediately from the provider cache.
 Reminder notifications are delivered by a user-level background service. Use
 `rcal reminders install` to install it, `rcal reminders status` to inspect it,
 and `rcal reminders test` to send a test notification. On macOS, notification

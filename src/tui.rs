@@ -1011,7 +1011,9 @@ fn render_create_event_modal(
 
             if value_x < content.right() {
                 match row.kind {
-                    CreateEventFormRowKind::Text | CreateEventFormRowKind::Multiline => {
+                    CreateEventFormRowKind::Text
+                    | CreateEventFormRowKind::Multiline
+                    | CreateEventFormRowKind::Selector => {
                         write_padded_left(
                             buf,
                             line_y,
@@ -1042,7 +1044,7 @@ fn render_create_event_modal(
         footer_y,
         content.x,
         content.width,
-        "Tab/Up/Down fields | Ctrl-S save | Esc cancel",
+        create_modal_footer(content.width),
         styles.footer,
     );
 }
@@ -1410,19 +1412,19 @@ fn help_rows(view_mode: ViewMode, keybindings: &KeyBindings) -> Vec<(String, &'s
                     keybindings.display_for(KeyCommand::MoveUp),
                     keybindings.display_for(KeyCommand::MoveDown)
                 ),
-                "Select a local event",
+                "Select an editable event",
             ),
             (
                 keybindings.display_for(KeyCommand::OpenDayOrEdit),
-                "Edit the selected local event",
+                "Edit the selected event",
             ),
             (
                 keybindings.display_for(KeyCommand::CopyEvent),
-                "Copy the selected local event",
+                "Copy the selected event",
             ),
             (
                 keybindings.display_for(KeyCommand::DeleteEvent),
-                "Delete the selected local event",
+                "Delete the selected event",
             ),
             (
                 keybindings.display_for(KeyCommand::CreateEvent),
@@ -1474,6 +1476,16 @@ fn create_modal_row_height(kind: CreateEventFormRowKind, value: &str, value_widt
     u16::try_from(create_modal_value_lines(kind, value, value_width).len()).unwrap_or(u16::MAX)
 }
 
+fn create_modal_footer(width: u16) -> &'static str {
+    let full = "Tab/Up/Down fields | Left/Right change | Ctrl-S save | Esc cancel";
+    let compact = "Left/Right | Ctrl-S save | Esc";
+    if usize::from(width) >= full.chars().count() {
+        full
+    } else {
+        compact
+    }
+}
+
 fn create_modal_value_lines(
     kind: CreateEventFormRowKind,
     value: &str,
@@ -1481,7 +1493,9 @@ fn create_modal_value_lines(
 ) -> Vec<String> {
     match kind {
         CreateEventFormRowKind::Multiline => wrap_text_lines(value, value_width),
-        CreateEventFormRowKind::Text | CreateEventFormRowKind::Toggle => {
+        CreateEventFormRowKind::Text
+        | CreateEventFormRowKind::Toggle
+        | CreateEventFormRowKind::Selector => {
             vec![value.to_string()]
         }
     }
@@ -2834,8 +2848,8 @@ mod tests {
         let rendered = render_app_to_string(&app, 84, 26);
 
         assert!(rendered.contains("Day keys"));
-        assert!(rendered.contains("Copy the selected local event"));
-        assert!(rendered.contains("Delete the selected local event"));
+        assert!(rendered.contains("Copy the selected event"));
+        assert!(rendered.contains("Delete the selected event"));
         assert!(rendered.contains("Move to the previous or next day"));
     }
 
@@ -2891,6 +2905,7 @@ mod tests {
         app.apply(AppAction::OpenCreate);
         let _ = app.handle_create_key(key(KeyCode::Char('A')));
         let _ = app.handle_create_key(key(KeyCode::Tab));
+        let _ = app.handle_create_key(key(KeyCode::Tab));
         let _ = app.handle_create_key(key(KeyCode::Enter));
 
         let area = Rect::new(0, 0, 84, 26);
@@ -2902,20 +2917,22 @@ mod tests {
         let label_width = 12.min(content.width.saturating_sub(1));
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
 
-        assert_styled_text(&buffer, content.x, row_y + 1, ">", Color::White);
+        assert_styled_text(&buffer, content.x, row_y + 2, ">", Color::White);
         assert_styled_text(&buffer, label_x, row_y, "Title", Color::White);
-        assert_styled_text(&buffer, label_x, row_y + 1, "All day", Color::White);
-        assert_styled_text(&buffer, label_x, row_y + 2, "Start date", Color::White);
+        assert_styled_text(&buffer, label_x, row_y + 1, "Calendar", Color::White);
+        assert_styled_text(&buffer, label_x, row_y + 2, "All day", Color::White);
+        assert_styled_text(&buffer, label_x, row_y + 3, "Start date", Color::White);
         assert_styled_text(&buffer, value_x, row_y, "A", Color::Gray);
-        assert_styled_text(&buffer, value_x, row_y + 2, "2026-04-23", Color::Gray);
-        assert_styled_text(&buffer, value_x, row_y + 3, "09:00", Color::Gray);
-        assert_styled_cell(&buffer, value_x, row_y + 1, "[", Color::Yellow);
-        assert_styled_cell(&buffer, value_x + 1, row_y + 1, "x", Color::White);
-        assert_styled_cell(&buffer, value_x + 2, row_y + 1, "]", Color::Yellow);
-        assert_styled_cell(&buffer, value_x, row_y + 8, "[", Color::Yellow);
-        assert_styled_cell(&buffer, value_x + 1, row_y + 8, " ", Color::White);
-        assert_styled_cell(&buffer, value_x + 2, row_y + 8, "]", Color::Yellow);
-        assert_styled_text(&buffer, value_x + 4, row_y + 8, "5m", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 1, "Local", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 3, "2026-04-23", Color::Gray);
+        assert_styled_text(&buffer, value_x, row_y + 4, "09:00", Color::Gray);
+        assert_styled_cell(&buffer, value_x, row_y + 2, "[", Color::Yellow);
+        assert_styled_cell(&buffer, value_x + 1, row_y + 2, "x", Color::White);
+        assert_styled_cell(&buffer, value_x + 2, row_y + 2, "]", Color::Yellow);
+        assert_styled_cell(&buffer, value_x, row_y + 9, "[", Color::Yellow);
+        assert_styled_cell(&buffer, value_x + 1, row_y + 9, " ", Color::White);
+        assert_styled_cell(&buffer, value_x + 2, row_y + 9, "]", Color::Yellow);
+        assert_styled_text(&buffer, value_x + 4, row_y + 9, "5m", Color::Gray);
     }
 
     #[test]
@@ -2923,7 +2940,7 @@ mod tests {
         let selected = date(2026, Month::April, 23);
         let mut app = AppState::new(selected);
         app.apply(AppAction::OpenCreate);
-        for _ in 0..7 {
+        for _ in 0..8 {
             let _ = app.handle_create_key(key(KeyCode::Tab));
         }
         let notes = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
@@ -2936,7 +2953,7 @@ mod tests {
         let modal = create_modal_area(area, app.create_form().expect("form stays open"));
         let content = inset_rect(modal);
         let row_y = content.y.saturating_add(2);
-        let notes_y = row_y.saturating_add(7);
+        let notes_y = row_y.saturating_add(8);
         let label_x = content.x.saturating_add(2);
         let label_width = 12.min(content.width.saturating_sub(1));
         let value_x = label_x.saturating_add(label_width).saturating_add(1);
@@ -2971,6 +2988,7 @@ mod tests {
         assert_eq!(lines.len(), 10);
         assert!(lines[1].contains("Create"));
         assert!(rendered.contains("Title"));
+        assert!(rendered.contains("Left/Right"));
         assert!(rendered.contains("Ctrl-S save"));
     }
 

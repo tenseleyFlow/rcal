@@ -133,6 +133,64 @@ impl SourceMetadata {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventWriteTarget {
+    pub id: EventWriteTargetId,
+    pub label: String,
+}
+
+impl EventWriteTarget {
+    pub fn local() -> Self {
+        Self {
+            id: EventWriteTargetId::Local,
+            label: "Local".to_string(),
+        }
+    }
+
+    pub fn microsoft(
+        account_id: impl Into<String>,
+        calendar_id: impl Into<String>,
+        label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: EventWriteTargetId::Microsoft {
+                account_id: account_id.into(),
+                calendar_id: calendar_id.into(),
+            },
+            label: label.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventWriteTargetId {
+    Local,
+    Microsoft {
+        account_id: String,
+        calendar_id: String,
+    },
+}
+
+impl EventWriteTargetId {
+    pub const fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
+    }
+
+    pub fn from_event(event: &Event) -> Option<Self> {
+        if event.is_local() {
+            return Some(Self::Local);
+        }
+        let mut parts = event.source.source_id.splitn(3, ':');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("microsoft"), Some(account_id), Some(calendar_id)) => Some(Self::Microsoft {
+                account_id: account_id.to_string(),
+                calendar_id: calendar_id.to_string(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Reminder {
     pub minutes_before: u16,
@@ -592,6 +650,14 @@ pub trait AgendaSource {
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday>;
 
+    fn event_write_targets(&self) -> Vec<EventWriteTarget> {
+        vec![EventWriteTarget::local()]
+    }
+
+    fn default_event_write_target(&self) -> EventWriteTargetId {
+        EventWriteTargetId::Local
+    }
+
     fn local_event_by_id(&self, _id: &str) -> Option<Event> {
         None
     }
@@ -653,16 +719,37 @@ impl ConfiguredAgendaSource {
     }
 
     pub fn create_event(&mut self, draft: CreateEventDraft) -> Result<Event, LocalEventStoreError> {
-        if self.create_target == ProviderCreateTarget::Microsoft
+        let target = self.default_event_write_target();
+        self.create_event_with_target(draft, &target)
+    }
+
+    pub fn create_event_with_target(
+        &mut self,
+        draft: CreateEventDraft,
+        target: &EventWriteTargetId,
+    ) -> Result<Event, LocalEventStoreError> {
+        if let EventWriteTargetId::Microsoft { .. } = target
             && let Some(microsoft) = &mut self.microsoft
         {
             let http = ReqwestMicrosoftHttpClient;
             let token_store = KeyringMicrosoftTokenStore;
             return microsoft
-                .create_event(draft, &http, &token_store)
+                .create_event_in_target(draft, target, &http, &token_store)
                 .map_err(provider_error);
         }
+        if matches!(target, EventWriteTargetId::Microsoft { .. }) {
+            return Err(LocalEventStoreError::Provider {
+                reason: "Microsoft provider is not configured".to_string(),
+            });
+        }
 
+        self.create_local_event(draft)
+    }
+
+    fn create_local_event(
+        &mut self,
+        draft: CreateEventDraft,
+    ) -> Result<Event, LocalEventStoreError> {
         let id = self.next_local_event_id(&draft.title);
         let event = draft
             .into_event(id)
@@ -684,6 +771,28 @@ impl ConfiguredAgendaSource {
         id: &str,
         draft: CreateEventDraft,
     ) -> Result<Event, LocalEventStoreError> {
+        let target = self
+            .event_target_for_id(id)
+            .unwrap_or(EventWriteTargetId::Local);
+        self.update_event_with_target(id, draft, &target)
+    }
+
+    pub fn update_event_with_target(
+        &mut self,
+        id: &str,
+        draft: CreateEventDraft,
+        target: &EventWriteTargetId,
+    ) -> Result<Event, LocalEventStoreError> {
+        let current_target = self.event_target_for_id(id);
+        if current_target
+            .as_ref()
+            .is_some_and(|current| current != target)
+        {
+            let created = self.create_event_with_target(draft, target)?;
+            self.delete_event(id)?;
+            return Ok(created);
+        }
+
         if self.events.local_event_by_id(id).is_none()
             && id.starts_with("microsoft:")
             && let Some(microsoft) = &mut self.microsoft
@@ -944,6 +1053,18 @@ impl ConfiguredAgendaSource {
         Ok(event)
     }
 
+    fn event_target_for_id(&self, id: &str) -> Option<EventWriteTargetId> {
+        self.events
+            .local_event_by_id(id)
+            .as_ref()
+            .and_then(EventWriteTargetId::from_event)
+            .or_else(|| {
+                let microsoft = self.microsoft.as_ref()?;
+                let event = microsoft.agenda_source().editable_event_by_id(id)?;
+                EventWriteTargetId::from_event(&event)
+            })
+    }
+
     fn next_local_event_id(&self, title: &str) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -975,6 +1096,26 @@ impl AgendaSource for ConfiguredAgendaSource {
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday> {
         self.holidays.holidays_in(range)
+    }
+
+    fn event_write_targets(&self) -> Vec<EventWriteTarget> {
+        let mut targets = vec![EventWriteTarget::local()];
+        if let Some(microsoft) = &self.microsoft {
+            targets.extend(microsoft.write_targets());
+        }
+        targets
+    }
+
+    fn default_event_write_target(&self) -> EventWriteTargetId {
+        if self.create_target == ProviderCreateTarget::Microsoft
+            && let Some(target) = self
+                .microsoft
+                .as_ref()
+                .and_then(MicrosoftProviderRuntime::default_write_target)
+        {
+            return target;
+        }
+        EventWriteTargetId::Local
     }
 
     fn local_event_by_id(&self, id: &str) -> Option<Event> {

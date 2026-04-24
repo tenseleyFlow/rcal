@@ -1631,7 +1631,10 @@ where
                             let submission = *submission;
                             match submission.mode {
                                 EventFormMode::Create => {
-                                    match agenda_source.create_event(submission.draft) {
+                                    match agenda_source.create_event_with_target(
+                                        submission.draft,
+                                        &submission.target,
+                                    ) {
                                         Ok(_) => {
                                             app.close_create_form();
                                             app.reconcile_day_event_selection(&agenda_source);
@@ -1640,7 +1643,11 @@ where
                                     }
                                 }
                                 EventFormMode::Edit { event_id } => {
-                                    match agenda_source.update_event(&event_id, submission.draft) {
+                                    match agenda_source.update_event_with_target(
+                                        &event_id,
+                                        submission.draft,
+                                        &submission.target,
+                                    ) {
                                         Ok(_) => {
                                             app.close_create_form();
                                             app.reconcile_day_event_selection(&agenda_source);

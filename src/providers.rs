@@ -19,9 +19,10 @@ use time::{Month, Time, Weekday};
 use crate::{
     agenda::{
         AgendaError, AgendaSource, CreateEventDraft, CreateEventTiming, DateRange, Event,
-        EventDateTime, Holiday, InMemoryAgendaSource, OccurrenceAnchor, OccurrenceMetadata,
-        RecurrenceEnd, RecurrenceFrequency, RecurrenceMonthlyRule, RecurrenceOrdinal,
-        RecurrenceRule, RecurrenceYearlyRule, Reminder, SourceMetadata,
+        EventDateTime, EventWriteTarget, EventWriteTargetId, Holiday, InMemoryAgendaSource,
+        OccurrenceAnchor, OccurrenceMetadata, RecurrenceEnd, RecurrenceFrequency,
+        RecurrenceMonthlyRule, RecurrenceOrdinal, RecurrenceRule, RecurrenceYearlyRule, Reminder,
+        SourceMetadata,
     },
     calendar::CalendarDate,
 };
@@ -326,6 +327,46 @@ impl MicrosoftProviderRuntime {
         }
     }
 
+    pub fn write_targets(&self) -> Vec<EventWriteTarget> {
+        self.config
+            .accounts
+            .iter()
+            .flat_map(|account| {
+                account.calendars.iter().filter_map(|calendar_id| {
+                    let record = self.cache.calendar_record(&account.id, calendar_id);
+                    if record.as_ref().is_some_and(|calendar| !calendar.can_edit) {
+                        return None;
+                    }
+                    let label = record
+                        .as_ref()
+                        .map(|calendar| calendar.name.as_str())
+                        .filter(|name| !name.trim().is_empty())
+                        .map(|name| format!("Microsoft {}: {name}", account.id))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Microsoft {}: {}",
+                                account.id,
+                                short_calendar_label(calendar_id)
+                            )
+                        });
+                    Some(EventWriteTarget::microsoft(
+                        account.id.clone(),
+                        calendar_id.clone(),
+                        label,
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    pub fn default_write_target(&self) -> Option<EventWriteTargetId> {
+        let (account, calendar_id) = self.config.default_calendar()?;
+        Some(EventWriteTargetId::Microsoft {
+            account_id: account.id.clone(),
+            calendar_id: calendar_id.to_string(),
+        })
+    }
+
     pub fn status(&self, token_store: &dyn MicrosoftTokenStore) -> MicrosoftProviderStatus {
         let accounts = self
             .config
@@ -400,11 +441,44 @@ impl MicrosoftProviderRuntime {
         http: &dyn MicrosoftHttpClient,
         token_store: &dyn MicrosoftTokenStore,
     ) -> Result<Event, ProviderError> {
-        let (account, calendar_id) = self.config.default_calendar().ok_or_else(|| {
+        let target = self.default_write_target().ok_or_else(|| {
             ProviderError::Config("no Microsoft default calendar configured".to_string())
         })?;
-        let account = account.clone();
-        let calendar_id = calendar_id.to_string();
+        self.create_event_in_target(draft, &target, http, token_store)
+    }
+
+    pub fn create_event_in_target(
+        &mut self,
+        draft: CreateEventDraft,
+        target: &EventWriteTargetId,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn MicrosoftTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let EventWriteTargetId::Microsoft {
+            account_id,
+            calendar_id,
+        } = target
+        else {
+            return Err(ProviderError::Config(
+                "Microsoft provider requires a Microsoft calendar target".to_string(),
+            ));
+        };
+        let account = self
+            .config
+            .account(account_id)
+            .ok_or_else(|| {
+                ProviderError::Config(format!("account '{account_id}' is not configured"))
+            })?
+            .clone();
+        if !account
+            .calendars
+            .iter()
+            .any(|calendar| calendar == calendar_id)
+        {
+            return Err(ProviderError::Config(format!(
+                "calendar '{calendar_id}' is not configured for account '{account_id}'"
+            )));
+        }
         let token = access_token(&account, http, token_store)?;
         let body = graph_event_payload(&draft, false)?;
         let response = graph_request(
@@ -412,14 +486,14 @@ impl MicrosoftProviderRuntime {
             "POST",
             &format!(
                 "{GRAPH_BASE_URL}/me/calendars/{}/events",
-                percent_encode(&calendar_id)
+                percent_encode(calendar_id)
             ),
             &token,
             Some(body.to_string()),
         )?;
         let value = parse_graph_success_json(response)?;
         let calendar =
-            fetch_calendar(http, &token, &calendar_id).unwrap_or(MicrosoftCalendarRecord {
+            fetch_calendar(http, &token, calendar_id).unwrap_or(MicrosoftCalendarRecord {
                 id: calendar_id.clone(),
                 name: calendar_id.clone(),
                 can_edit: true,
@@ -2331,6 +2405,16 @@ fn microsoft_event_app_id(account_id: &str, calendar_id: &str, graph_id: &str) -
     format!("microsoft:{account_id}:{calendar_id}:{graph_id}")
 }
 
+fn short_calendar_label(calendar_id: &str) -> String {
+    const MAX: usize = 18;
+    let label = calendar_id.chars().take(MAX).collect::<String>();
+    if calendar_id.chars().count() > MAX {
+        format!("{label}...")
+    } else {
+        label
+    }
+}
+
 fn anchor_label(anchor: OccurrenceAnchor) -> String {
     match anchor {
         OccurrenceAnchor::AllDay { date } => date.to_string(),
@@ -2632,6 +2716,15 @@ mod tests {
         }
     }
 
+    fn calendar_record(id: &str, name: &str, can_edit: bool) -> MicrosoftCalendarRecord {
+        MicrosoftCalendarRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            can_edit,
+            is_default: false,
+        }
+    }
+
     #[derive(Default)]
     struct MemoryTokenStore {
         tokens: RefCell<HashMap<String, MicrosoftToken>>,
@@ -2747,6 +2840,104 @@ mod tests {
         assert_eq!(event.location.as_deref(), Some("Room"));
         assert_eq!(event.reminders, vec![Reminder::minutes_before(15)]);
         assert!(event.source.source_id.starts_with("microsoft:work:cal"));
+    }
+
+    #[test]
+    fn provider_write_targets_use_configured_editable_calendars() {
+        let cache_file = temp_path("targets/microsoft-cache.json");
+        let mut config = provider_config(cache_file);
+        config.default_calendar = Some("team".to_string());
+        config.accounts[0].calendars = vec![
+            "cal".to_string(),
+            "team".to_string(),
+            "holidays".to_string(),
+        ];
+        let mut runtime = MicrosoftProviderRuntime::load(config).expect("load");
+        runtime
+            .cache
+            .replace_calendar("work", calendar_record("cal", "Work", true), Vec::new(), 0);
+        runtime.cache.replace_calendar(
+            "work",
+            calendar_record("holidays", "Holidays", false),
+            Vec::new(),
+            0,
+        );
+
+        let targets = runtime.write_targets();
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].label, "Microsoft work: Work");
+        assert_eq!(targets[1].label, "Microsoft work: team");
+        assert_eq!(
+            runtime.default_write_target(),
+            Some(EventWriteTargetId::Microsoft {
+                account_id: "work".to_string(),
+                calendar_id: "team".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn create_event_uses_explicit_calendar_target() {
+        let cache_file = temp_path("create-target/microsoft-cache.json");
+        let mut config = provider_config(cache_file.clone());
+        config.accounts[0].calendars = vec!["cal".to_string(), "personal".to_string()];
+        let store = MemoryTokenStore::with_token("work");
+        let http = RecordingHttpClient::new(vec![
+            RecordingHttpClient::json(
+                201,
+                json!({
+                    "id": "evt",
+                    "subject": "Planning",
+                    "type": "singleInstance",
+                    "isAllDay": false,
+                    "start": {"dateTime": "2026-04-23T09:00:00", "timeZone": "UTC"},
+                    "end": {"dateTime": "2026-04-23T10:00:00", "timeZone": "UTC"}
+                }),
+            ),
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "id": "personal",
+                    "name": "Personal",
+                    "canEdit": true,
+                    "isDefaultCalendar": false
+                }),
+            ),
+        ]);
+        let mut runtime = MicrosoftProviderRuntime::load(config).expect("load");
+        let day = date(2026, Month::April, 23);
+        let draft = CreateEventDraft {
+            title: "Planning".to_string(),
+            timing: CreateEventTiming::Timed {
+                start: at(day, 9, 0),
+                end: at(day, 10, 0),
+            },
+            location: None,
+            notes: None,
+            reminders: Vec::new(),
+            recurrence: None,
+        };
+        let target = EventWriteTargetId::Microsoft {
+            account_id: "work".to_string(),
+            calendar_id: "personal".to_string(),
+        };
+
+        let event = runtime
+            .create_event_in_target(draft, &target, &http, &store)
+            .expect("create succeeds");
+
+        let _ = fs::remove_dir_all(
+            cache_file
+                .parent()
+                .and_then(Path::parent)
+                .expect("test root"),
+        );
+        assert_eq!(event.id, "microsoft:work:personal:evt");
+        assert_eq!(
+            http.requests.borrow()[0].url,
+            format!("{GRAPH_BASE_URL}/me/calendars/personal/events")
+        );
     }
 
     #[test]
