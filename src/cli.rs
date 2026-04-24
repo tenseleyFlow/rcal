@@ -26,6 +26,11 @@ use crate::{
         ConfigError, ConfigHolidaySource, UserConfig, init_config_file, load_discovered_config,
         load_explicit_config,
     },
+    providers::{
+        KeyringMicrosoftTokenStore, MicrosoftProviderConfig, MicrosoftProviderRuntime,
+        ProviderConfig, ProviderError, ReqwestMicrosoftHttpClient, list_calendars,
+        login_device_code_or_browser, logout,
+    },
     reminders::{
         ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file,
         notification_backend_name, run_daemon, run_once, test_notification,
@@ -47,6 +52,11 @@ const HELP: &str = concat!(
     "Usage:\n",
     "  rcal [--config PATH|--no-config] [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n",
     "  rcal config init [--path PATH] [--force]\n\n",
+    "  rcal providers microsoft auth login --account ID [--browser]\n",
+    "  rcal providers microsoft auth logout --account ID\n",
+    "  rcal providers microsoft calendars list --account ID\n",
+    "  rcal providers microsoft sync [--account ID]\n",
+    "  rcal providers microsoft status\n\n",
     "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
     "  rcal reminders install [--events-file PATH] [--state-file PATH]\n",
     "  rcal reminders uninstall\n",
@@ -70,15 +80,15 @@ const HELP: &str = concat!(
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
     "  ? opens contextual help.\n",
     "  + opens the Create event modal.\n",
-    "  In day view, c opens the Copy confirmation for the selected local event.\n",
-    "  In day view, d opens the Delete confirmation for the selected local event.\n",
+    "  In day view, c opens the Copy confirmation for the selected editable event.\n",
+    "  In day view, d opens the Delete confirmation for the selected editable event.\n",
     "  In day view, Left/Right move to the previous or next day.\n",
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
     "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",
     "  Left click selects a visible date; double-click a visible date to open day view.\n\n",
     "Notes:\n",
-    "  Reminder services are user-level background jobs. Provider account integration is not in this milestone.\n",
+    "  Microsoft provider data is cache-first. Run `rcal providers microsoft sync` to refresh it.\n",
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -91,6 +101,7 @@ pub struct AppConfig {
     pub holiday_source: HolidaySourceConfig,
     pub holiday_country: String,
     pub keybindings: KeyBindings,
+    pub providers: ProviderConfig,
 }
 
 impl AppConfig {
@@ -101,6 +112,7 @@ impl AppConfig {
             holiday_source: HolidaySourceConfig::UsFederal,
             holiday_country: "US".to_string(),
             keybindings: KeyBindings::default(),
+            providers: ProviderConfig::default(),
         }
     }
 }
@@ -117,6 +129,7 @@ pub enum CliAction {
     Run(AppConfig),
     Reminders(ReminderCliAction),
     Config(ConfigCliAction),
+    Providers(ProviderCliAction),
     Help,
     Version,
 }
@@ -124,6 +137,34 @@ pub enum CliAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigCliAction {
     Init { path: Option<PathBuf>, force: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCliAction {
+    Microsoft(MicrosoftCliAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MicrosoftCliAction {
+    AuthLogin {
+        account: String,
+        browser: bool,
+        config: MicrosoftProviderConfig,
+    },
+    AuthLogout {
+        account: String,
+    },
+    CalendarsList {
+        account: String,
+        config: MicrosoftProviderConfig,
+    },
+    Sync {
+        account: Option<String>,
+        config: MicrosoftProviderConfig,
+    },
+    Status {
+        config: MicrosoftProviderConfig,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +185,7 @@ pub enum ReminderCliAction {
 pub struct ReminderRunConfig {
     pub events_file: PathBuf,
     pub state_file: PathBuf,
+    pub providers: ProviderConfig,
     pub once: bool,
 }
 
@@ -168,6 +210,11 @@ pub enum CliError {
     DuplicateConfigInitPath,
     MissingConfigInitPathValue,
     Config(ConfigError),
+    Provider(ProviderError),
+    MissingProviderCommand,
+    UnknownProviderCommand(String),
+    MissingProviderAccount,
+    DuplicateProviderAccount,
     MissingReminderCommand,
     UnknownReminderCommand(String),
     DuplicateStateFile,
@@ -220,6 +267,13 @@ impl fmt::Display for CliError {
             }
             Self::MissingConfigInitPathValue => write!(f, "config init --path requires a path"),
             Self::Config(err) => write!(f, "{err}"),
+            Self::Provider(err) => write!(f, "{err}"),
+            Self::MissingProviderCommand => write!(f, "providers requires a command: microsoft"),
+            Self::UnknownProviderCommand(command) => {
+                write!(f, "unknown providers command: {command}")
+            }
+            Self::MissingProviderAccount => write!(f, "--account requires a Microsoft account id"),
+            Self::DuplicateProviderAccount => write!(f, "--account may only be provided once"),
             Self::MissingReminderCommand => write!(
                 f,
                 "reminders requires one of: run, install, uninstall, status, test"
@@ -242,6 +296,12 @@ impl std::error::Error for CliError {}
 impl From<ConfigError> for CliError {
     fn from(err: ConfigError) -> Self {
         Self::Config(err)
+    }
+}
+
+impl From<ProviderError> for CliError {
+    fn from(err: ProviderError) -> Self {
+        Self::Provider(err)
     }
 }
 
@@ -287,6 +347,7 @@ where
         }
         Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Config(action)) => run_config_action(action, &mut stdout, &mut stderr),
+        Ok(CliAction::Providers(action)) => run_provider_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -322,6 +383,7 @@ where
         }
         Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Config(action)) => run_config_action(action, &mut stdout, &mut stderr),
+        Ok(CliAction::Providers(action)) => run_provider_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -394,6 +456,12 @@ where
         && first == "reminders"
     {
         return parse_reminder_args(args.into_iter().skip(1), &user_config);
+    }
+
+    if let Some(first) = args.first()
+        && first == "providers"
+    {
+        return parse_provider_args(args.into_iter().skip(1), &user_config);
     }
 
     parse_calendar_args(args, today, user_config)
@@ -469,6 +537,12 @@ fn early_static_action(args: &[OsString]) -> Option<CliAction> {
         return Some(CliAction::Help);
     }
     if first == "config"
+        && let Some(second) = args.get(1)
+        && (second == "--help" || second == "-h")
+    {
+        return Some(CliAction::Help);
+    }
+    if first == "providers"
         && let Some(second) = args.get(1)
         && (second == "--help" || second == "-h")
     {
@@ -601,6 +675,7 @@ where
         config.holiday_country = holiday_country;
     }
     config.keybindings = user_config.keybindings;
+    config.providers = user_config.providers;
 
     if let Some(events_file) = events_file {
         config.events_file = events_file;
@@ -687,6 +762,210 @@ where
     }
 
     Ok(CliAction::Config(ConfigCliAction::Init { path, force }))
+}
+
+fn parse_provider_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "microsoft" => parse_microsoft_provider_args(args, &user_config.providers.microsoft),
+        "--help" | "-h" => Ok(CliAction::Help),
+        _ => Err(CliError::UnknownProviderCommand(command.to_string())),
+    }
+}
+
+fn parse_microsoft_provider_args<I>(
+    args: I,
+    config: &MicrosoftProviderConfig,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "auth" => parse_microsoft_auth_args(args, config),
+        "calendars" => parse_microsoft_calendars_args(args, config),
+        "sync" => parse_microsoft_sync_args(args, config),
+        "status" => no_extra_provider_args(
+            args,
+            MicrosoftCliAction::Status {
+                config: config.clone(),
+            },
+        ),
+        "--help" | "-h" => Ok(CliAction::Help),
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "microsoft {command}"
+        ))),
+    }
+}
+
+fn parse_microsoft_auth_args<I>(
+    args: I,
+    config: &MicrosoftProviderConfig,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "login" => {
+            let (account, browser) = parse_account_and_browser(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::AuthLogin {
+                    account,
+                    browser,
+                    config: config.clone(),
+                },
+            )))
+        }
+        "logout" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::AuthLogout { account },
+            )))
+        }
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "microsoft auth {command}"
+        ))),
+    }
+}
+
+fn parse_microsoft_calendars_args<I>(
+    args: I,
+    config: &MicrosoftProviderConfig,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+    match command {
+        "list" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::CalendarsList {
+                    account,
+                    config: config.clone(),
+                },
+            )))
+        }
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "microsoft calendars {command}"
+        ))),
+    }
+}
+
+fn parse_microsoft_sync_args<I>(
+    args: I,
+    config: &MicrosoftProviderConfig,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let account = parse_optional_account(args)?;
+    Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+        MicrosoftCliAction::Sync {
+            account,
+            config: config.clone(),
+        },
+    )))
+}
+
+fn no_extra_provider_args<I>(args: I, action: MicrosoftCliAction) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if let Some(arg) = args.next() {
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+    Ok(CliAction::Providers(ProviderCliAction::Microsoft(action)))
+}
+
+fn parse_required_account<I>(args: I) -> Result<String, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    parse_optional_account(args)?.ok_or(CliError::MissingProviderAccount)
+}
+
+fn parse_account_and_browser<I>(args: I) -> Result<(String, bool), CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut browser = false;
+    let mut account = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--browser" {
+            browser = true;
+            continue;
+        }
+        parse_account_arg(arg, &mut args, &mut account)?;
+    }
+    Ok((account.ok_or(CliError::MissingProviderAccount)?, browser))
+}
+
+fn parse_optional_account<I>(args: I) -> Result<Option<String>, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut account = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        parse_account_arg(arg, &mut args, &mut account)?;
+    }
+    Ok(account)
+}
+
+fn parse_account_arg<I>(
+    arg: OsString,
+    args: &mut I,
+    account: &mut Option<String>,
+) -> Result<(), CliError>
+where
+    I: Iterator<Item = OsString>,
+{
+    if arg == "--account" {
+        if account.is_some() {
+            return Err(CliError::DuplicateProviderAccount);
+        }
+        *account = Some(display_arg(
+            &args.next().ok_or(CliError::MissingProviderAccount)?,
+        ));
+        return Ok(());
+    }
+    if let Some(value) = arg
+        .to_str()
+        .and_then(|value| value.strip_prefix("--account="))
+    {
+        if account.is_some() {
+            return Err(CliError::DuplicateProviderAccount);
+        }
+        *account = Some(value.to_string());
+        return Ok(());
+    }
+    Err(CliError::UnknownArgument(display_arg(&arg)))
 }
 
 fn parse_reminder_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
@@ -780,6 +1059,7 @@ where
                     .clone()
                     .unwrap_or_else(default_state_file)
             }),
+            providers: user_config.providers.clone(),
             once,
         },
     )))
@@ -902,7 +1182,14 @@ fn agenda_source(config: &AppConfig) -> Result<ConfiguredAgendaSource, LocalEven
         HolidaySourceConfig::Nager => HolidayProvider::nager(config.holiday_country.clone()),
     };
 
-    ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays)
+    ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays).and_then(
+        |source| {
+            source.with_microsoft_provider(
+                config.providers.microsoft.clone(),
+                config.providers.create_target,
+            )
+        },
+    )
 }
 
 fn run_config_action(
@@ -921,6 +1208,113 @@ fn run_config_action(
     }
 }
 
+fn run_provider_action(
+    action: ProviderCliAction,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::process::ExitCode {
+    match action {
+        ProviderCliAction::Microsoft(action) => run_microsoft_action(action, stdout, stderr),
+    }
+}
+
+fn run_microsoft_action(
+    action: MicrosoftCliAction,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::process::ExitCode {
+    let http = ReqwestMicrosoftHttpClient;
+    let token_store = KeyringMicrosoftTokenStore;
+    let result = match action {
+        MicrosoftCliAction::AuthLogin {
+            account,
+            browser,
+            config,
+        } => {
+            let Some(account_config) = config.account(&account) else {
+                return provider_error_exit(
+                    stderr,
+                    ProviderError::Config(format!(
+                        "Microsoft account '{account}' is not configured"
+                    )),
+                );
+            };
+            login_device_code_or_browser(account_config, &http, &token_store, stdout, browser)
+        }
+        MicrosoftCliAction::AuthLogout { account } => logout(&account, &token_store).map(|()| {
+            let _ = writeln!(stdout, "removed Microsoft credentials for '{account}'");
+        }),
+        MicrosoftCliAction::CalendarsList { account, config } => {
+            let Some(account_config) = config.account(&account) else {
+                return provider_error_exit(
+                    stderr,
+                    ProviderError::Config(format!(
+                        "Microsoft account '{account}' is not configured"
+                    )),
+                );
+            };
+            list_calendars(account_config, &http, &token_store).map(|calendars| {
+                for calendar in calendars {
+                    let _ = writeln!(
+                        stdout,
+                        "{}\t{}\tcan_edit={}\tdefault={}",
+                        calendar.id, calendar.name, calendar.can_edit, calendar.is_default
+                    );
+                }
+            })
+        }
+        MicrosoftCliAction::Sync { account, config } => {
+            let mut runtime = match MicrosoftProviderRuntime::load(config) {
+                Ok(runtime) => runtime,
+                Err(err) => return provider_error_exit(stderr, err),
+            };
+            runtime
+                .sync(
+                    account.as_deref(),
+                    &http,
+                    &token_store,
+                    CalendarDate::from(default_start_date()),
+                )
+                .map(|summary| {
+                    let _ = writeln!(
+                        stdout,
+                        "synced accounts={} calendars={} events={}",
+                        summary.accounts, summary.calendars, summary.events
+                    );
+                })
+        }
+        MicrosoftCliAction::Status { config } => {
+            let runtime = match MicrosoftProviderRuntime::load(config.clone()) {
+                Ok(runtime) => runtime,
+                Err(err) => return provider_error_exit(stderr, err),
+            };
+            let status = runtime.status(&token_store);
+            let _ = writeln!(
+                stdout,
+                "enabled={} cache={} cached_events={}",
+                status.enabled,
+                status.cache_file.display(),
+                status.event_count
+            );
+            for account in status.accounts {
+                let _ = writeln!(
+                    stdout,
+                    "account={} authenticated={} calendars={}",
+                    account.id,
+                    account.authenticated,
+                    account.calendars.join(",")
+                );
+            }
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => provider_error_exit(stderr, err),
+    }
+}
+
 fn run_reminder_action(
     action: ReminderCliAction,
     stdout: &mut impl Write,
@@ -928,7 +1322,8 @@ fn run_reminder_action(
 ) -> std::process::ExitCode {
     match action {
         ReminderCliAction::Run(config) => {
-            let daemon_config = ReminderDaemonConfig::new(config.events_file, config.state_file);
+            let daemon_config = ReminderDaemonConfig::new(config.events_file, config.state_file)
+                .with_providers(config.providers);
             let mut notifier = SystemNotifier;
             if config.once {
                 match run_once(
@@ -1329,6 +1724,11 @@ fn service_error_exit(stderr: &mut impl Write, err: ServiceError) -> std::proces
     std::process::ExitCode::FAILURE
 }
 
+fn provider_error_exit(stderr: &mut impl Write, err: ProviderError) -> std::process::ExitCode {
+    let _ = writeln!(stderr, "error: {err}");
+    std::process::ExitCode::FAILURE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,6 +1736,7 @@ mod tests {
 
     use crate::app::{KeyBindingOverrides, KeyCommand};
     use crate::calendar::CalendarMonth;
+    use crate::providers::{MicrosoftAccountConfig, ProviderCreateTarget};
     use time::Month;
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
@@ -1365,6 +1766,35 @@ mod tests {
                 ..KeyBindingOverrides::default()
             })
             .expect("test bindings are valid"),
+            providers: ProviderConfig::default(),
+        }
+    }
+
+    fn microsoft_provider_config() -> MicrosoftProviderConfig {
+        MicrosoftProviderConfig {
+            enabled: true,
+            default_account: Some("work".to_string()),
+            default_calendar: Some("cal-1".to_string()),
+            sync_past_days: 30,
+            sync_future_days: 365,
+            cache_file: PathBuf::from("/tmp/microsoft-cache.json"),
+            accounts: vec![MicrosoftAccountConfig {
+                id: "work".to_string(),
+                client_id: "client-id".to_string(),
+                tenant: "organizations".to_string(),
+                redirect_port: 8765,
+                calendars: vec!["cal-1".to_string()],
+            }],
+        }
+    }
+
+    fn config_with_microsoft_provider() -> UserConfig {
+        UserConfig {
+            providers: ProviderConfig {
+                create_target: ProviderCreateTarget::Microsoft,
+                microsoft: microsoft_provider_config(),
+            },
+            ..UserConfig::empty()
         }
     }
 
@@ -1671,6 +2101,7 @@ create_event = ["n"]
             CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
                 events_file: PathBuf::from("/tmp/events.json"),
                 state_file: PathBuf::from("/tmp/state.json"),
+                providers: ProviderConfig::default(),
                 once: true,
             }))
         );
@@ -1692,6 +2123,7 @@ create_event = ["n"]
             CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
                 events_file: PathBuf::from("/tmp/config-events.json"),
                 state_file: PathBuf::from("/tmp/config-state.json"),
+                providers: ProviderConfig::default(),
                 once: true,
             }))
         );
@@ -1781,6 +2213,92 @@ create_event = ["n"]
             )
             .expect_err("duplicate state path fails"),
             CliError::DuplicateStateFile
+        );
+    }
+
+    #[test]
+    fn microsoft_provider_commands_parse_configured_account() {
+        let today = date(2026, Month::April, 23);
+        let user_config = config_with_microsoft_provider();
+        let microsoft = user_config.providers.microsoft.clone();
+
+        let sync_action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("microsoft"),
+                arg("sync"),
+                arg("--account"),
+                arg("work"),
+            ],
+            today.into(),
+            user_config.clone(),
+            None,
+        )
+        .expect("sync parses");
+        assert_eq!(
+            sync_action,
+            CliAction::Providers(ProviderCliAction::Microsoft(MicrosoftCliAction::Sync {
+                account: Some("work".to_string()),
+                config: microsoft.clone(),
+            }))
+        );
+
+        let login_action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("microsoft"),
+                arg("auth"),
+                arg("login"),
+                arg("--account=work"),
+                arg("--browser"),
+            ],
+            today.into(),
+            user_config,
+            None,
+        )
+        .expect("login parses");
+        assert_eq!(
+            login_action,
+            CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::AuthLogin {
+                    account: "work".to_string(),
+                    browser: true,
+                    config: microsoft,
+                },
+            ))
+        );
+    }
+
+    #[test]
+    fn microsoft_provider_args_reject_missing_and_duplicate_accounts() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_args(
+                [
+                    arg("providers"),
+                    arg("microsoft"),
+                    arg("auth"),
+                    arg("login")
+                ],
+                today.into(),
+            )
+            .expect_err("missing account fails"),
+            CliError::MissingProviderAccount
+        );
+        assert_eq!(
+            parse_args(
+                [
+                    arg("providers"),
+                    arg("microsoft"),
+                    arg("sync"),
+                    arg("--account=one"),
+                    arg("--account=two"),
+                ],
+                today.into(),
+            )
+            .expect_err("duplicate account fails"),
+            CliError::DuplicateProviderAccount
         );
     }
 

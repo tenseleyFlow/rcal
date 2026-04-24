@@ -1,5 +1,6 @@
 use std::{array, fmt};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use time::{Date, Month, Weekday};
 
 pub const DAYS_PER_WEEK: usize = 7;
@@ -91,6 +92,37 @@ impl fmt::Display for CalendarDate {
             self.day()
         )
     }
+}
+
+impl Serialize for CalendarDate {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for CalendarDate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_calendar_date(&value)
+            .ok_or_else(|| de::Error::custom(format!("invalid calendar date '{value}'")))
+    }
+}
+
+fn parse_calendar_date(value: &str) -> Option<CalendarDate> {
+    let mut parts = value.split('-');
+    let year = parts.next()?.parse().ok()?;
+    let month = Month::try_from(parts.next()?.parse::<u8>().ok()?).ok()?;
+    let day = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    CalendarDate::from_ymd(year, month, day).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

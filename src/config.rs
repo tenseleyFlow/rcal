@@ -7,7 +7,12 @@ use std::{
 
 use serde::Deserialize;
 
-use crate::app::{KeyBindingError, KeyBindingOverrides, KeyBindings};
+use crate::{
+    app::{KeyBindingError, KeyBindingOverrides, KeyBindings},
+    providers::{
+        MicrosoftAccountConfig, MicrosoftProviderConfig, ProviderConfig, ProviderCreateTarget,
+    },
+};
 
 pub const DEFAULT_CONFIG_TOML: &str = r#"# rcal configuration
 # Generate this file with `rcal config init`.
@@ -25,6 +30,27 @@ country = "US"
 [reminders]
 # Delivered/skipped reminder state. Services snapshot this path at install time.
 state_file = "~/.local/state/rcal/reminders-state.json"
+
+[providers]
+# Where newly created events go when provider support is enabled: "local" or "microsoft".
+create_target = "local"
+
+[providers.microsoft]
+# Microsoft Graph provider for Outlook / Microsoft 365 calendars.
+enabled = false
+default_account = "work"
+default_calendar = "CALENDAR_ID"
+sync_past_days = 30
+sync_future_days = 365
+# Provider cache is separate from the local events file.
+# cache_file = "~/.cache/rcal/microsoft-cache.json"
+
+[[providers.microsoft.accounts]]
+id = "work"
+client_id = "AZURE_APP_CLIENT_ID"
+tenant = "organizations"
+redirect_port = 8765
+calendars = ["CALENDAR_ID"]
 
 [keybindings]
 # Normal month/day app commands. Modal/form editing keys are fixed for now.
@@ -57,6 +83,7 @@ pub struct UserConfig {
     pub holiday_country: Option<String>,
     pub reminder_state_file: Option<PathBuf>,
     pub keybindings: KeyBindings,
+    pub providers: ProviderConfig,
 }
 
 impl UserConfig {
@@ -68,6 +95,7 @@ impl UserConfig {
             holiday_country: None,
             reminder_state_file: None,
             keybindings: KeyBindings::default(),
+            providers: ProviderConfig::default(),
         }
     }
 }
@@ -191,6 +219,11 @@ fn raw_config_to_user_config(raw: RawConfig, path: &Path) -> Result<UserConfig, 
     } else {
         KeyBindings::default()
     };
+    let providers = raw
+        .providers
+        .map(|providers| providers.into_config(path, base_dir))
+        .transpose()?
+        .unwrap_or_default();
 
     Ok(UserConfig {
         path: Some(path.to_path_buf()),
@@ -199,6 +232,7 @@ fn raw_config_to_user_config(raw: RawConfig, path: &Path) -> Result<UserConfig, 
         holiday_country,
         reminder_state_file,
         keybindings,
+        providers,
     })
 }
 
@@ -264,6 +298,7 @@ struct RawConfig {
     paths: Option<RawPathsConfig>,
     holidays: Option<RawHolidaysConfig>,
     reminders: Option<RawRemindersConfig>,
+    providers: Option<RawProvidersConfig>,
     keybindings: Option<RawKeyBindingsConfig>,
 }
 
@@ -284,6 +319,35 @@ struct RawHolidaysConfig {
 #[serde(deny_unknown_fields)]
 struct RawRemindersConfig {
     state_file: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProvidersConfig {
+    create_target: Option<String>,
+    microsoft: Option<RawMicrosoftProviderConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMicrosoftProviderConfig {
+    enabled: Option<bool>,
+    default_account: Option<String>,
+    default_calendar: Option<String>,
+    sync_past_days: Option<i32>,
+    sync_future_days: Option<i32>,
+    cache_file: Option<String>,
+    accounts: Option<Vec<RawMicrosoftAccountConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawMicrosoftAccountConfig {
+    id: String,
+    client_id: String,
+    tenant: String,
+    redirect_port: Option<u16>,
+    calendars: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -331,6 +395,90 @@ impl RawKeyBindingsConfig {
             jump_saturday: self.jump_saturday,
             jump_sunday: self.jump_sunday,
         }
+    }
+}
+
+impl RawProvidersConfig {
+    fn into_config(self, path: &Path, base_dir: &Path) -> Result<ProviderConfig, ConfigError> {
+        let mut config = ProviderConfig::default();
+        let create_target_was_set = self.create_target.is_some();
+        if let Some(create_target) = self.create_target {
+            config.create_target = parse_create_target(&create_target, path)?;
+        }
+        if let Some(microsoft) = self.microsoft {
+            config.microsoft = microsoft.into_config(path, base_dir)?;
+            if config.microsoft.enabled && !create_target_was_set {
+                config.create_target = ProviderCreateTarget::Microsoft;
+            }
+        }
+        config
+            .microsoft
+            .validate()
+            .map_err(|err| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        Ok(config)
+    }
+}
+
+impl RawMicrosoftProviderConfig {
+    fn into_config(
+        self,
+        path: &Path,
+        base_dir: &Path,
+    ) -> Result<MicrosoftProviderConfig, ConfigError> {
+        let mut config = MicrosoftProviderConfig::default();
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        config.default_account = self.default_account;
+        config.default_calendar = self.default_calendar;
+        if let Some(sync_past_days) = self.sync_past_days {
+            config.sync_past_days = sync_past_days.max(0);
+        }
+        if let Some(sync_future_days) = self.sync_future_days {
+            config.sync_future_days = sync_future_days.max(1);
+        }
+        if let Some(cache_file) = self.cache_file {
+            config.cache_file = resolve_config_path(&cache_file, base_dir)?;
+        }
+        config.accounts = self
+            .accounts
+            .unwrap_or_default()
+            .into_iter()
+            .map(RawMicrosoftAccountConfig::into_config)
+            .collect();
+        config.validate().map_err(|err| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+        Ok(config)
+    }
+}
+
+impl RawMicrosoftAccountConfig {
+    fn into_config(self) -> MicrosoftAccountConfig {
+        MicrosoftAccountConfig {
+            id: self.id,
+            client_id: self.client_id,
+            tenant: self.tenant,
+            redirect_port: self.redirect_port.unwrap_or(8765),
+            calendars: self.calendars.unwrap_or_default(),
+        }
+    }
+}
+
+fn parse_create_target(value: &str, path: &Path) -> Result<ProviderCreateTarget, ConfigError> {
+    match value {
+        "local" => Ok(ProviderCreateTarget::Local),
+        "microsoft" => Ok(ProviderCreateTarget::Microsoft),
+        _ => Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!(
+                "invalid providers.create_target '{value}'; expected local or microsoft"
+            ),
+        }),
     }
 }
 
@@ -455,6 +603,82 @@ state_file = "~/state.json"
         let parsed = toml::from_str::<RawConfig>(DEFAULT_CONFIG_TOML).expect("template parses");
         assert!(parsed.paths.expect("paths").events_file.is_some());
         assert!(parsed.keybindings.expect("keybindings").quit.is_some());
+    }
+
+    #[test]
+    fn microsoft_provider_config_parses_and_resolves_paths() {
+        let path = temp_config_path("providers/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers]
+create_target = "microsoft"
+
+[providers.microsoft]
+enabled = true
+default_account = "work"
+default_calendar = "cal-1"
+sync_past_days = 7
+sync_future_days = 90
+cache_file = "microsoft-cache.json"
+
+[[providers.microsoft.accounts]]
+id = "work"
+client_id = "client-id"
+tenant = "organizations"
+redirect_port = 9001
+calendars = ["cal-1"]
+"#,
+        )
+        .expect("config writes");
+
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        assert_eq!(
+            config.providers.create_target,
+            ProviderCreateTarget::Microsoft
+        );
+        assert!(config.providers.microsoft.enabled);
+        assert_eq!(
+            config.providers.microsoft.cache_file,
+            path.parent()
+                .expect("config dir")
+                .join("microsoft-cache.json")
+        );
+        assert_eq!(config.providers.microsoft.sync_past_days, 7);
+        assert_eq!(config.providers.microsoft.sync_future_days, 90);
+        assert_eq!(config.providers.microsoft.accounts[0].redirect_port, 9001);
+    }
+
+    #[test]
+    fn invalid_microsoft_provider_config_fails_clearly() {
+        let path = temp_config_path("providers-invalid/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers.microsoft]
+enabled = true
+default_account = "work"
+default_calendar = "missing"
+
+[[providers.microsoft.accounts]]
+id = "work"
+client_id = "client-id"
+tenant = "organizations"
+calendars = ["cal-1"]
+"#,
+        )
+        .expect("config writes");
+
+        let err = load_config_file(&path).expect_err("invalid provider config fails");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        assert!(err.to_string().contains("default calendar"));
     }
 
     #[test]

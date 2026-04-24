@@ -4,6 +4,7 @@ pub mod calendar;
 pub mod cli;
 pub mod config;
 pub mod layout;
+pub mod providers;
 pub mod reminders;
 pub mod services;
 pub mod tui;

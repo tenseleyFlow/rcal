@@ -8,10 +8,16 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use time::{Month, Time, Weekday};
 
-use crate::calendar::CalendarDate;
+use crate::{
+    calendar::CalendarDate,
+    providers::{
+        KeyringMicrosoftTokenStore, MicrosoftProviderConfig, MicrosoftProviderRuntime,
+        ProviderCreateTarget, ProviderError, ReqwestMicrosoftHttpClient,
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DateRange {
@@ -69,6 +75,31 @@ impl DayMinute {
 impl EventDateTime {
     pub const fn new(date: CalendarDate, time: Time) -> Self {
         Self { date, time }
+    }
+}
+
+impl Serialize for EventDateTime {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&format!(
+            "{}T{:02}:{:02}",
+            self.date,
+            self.time.hour(),
+            self.time.minute()
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for EventDateTime {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        parse_event_datetime_record(&value)
+            .ok_or_else(|| de::Error::custom(format!("invalid event datetime '{value}'")))
     }
 }
 
@@ -347,6 +378,14 @@ impl Event {
         self.source.source_id == "local"
     }
 
+    pub fn is_microsoft(&self) -> bool {
+        self.source.source_id.starts_with("microsoft:")
+    }
+
+    pub fn is_editable(&self) -> bool {
+        self.is_local() || self.is_microsoft()
+    }
+
     pub const fn is_recurring_series(&self) -> bool {
         self.recurrence.is_some()
     }
@@ -556,6 +595,10 @@ pub trait AgendaSource {
     fn local_event_by_id(&self, _id: &str) -> Option<Event> {
         None
     }
+
+    fn editable_event_by_id(&self, id: &str) -> Option<Event> {
+        self.local_event_by_id(id)
+    }
 }
 
 #[derive(Debug)]
@@ -563,6 +606,8 @@ pub struct ConfiguredAgendaSource {
     events: InMemoryAgendaSource,
     holidays: HolidayProvider,
     events_file: Option<PathBuf>,
+    create_target: ProviderCreateTarget,
+    microsoft: Option<MicrosoftProviderRuntime>,
 }
 
 impl ConfiguredAgendaSource {
@@ -575,6 +620,8 @@ impl ConfiguredAgendaSource {
             events,
             holidays,
             events_file: None,
+            create_target: ProviderCreateTarget::Local,
+            microsoft: None,
         }
     }
 
@@ -588,10 +635,34 @@ impl ConfiguredAgendaSource {
             events,
             holidays,
             events_file: Some(events_file),
+            create_target: ProviderCreateTarget::Local,
+            microsoft: None,
         })
     }
 
+    pub fn with_microsoft_provider(
+        mut self,
+        config: MicrosoftProviderConfig,
+        create_target: ProviderCreateTarget,
+    ) -> Result<Self, LocalEventStoreError> {
+        if config.enabled {
+            self.microsoft = Some(MicrosoftProviderRuntime::load(config).map_err(provider_error)?);
+            self.create_target = create_target;
+        }
+        Ok(self)
+    }
+
     pub fn create_event(&mut self, draft: CreateEventDraft) -> Result<Event, LocalEventStoreError> {
+        if self.create_target == ProviderCreateTarget::Microsoft
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .create_event(draft, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let id = self.next_local_event_id(&draft.title);
         let event = draft
             .into_event(id)
@@ -613,6 +684,17 @@ impl ConfiguredAgendaSource {
         id: &str,
         draft: CreateEventDraft,
     ) -> Result<Event, LocalEventStoreError> {
+        if self.events.local_event_by_id(id).is_none()
+            && id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .update_event(id, draft, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let mut events = self.events.events().to_vec();
         let Some(index) = events.iter().position(|event| event.id == id) else {
             return Err(LocalEventStoreError::EventNotFound { id: id.to_string() });
@@ -653,6 +735,17 @@ impl ConfiguredAgendaSource {
         anchor: OccurrenceAnchor,
         draft: CreateEventDraft,
     ) -> Result<Event, LocalEventStoreError> {
+        if self.events.local_event_by_id(series_id).is_none()
+            && series_id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .update_occurrence(series_id, anchor, draft, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let mut events = self.events.events().to_vec();
         let Some(index) = events.iter().position(|event| event.id == series_id) else {
             return Err(LocalEventStoreError::EventNotFound {
@@ -703,6 +796,17 @@ impl ConfiguredAgendaSource {
     }
 
     pub fn delete_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
+        if self.events.local_event_by_id(id).is_none()
+            && id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .delete_event(id, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let mut events = self.events.events().to_vec();
         let Some(index) = events.iter().position(|event| event.id == id) else {
             return Err(LocalEventStoreError::EventNotFound { id: id.to_string() });
@@ -720,6 +824,17 @@ impl ConfiguredAgendaSource {
     }
 
     pub fn duplicate_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
+        if self.events.local_event_by_id(id).is_none()
+            && id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .duplicate_event(id, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let event = self
             .events
             .local_event_by_id(id)
@@ -732,6 +847,17 @@ impl ConfiguredAgendaSource {
         series_id: &str,
         anchor: OccurrenceAnchor,
     ) -> Result<Event, LocalEventStoreError> {
+        if self.events.local_event_by_id(series_id).is_none()
+            && series_id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .duplicate_occurrence(series_id, anchor, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let series = self.events.local_event_by_id(series_id).ok_or_else(|| {
             LocalEventStoreError::EventNotFound {
                 id: series_id.to_string(),
@@ -760,6 +886,17 @@ impl ConfiguredAgendaSource {
         series_id: &str,
         anchor: OccurrenceAnchor,
     ) -> Result<(), LocalEventStoreError> {
+        if self.events.local_event_by_id(series_id).is_none()
+            && series_id.starts_with("microsoft:")
+            && let Some(microsoft) = &mut self.microsoft
+        {
+            let http = ReqwestMicrosoftHttpClient;
+            let token_store = KeyringMicrosoftTokenStore;
+            return microsoft
+                .delete_occurrence(series_id, anchor, &http, &token_store)
+                .map_err(provider_error);
+        }
+
         let mut events = self.events.events().to_vec();
         let Some(index) = events.iter().position(|event| event.id == series_id) else {
             return Err(LocalEventStoreError::EventNotFound {
@@ -824,7 +961,16 @@ impl ConfiguredAgendaSource {
 
 impl AgendaSource for ConfiguredAgendaSource {
     fn events_intersecting(&self, range: DateRange) -> Vec<Event> {
-        self.events.events_intersecting(range)
+        let mut events = self.events.events_intersecting(range);
+        if let Some(microsoft) = &self.microsoft {
+            events.extend(microsoft.agenda_source().events_intersecting(range));
+        }
+        events.sort_by(|left, right| {
+            event_sort_key(left)
+                .cmp(&event_sort_key(right))
+                .then(left.id.cmp(&right.id))
+        });
+        events
     }
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday> {
@@ -833,6 +979,20 @@ impl AgendaSource for ConfiguredAgendaSource {
 
     fn local_event_by_id(&self, id: &str) -> Option<Event> {
         self.events.local_event_by_id(id)
+    }
+
+    fn editable_event_by_id(&self, id: &str) -> Option<Event> {
+        self.events.local_event_by_id(id).or_else(|| {
+            self.microsoft
+                .as_ref()
+                .and_then(|microsoft| microsoft.agenda_source().event_by_id(id))
+        })
+    }
+}
+
+fn provider_error(err: ProviderError) -> LocalEventStoreError {
+    LocalEventStoreError::Provider {
+        reason: err.to_string(),
     }
 }
 
@@ -1501,6 +1661,9 @@ pub enum LocalEventStoreError {
         path: Option<PathBuf>,
         reason: String,
     },
+    Provider {
+        reason: String,
+    },
     Write {
         path: PathBuf,
         reason: String,
@@ -1536,6 +1699,7 @@ impl fmt::Display for LocalEventStoreError {
                     write!(f, "failed to encode local event: {reason}")
                 }
             }
+            Self::Provider { reason } => write!(f, "{reason}"),
             Self::Write { path, reason } => {
                 write!(f, "failed to write {}: {reason}", path.display())
             }
@@ -2289,6 +2453,14 @@ fn parse_month_record(value: u8, path: &Path) -> Result<Month, LocalEventStoreEr
         path: path.to_path_buf(),
         reason: format!("invalid month '{value}'"),
     })
+}
+
+fn parse_event_datetime_record(value: &str) -> Option<EventDateTime> {
+    let (date, time) = value.split_once('T')?;
+    Some(EventDateTime::new(
+        parse_iso_date(date)?,
+        parse_hhmm_time(time)?,
+    ))
 }
 
 fn parse_local_date(value: &str, path: &Path) -> Result<CalendarDate, LocalEventStoreError> {

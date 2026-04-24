@@ -22,6 +22,7 @@ use crate::{
         HolidayProvider,
     },
     calendar::CalendarDate,
+    providers::ProviderConfig,
 };
 
 const STATE_VERSION: u8 = 1;
@@ -34,6 +35,7 @@ const POLL_INTERVAL: StdDuration = StdDuration::from_secs(30);
 pub struct ReminderDaemonConfig {
     pub events_file: PathBuf,
     pub state_file: PathBuf,
+    pub providers: ProviderConfig,
     pub poll_interval: StdDuration,
     pub grace: Duration,
 }
@@ -43,9 +45,15 @@ impl ReminderDaemonConfig {
         Self {
             events_file,
             state_file,
+            providers: ProviderConfig::default(),
             poll_interval: POLL_INTERVAL,
             grace: Duration::minutes(GRACE_MINUTES),
         }
+    }
+
+    pub fn with_providers(mut self, providers: ProviderConfig) -> Self {
+        self.providers = providers;
+        self
     }
 
     pub fn lock_file(&self) -> PathBuf {
@@ -216,6 +224,12 @@ pub fn run_once(
 ) -> Result<ReminderRunSummary, ReminderError> {
     let source =
         ConfiguredAgendaSource::from_events_file(&config.events_file, HolidayProvider::off())
+            .and_then(|source| {
+                source.with_microsoft_provider(
+                    config.providers.microsoft.clone(),
+                    config.providers.create_target,
+                )
+            })
             .map_err(|err| ReminderError::Events(err.to_string()))?;
     let mut state = ReminderState::load(&config.state_file)?;
     let instances = reminder_instances(&source, now);
@@ -286,7 +300,7 @@ pub fn reminder_instances(
     let mut instances = source
         .events_intersecting(range)
         .into_iter()
-        .filter(Event::is_local)
+        .filter(Event::is_editable)
         .flat_map(reminders_for_event)
         .collect::<Vec<_>>();
     instances.sort_by(|left, right| {

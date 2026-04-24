@@ -208,7 +208,7 @@ impl AppState {
                 RecurrenceEditChoiceAction::Series => {
                     let series_id = choice.series_id.clone();
                     self.recurrence_choice = None;
-                    if let Some(event) = source.local_event_by_id(&series_id) {
+                    if let Some(event) = source.editable_event_by_id(&series_id) {
                         self.create_form = Some(CreateEventForm::edit(&event));
                     }
                     RecurrenceChoiceInputResult::Continue
@@ -1912,7 +1912,7 @@ fn selectable_day_events(date: CalendarDate, source: &dyn AgendaSource) -> Vec<E
                 .into_iter()
                 .map(|agenda_event| agenda_event.event),
         )
-        .filter(Event::is_local)
+        .filter(Event::is_editable)
         .collect()
 }
 

@@ -27,6 +27,11 @@ cargo run -- --date 2026-04-23
 ```sh
 rcal [--config PATH|--no-config] [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]
 rcal config init [--path PATH] [--force]
+rcal providers microsoft auth login --account ID [--browser]
+rcal providers microsoft auth logout --account ID
+rcal providers microsoft calendars list --account ID
+rcal providers microsoft sync [--account ID]
+rcal providers microsoft status
 rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
 rcal reminders install [--events-file PATH] [--state-file PATH]
 rcal reminders uninstall
@@ -56,18 +61,37 @@ Config is discovered at `$XDG_CONFIG_HOME/rcal/config.toml`, else
 `rcal config init` to write a commented starter file. Omitted settings keep
 built-in defaults, and CLI flags override config values. Config can set the
 events file, holiday source and country, reminder state file, and normal-mode
-keybindings. Modal/form keys stay fixed for now.
+keybindings. It can also configure the Microsoft provider. Modal/form keys stay
+fixed for now.
 
 Nager.Date is cache-first and opt-in. Default startup does not need network
 access.
+
+## Microsoft Provider
+
+Microsoft Graph is the first remote provider. It is cache-first: the TUI reads
+the local Microsoft cache instantly, and you refresh remote data explicitly:
+
+```sh
+rcal providers microsoft auth login --account work
+rcal providers microsoft calendars list --account work
+rcal providers microsoft sync --account work
+```
+
+Users provide their own Azure app `client_id` and tenant in `config.toml`.
+Tokens are stored in the OS keychain. The provider syncs configured calendars
+through Graph `calendarView`, caches selected events separately from the local
+events JSON, and routes create/edit/delete/copy operations for Microsoft events
+back through Graph. Provider reminders fire from cached provider events after a
+sync; the reminder daemon does not sync remote calendars itself.
 
 ## Controls
 
 - Arrow keys move the selected date.
 - `?` opens contextual help.
 - `+` opens the Create event modal.
-- In day view, `c` opens the Copy confirmation for the selected local event.
-- In day view, `d` opens the Delete confirmation for the selected local event.
+- In day view, `c` opens the Copy confirmation for the selected editable event.
+- In day view, `d` opens the Delete confirmation for the selected editable event.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.
 - `q` exits.
@@ -100,8 +124,9 @@ back to a focused day summary.
 
 ## Current Limits
 
-- Real account integrations for Outlook, Google Calendar, Exchange, and similar
-  providers are not implemented yet.
+- Google Calendar, CalDAV, and other providers are not implemented yet.
+- Microsoft sync is manual and cache-first; there is no background provider
+  sync daemon yet.
 - Packaging is currently source-based through Cargo.
 
 ## Development
