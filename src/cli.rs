@@ -18,7 +18,7 @@ use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
     app::{
         AppState, CreateEventInputResult, EventDeleteInputResult, EventDeleteSubmission,
-        EventFormMode, KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
+        EventFormMode, HelpInputResult, KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
     },
     calendar::CalendarDate,
     tui::{
@@ -43,6 +43,7 @@ const HELP: &str = concat!(
     "  -V, --version                       Show version.\n\n",
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
+    "  ? opens contextual help.\n",
     "  + opens the Create event modal.\n",
     "  In day view, d opens the Delete confirmation for the selected local event.\n",
     "  In day view, Left/Right move to the previous or next day.\n",
@@ -446,6 +447,7 @@ where
         let event = if !app.is_creating_event()
             && !app.is_choosing_recurring_edit()
             && !app.is_confirming_delete()
+            && !app.is_showing_help()
             && keyboard.is_waiting_for_digit()
         {
             if event::poll(DIGIT_JUMP_TIMEOUT)? {
@@ -461,7 +463,11 @@ where
         match event {
             Event::Key(key) => {
                 mouse.clear();
-                if app.is_confirming_delete() {
+                if app.is_showing_help() {
+                    match app.handle_help_key(key) {
+                        HelpInputResult::Continue | HelpInputResult::Close => {}
+                    }
+                } else if app.is_confirming_delete() {
                     match app.handle_delete_choice_key(key) {
                         EventDeleteInputResult::Continue => {}
                         EventDeleteInputResult::Cancel => app.close_delete_choice(),
@@ -542,6 +548,7 @@ where
                 if app.is_creating_event()
                     || app.is_choosing_recurring_edit()
                     || app.is_confirming_delete()
+                    || app.is_showing_help()
                 {
                     continue;
                 }

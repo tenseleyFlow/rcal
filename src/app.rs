@@ -26,6 +26,7 @@ pub struct AppState {
     create_form: Option<CreateEventForm>,
     recurrence_choice: Option<RecurrenceEditChoice>,
     delete_choice: Option<EventDeleteChoice>,
+    help_open: bool,
     selected_day_event_id: Option<String>,
     should_quit: bool,
 }
@@ -43,6 +44,7 @@ impl AppState {
             create_form: None,
             recurrence_choice: None,
             delete_choice: None,
+            help_open: false,
             selected_day_event_id: None,
             should_quit: false,
         }
@@ -92,6 +94,10 @@ impl AppState {
         self.delete_choice.is_some()
     }
 
+    pub const fn is_showing_help(&self) -> bool {
+        self.help_open
+    }
+
     pub fn close_create_form(&mut self) {
         self.create_form = None;
     }
@@ -102,6 +108,10 @@ impl AppState {
 
     pub fn close_delete_choice(&mut self) {
         self.delete_choice = None;
+    }
+
+    pub fn close_help(&mut self) {
+        self.help_open = false;
     }
 
     pub fn set_delete_error(&mut self, message: impl Into<String>) {
@@ -229,6 +239,28 @@ impl AppState {
         }
     }
 
+    pub fn handle_help_key(&mut self, key: KeyEvent) -> HelpInputResult {
+        if key.kind == KeyEventKind::Release {
+            return HelpInputResult::Continue;
+        }
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?') => {
+                self.close_help();
+                HelpInputResult::Close
+            }
+            KeyCode::Char(value) if value.eq_ignore_ascii_case(&'q') => {
+                self.should_quit = true;
+                HelpInputResult::Continue
+            }
+            KeyCode::Char(value) if ctrl_c(value, key.modifiers) => {
+                self.should_quit = true;
+                HelpInputResult::Continue
+            }
+            _ => HelpInputResult::Continue,
+        }
+    }
+
     pub fn calendar_month(&self) -> CalendarMonth {
         CalendarMonth::from_dates(self.selected_date, self.today)
     }
@@ -268,6 +300,14 @@ impl AppState {
         match action {
             AppAction::Noop => {}
             AppAction::Quit => self.should_quit = true,
+            AppAction::OpenHelp
+                if self.create_form.is_none()
+                    && self.recurrence_choice.is_none()
+                    && self.delete_choice.is_none() =>
+            {
+                self.help_open = true;
+            }
+            _ if self.help_open => {}
             AppAction::OpenDay if self.view_mode == ViewMode::Day => {
                 if let Some(source) = source {
                     self.open_selected_event_for_edit(source);
@@ -284,11 +324,13 @@ impl AppState {
                 self.selected_day_event_id = None;
                 self.recurrence_choice = None;
                 self.delete_choice = None;
+                self.help_open = false;
             }
             AppAction::OpenCreate => {
                 if self.create_form.is_none()
                     && self.recurrence_choice.is_none()
                     && self.delete_choice.is_none()
+                    && !self.help_open
                 {
                     let context = match self.view_mode {
                         ViewMode::Month => CreateEventContext::EditableDate,
@@ -301,6 +343,7 @@ impl AppState {
                 if self.create_form.is_none()
                     && self.recurrence_choice.is_none()
                     && self.delete_choice.is_none()
+                    && !self.help_open
                     && let Some(source) = source
                 {
                     self.open_selected_event_for_delete(source);
@@ -346,7 +389,8 @@ impl AppState {
             | AppAction::SelectDate(_)
             | AppAction::JumpToDay(_)
             | AppAction::JumpToWeekday(_)
-            | AppAction::OpenDelete => {}
+            | AppAction::OpenDelete
+            | AppAction::OpenHelp => {}
         }
     }
 
@@ -428,6 +472,7 @@ pub enum AppAction {
     CloseDay,
     OpenCreate,
     OpenDelete,
+    OpenHelp,
     Quit,
 }
 
@@ -677,6 +722,12 @@ pub enum EventDeleteInputResult {
     Continue,
     Cancel,
     Submit(EventDeleteSubmission),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelpInputResult {
+    Continue,
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1678,6 +1729,11 @@ impl KeyboardInput {
             return AppAction::OpenCreate;
         }
 
+        if value == '?' {
+            self.clear();
+            return AppAction::OpenHelp;
+        }
+
         if value.eq_ignore_ascii_case(&'d') {
             self.clear();
             return AppAction::OpenDelete;
@@ -2449,6 +2505,40 @@ mod tests {
             app.create_form().expect("form opens").context(),
             CreateEventContext::FixedDate
         );
+    }
+
+    #[test]
+    fn question_mark_opens_help_and_esc_closes_it() {
+        let day = date(2026, Month::April, 23);
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        app.apply(input.translate(char_key('?')));
+
+        assert!(app.is_showing_help());
+        assert_eq!(
+            app.handle_help_key(key(KeyCode::Esc)),
+            HelpInputResult::Close
+        );
+        assert!(!app.is_showing_help());
+        assert_eq!(app.selected_date(), day);
+    }
+
+    #[test]
+    fn help_modal_blocks_calendar_navigation_until_closed() {
+        let day = date(2026, Month::April, 23);
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        app.apply(input.translate(char_key('?')));
+        app.apply(input.translate(key(KeyCode::Right)));
+
+        assert!(app.is_showing_help());
+        assert_eq!(app.selected_date(), day);
+
+        assert_eq!(app.handle_help_key(char_key('?')), HelpInputResult::Close);
+        app.apply(input.translate(key(KeyCode::Right)));
+        assert_eq!(app.selected_date(), date(2026, Month::April, 24));
     }
 
     #[test]

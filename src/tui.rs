@@ -28,6 +28,7 @@ pub const DEFAULT_RENDER_HEIGHT: u16 = 26;
 const HEADER_HEIGHT: u16 = 2;
 const VERTICAL_GRID_LINES: u16 = DAYS_PER_WEEK as u16 + 1;
 const HORIZONTAL_GRID_LINES: u16 = MONTH_GRID_WEEKS as u16 + 1;
+const HELP_HINT: &str = "?: Help";
 static EMPTY_AGENDA_SOURCE: EmptyAgendaSource = EmptyAgendaSource;
 
 #[derive(Clone, Copy)]
@@ -101,6 +102,9 @@ impl Widget for AppView<'_> {
         }
         if let Some(choice) = self.app.delete_choice() {
             render_delete_choice_modal(choice, area, buf, CreateModalStyles::new());
+        }
+        if self.app.is_showing_help() {
+            render_help_modal(self.app.view_mode(), area, buf, CreateModalStyles::new());
         }
     }
 }
@@ -418,6 +422,7 @@ struct MonthGridStyles {
     in_month_border: Style,
     preview: Style,
     preview_summary: Style,
+    help_hint: Style,
     filler: Style,
     filler_border: Style,
 }
@@ -443,6 +448,7 @@ impl MonthGridStyles {
             in_month_border: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             preview: Style::new().fg(Color::Gray),
             preview_summary: Style::new().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            help_hint: Style::new().fg(Color::DarkGray),
             filler: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
             filler_border: Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
         }
@@ -462,6 +468,7 @@ struct DayViewStyles {
     holiday: Style,
     event: Style,
     selected_event: Style,
+    help_hint: Style,
 }
 
 impl DayViewStyles {
@@ -481,6 +488,7 @@ impl DayViewStyles {
                 .fg(Color::White)
                 .bg(Color::Blue)
                 .add_modifier(Modifier::BOLD),
+            help_hint: Style::new().fg(Color::DarkGray),
         }
     }
 }
@@ -790,13 +798,22 @@ fn render_day_header(
     buf: &mut Buffer,
     styles: DayViewStyles,
 ) {
+    let title = day_title(agenda.date);
     write_centered(
         buf,
         layout.title_y,
         layout.area.x,
         layout.area.width,
-        &day_title(agenda.date),
+        &title,
         styles.title,
+    );
+    render_title_hint(
+        buf,
+        layout.title_y,
+        layout.area.x,
+        layout.area.width,
+        &title,
+        styles.help_hint,
     );
 
     let Some(summary_y) = layout.summary_y else {
@@ -1046,6 +1063,60 @@ fn render_delete_choice_modal(
     );
 }
 
+fn render_help_modal(view_mode: ViewMode, area: Rect, buf: &mut Buffer, styles: CreateModalStyles) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let rows = help_rows(view_mode);
+    let modal = help_modal_area(area, rows.len());
+    fill_rect(buf, modal, styles.panel);
+    draw_border(buf, modal, styles.border, BorderCharacters::normal());
+
+    let content = inset_rect(modal);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    write_centered(
+        buf,
+        content.y,
+        content.x,
+        content.width,
+        help_heading(view_mode),
+        styles.title,
+    );
+
+    let key_width = 13.min(content.width.saturating_sub(2));
+    let description_x = content.x.saturating_add(key_width).saturating_add(2);
+    let description_width = content.right().saturating_sub(description_x);
+    let mut y = content.y.saturating_add(2);
+    for (key, description) in rows {
+        if y >= content.bottom().saturating_sub(2) {
+            break;
+        }
+        write_padded_left(buf, y, content.x, key_width, key, styles.checkbox);
+        write_left(
+            buf,
+            y,
+            description_x,
+            description_width,
+            description,
+            styles.value,
+        );
+        y = y.saturating_add(1);
+    }
+
+    write_centered(
+        buf,
+        content.bottom().saturating_sub(1),
+        content.x,
+        content.width,
+        "Esc / ? close",
+        styles.footer,
+    );
+}
+
 fn create_modal_area(area: Rect, form: &CreateEventForm) -> Rect {
     if area.width < 52 || area.height < 16 {
         return area;
@@ -1060,6 +1131,56 @@ fn create_modal_area(area: Rect, form: &CreateEventForm) -> Rect {
         width,
         height,
     )
+}
+
+fn help_modal_area(area: Rect, row_count: usize) -> Rect {
+    if area.width < 48 || area.height < 12 {
+        return area;
+    }
+
+    let width = area.width.saturating_sub(4).min(66);
+    let desired_height = u16::try_from(row_count)
+        .unwrap_or(u16::MAX)
+        .saturating_add(5);
+    let height = desired_height.min(area.height.saturating_sub(4)).max(10);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn help_heading(view_mode: ViewMode) -> &'static str {
+    match view_mode {
+        ViewMode::Month => "Month / Week keys",
+        ViewMode::Day => "Day keys",
+    }
+}
+
+fn help_rows(view_mode: ViewMode) -> &'static [(&'static str, &'static str)] {
+    match view_mode {
+        ViewMode::Month => &[
+            ("Arrows", "Move the selected date"),
+            ("Digits", "Jump to a day, with quick two-digit refinement"),
+            ("Weekdays", "Jump within the selected week"),
+            ("Enter", "Open the focused day view"),
+            ("+", "Create an event on the selected date"),
+            ("Mouse", "Select a date; click it again to open"),
+            ("?", "Close this help"),
+            ("q", "Quit"),
+        ],
+        ViewMode::Day => &[
+            ("Left/Right", "Move to the previous or next day"),
+            ("Up/Down", "Select a local event"),
+            ("Enter", "Edit the selected local event"),
+            ("d", "Delete the selected local event"),
+            ("+", "Create an event on this day"),
+            ("Esc", "Return to month view"),
+            ("?", "Close this help"),
+            ("q", "Quit"),
+        ],
+    }
 }
 
 fn recurrence_choice_modal_area(area: Rect) -> Rect {
@@ -1521,6 +1642,14 @@ fn render_title(
         &title,
         styles.title,
     );
+    render_title_hint(
+        buf,
+        layout.title_y,
+        layout.area.x,
+        layout.area.width,
+        &title,
+        styles.help_hint,
+    );
 }
 
 fn render_weekdays(layout: &MonthGridLayout, buf: &mut Buffer, styles: MonthGridStyles) {
@@ -1565,6 +1694,14 @@ fn render_week_title(
         layout.area.width,
         &title,
         styles.title,
+    );
+    render_title_hint(
+        buf,
+        layout.title_y,
+        layout.area.x,
+        layout.area.width,
+        &title,
+        styles.help_hint,
     );
 }
 
@@ -1850,6 +1987,23 @@ fn write_centered(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, styl
     buf.set_stringn(start, y, text, usize::from(width), style);
 }
 
+fn render_title_hint(buf: &mut Buffer, y: u16, x: u16, width: u16, title: &str, style: Style) {
+    let hint_width = u16::try_from(HELP_HINT.len()).unwrap_or(u16::MAX);
+    let title_width = u16::try_from(title.len()).unwrap_or(u16::MAX);
+    if width <= hint_width.saturating_add(1) || title_width >= width {
+        return;
+    }
+
+    let title_start = x + width.saturating_sub(title_width) / 2;
+    let title_end = title_start.saturating_add(title_width);
+    let hint_x = x + width.saturating_sub(hint_width).saturating_sub(1);
+    if hint_x <= title_end.saturating_add(3) {
+        return;
+    }
+
+    write_left(buf, y, hint_x, hint_width, HELP_HINT, style);
+}
+
 fn write_left(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, style: Style) {
     if width == 0 || !buf.area.contains((x, y).into()) {
         return;
@@ -2092,6 +2246,11 @@ mod tests {
         format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
     }
 
+    fn assert_line_has_centered_title(line: &str, width: usize, title: &str) {
+        let start = width.saturating_sub(title.len()) / 2;
+        assert_eq!(&line[start..start + title.len()], title);
+    }
+
     fn source_metadata() -> SourceMetadata {
         SourceMetadata::fixture()
     }
@@ -2127,10 +2286,8 @@ mod tests {
         let lines = buffer_lines(&buffer);
 
         assert_eq!(lines.len(), 20);
-        assert_eq!(
-            lines[0],
-            "                   April 2026                    "
-        );
+        assert_line_has_centered_title(&lines[0], 49, "April 2026");
+        assert!(lines[0].contains("?: Help"));
         assert_eq!(
             lines[1],
             "  Sun    Mon    Tue    Wed    Thu    Fri    Sat  "
@@ -2272,6 +2429,16 @@ mod tests {
     }
 
     #[test]
+    fn title_hint_renders_without_moving_month_title() {
+        let app = AppState::new(date(2026, Month::April, 23));
+        let rendered = render_app_to_string(&app, 84, 26);
+        let lines = rendered.lines().collect::<Vec<_>>();
+
+        assert_line_has_centered_title(lines[0], 84, "April 2026");
+        assert!(lines[0].contains("?: Help"));
+    }
+
+    #[test]
     fn create_modal_renders_over_month_view() {
         let mut app = AppState::new(date(2026, Month::April, 23));
         app.apply(AppAction::OpenCreate);
@@ -2352,6 +2519,32 @@ mod tests {
         assert!(rendered.contains("Delete"));
         assert!(rendered.contains("Delete event"));
         assert!(rendered.contains("Enter select"));
+    }
+
+    #[test]
+    fn help_modal_shows_month_week_keys_in_month_mode() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        app.apply(AppAction::OpenHelp);
+
+        let rendered = render_app_to_string(&app, 84, 26);
+
+        assert!(rendered.contains("Month / Week keys"));
+        assert!(rendered.contains("Open the focused day view"));
+        assert!(rendered.contains("Esc / ? close"));
+        assert!(!rendered.contains("Delete the selected local event"));
+    }
+
+    #[test]
+    fn help_modal_shows_day_keys_in_day_mode() {
+        let mut app = AppState::new(date(2026, Month::April, 23));
+        app.apply(AppAction::OpenDay);
+        app.apply(AppAction::OpenHelp);
+
+        let rendered = render_app_to_string(&app, 84, 26);
+
+        assert!(rendered.contains("Day keys"));
+        assert!(rendered.contains("Delete the selected local event"));
+        assert!(rendered.contains("Move to the previous or next day"));
     }
 
     #[test]
@@ -2648,7 +2841,8 @@ mod tests {
         let rendered = render_app_to_string(&app, 84, 14);
         let lines: Vec<_> = rendered.lines().collect();
 
-        assert_eq!(lines[0], centered(84, "Thursday, April 23, 2026"));
+        assert_line_has_centered_title(lines[0], 84, "Thursday, April 23, 2026");
+        assert!(lines[0].contains("?: Help"));
         assert_eq!(
             lines[1],
             centered(84, "0 holidays | 0 events | Esc returns to month")
