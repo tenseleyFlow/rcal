@@ -12,7 +12,7 @@ use crate::{
     providers::{
         GoogleAccountConfig, GoogleProviderConfig, MICROSOFT_DEFAULT_TENANT,
         MICROSOFT_OFFICIAL_CLIENT_ID, MicrosoftAccountConfig, MicrosoftProviderConfig,
-        ProviderConfig, ProviderCreateTarget,
+        ProviderConfig, ProviderCreateTarget, google_official_client_config,
     },
 };
 
@@ -56,9 +56,8 @@ calendars = []
 
 [providers.google]
 # Google Calendar provider.
-# For now, create a Google OAuth Desktop client and paste its client_id here.
-# Some Google clients also provide a client_secret; include it in the account
-# block if token exchange requires it.
+# rcal release builds can ship an official Google OAuth Desktop client.
+# Advanced users may override client_id/client_secret inside an account block.
 enabled = false
 default_account = "personal"
 sync_past_days = 30
@@ -68,8 +67,8 @@ sync_future_days = 365
 
 [[providers.google.accounts]]
 id = "personal"
-client_id = ""
-# client_secret = ""
+# client_id = "GOOGLE_CLIENT_ID"
+# client_secret = "GOOGLE_CLIENT_SECRET"
 redirect_port = 8766
 calendars = []
 
@@ -215,7 +214,7 @@ pub struct MicrosoftSetupConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GoogleSetupConfig {
     pub account_id: String,
-    pub client_id: String,
+    pub client_id: Option<String>,
     pub client_secret: Option<String>,
     pub calendar_id: String,
     pub calendar_name: String,
@@ -360,14 +359,15 @@ fn google_setup_config_body(existing: &str, setup: &GoogleSetupConfig) -> String
             "sync_future_days = {sync_future_days}\n\n",
             "[[providers.google.accounts]]\n",
             "id = {account}\n",
-            "client_id = {client_id}\n",
         ),
         account = toml_string(&setup.account_id),
         calendar = toml_string(&setup.calendar_id),
-        client_id = toml_string(&setup.client_id),
         sync_past_days = setup.sync_past_days.max(0),
         sync_future_days = setup.sync_future_days.max(1),
     ));
+    if let Some(client_id) = &setup.client_id {
+        body.push_str(&format!("client_id = {}\n", toml_string(client_id)));
+    }
     if let Some(client_secret) = &setup.client_secret {
         body.push_str(&format!("client_secret = {}\n", toml_string(client_secret)));
     }
@@ -620,7 +620,7 @@ struct RawGoogleProviderConfig {
 #[serde(deny_unknown_fields)]
 struct RawGoogleAccountConfig {
     id: String,
-    client_id: String,
+    client_id: Option<String>,
     client_secret: Option<String>,
     redirect_port: Option<u16>,
     calendars: Option<Vec<String>>,
@@ -799,10 +799,18 @@ impl RawGoogleProviderConfig {
 
 impl RawGoogleAccountConfig {
     fn into_config(self) -> GoogleAccountConfig {
+        let uses_official_client = self.client_id.is_none();
+        let official_client = uses_official_client
+            .then(google_official_client_config)
+            .flatten();
+        let official_client_id = official_client
+            .as_ref()
+            .map(|(client_id, _)| client_id.clone());
+        let official_client_secret = official_client.and_then(|(_, client_secret)| client_secret);
         GoogleAccountConfig {
             id: self.id,
-            client_id: self.client_id,
-            client_secret: self.client_secret,
+            client_id: self.client_id.or(official_client_id).unwrap_or_default(),
+            client_secret: self.client_secret.or(official_client_secret),
             redirect_port: self.redirect_port.unwrap_or(8766),
             calendars: self.calendars.unwrap_or_default(),
         }
@@ -1176,7 +1184,7 @@ enabled = false
             Some(path.clone()),
             &GoogleSetupConfig {
                 account_id: "personal".to_string(),
-                client_id: "google-client".to_string(),
+                client_id: Some("google-client".to_string()),
                 client_secret: Some("google-secret".to_string()),
                 calendar_id: "primary".to_string(),
                 calendar_name: "Calendar".to_string(),

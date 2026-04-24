@@ -34,7 +34,7 @@ rcal providers google auth login --account ID
 rcal providers google auth logout --account ID
 rcal providers google auth inspect --account ID
 rcal providers google calendars list --account ID
-rcal providers google setup --account ID --client-id ID [--client-secret SECRET] [--calendar ID]
+rcal providers google setup --account ID [--client-id ID] [--client-secret SECRET] [--calendar ID]
 rcal providers google sync [--account ID]
 rcal providers google status
 rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
@@ -204,13 +204,12 @@ daemon does not sync remote calendars itself.
 Google Calendar support is also cache-first. You refresh remote data explicitly:
 
 ```sh
-rcal providers google setup --account personal --client-id GOOGLE_CLIENT_ID
+rcal providers google setup --account personal
 rcal
 ```
 
-Google setup currently needs your own Google OAuth Desktop client ID. If Google
-also gives you a client secret, pass `--client-secret GOOGLE_CLIENT_SECRET`.
-The setup flow opens browser auth, selects your default editable calendar,
+The setup flow uses rcal's official Google OAuth Desktop client when the build
+includes one. It opens browser auth, selects your default editable calendar,
 writes `~/.config/rcal/config.toml`, performs the first sync, and sets new
 event creation to Google by default. User tokens are stored in the OS keychain.
 
@@ -242,10 +241,20 @@ sync_future_days = 365
 
 [[providers.google.accounts]]
 id = "personal"
-client_id = "GOOGLE_CLIENT_ID"
-# client_secret = "GOOGLE_CLIENT_SECRET"
+# client_id = "GOOGLE_CLIENT_ID"         # optional custom OAuth client
+# client_secret = "GOOGLE_CLIENT_SECRET" # optional custom OAuth client secret
 redirect_port = 8766
 calendars = ["primary"]
+```
+
+Advanced custom-client setup remains available for development builds or for
+users who want their own Google OAuth quota/project:
+
+```sh
+rcal providers google setup \
+  --account personal \
+  --client-id GOOGLE_CLIENT_ID \
+  --client-secret GOOGLE_CLIENT_SECRET
 ```
 
 The Google provider syncs configured calendars through the Calendar API,
@@ -259,8 +268,9 @@ Calendar. Provider reminders fire from cached Google events after a sync.
 - CalDAV and other non-Microsoft/non-Google providers are not implemented yet.
 - Provider sync is manual and cache-first; there is no background provider
   sync daemon yet.
-- Google currently requires a user-supplied OAuth Desktop client ID; rcal does
-  not yet ship an official Google OAuth client.
+- Google official OAuth client registration and verification are still in
+  progress; until those constants are filled for a release build, use the
+  advanced custom-client setup above.
 
 ## Development
 

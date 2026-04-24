@@ -67,7 +67,7 @@ const HELP: &str = concat!(
     "  rcal providers google auth logout --account ID\n",
     "  rcal providers google auth inspect --account ID\n",
     "  rcal providers google calendars list --account ID\n",
-    "  rcal providers google setup --account ID --client-id ID [--client-secret SECRET] [--calendar ID]\n",
+    "  rcal providers google setup --account ID [--client-id ID] [--client-secret SECRET] [--calendar ID]\n",
     "  rcal providers google sync [--account ID]\n",
     "  rcal providers google status\n\n",
     "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
@@ -195,7 +195,7 @@ pub enum MicrosoftCliAction {
 pub enum GoogleCliAction {
     Setup {
         account: String,
-        client_id: String,
+        client_id: Option<String>,
         client_secret: Option<String>,
         calendar: Option<String>,
         config_path: PathBuf,
@@ -1210,7 +1210,7 @@ where
     Ok(CliAction::Providers(ProviderCliAction::Google(
         GoogleCliAction::Setup {
             account: account.ok_or(CliError::MissingProviderAccount)?,
-            client_id: client_id.ok_or(CliError::MissingProviderClientId)?,
+            client_id,
             client_secret,
             calendar,
             config_path,
@@ -1816,8 +1816,20 @@ fn run_google_action(
             config_path,
             config,
         } => (|| {
-            let account_config =
-                GoogleAccountConfig::new(account.clone(), client_id.clone(), client_secret.clone());
+            let account_config = match &client_id {
+                Some(client_id) => GoogleAccountConfig::new(
+                    account.clone(),
+                    client_id.clone(),
+                    client_secret.clone(),
+                ),
+                None => {
+                    let mut account_config = GoogleAccountConfig::new_official(account.clone())?;
+                    if client_secret.is_some() {
+                        account_config.client_secret = client_secret.clone();
+                    }
+                    account_config
+                }
+            };
             login_google_browser(&account_config, &http, &token_store, stdout)?;
             let calendars = list_google_calendars(&account_config, &http, &token_store)?;
             let calendar = choose_google_setup_calendar(&calendars, calendar.as_deref())?;
@@ -3165,9 +3177,43 @@ create_event = ["n"]
             action,
             CliAction::Providers(ProviderCliAction::Google(GoogleCliAction::Setup {
                 account: "personal".to_string(),
-                client_id: "google-client".to_string(),
+                client_id: Some("google-client".to_string()),
                 client_secret: Some("google-secret".to_string()),
                 calendar: Some("primary".to_string()),
+                config_path,
+                config: google,
+            }))
+        );
+    }
+
+    #[test]
+    fn google_setup_command_allows_official_client_defaults() {
+        let today = date(2026, Month::April, 23);
+        let user_config = UserConfig::empty();
+        let google = user_config.providers.google.clone();
+        let config_path = PathBuf::from("/tmp/rcal/google-official-setup-config.toml");
+
+        let action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("google"),
+                arg("setup"),
+                arg("--account"),
+                arg("personal"),
+            ],
+            today.into(),
+            user_config,
+            Some(config_path.clone()),
+        )
+        .expect("setup parses");
+
+        assert_eq!(
+            action,
+            CliAction::Providers(ProviderCliAction::Google(GoogleCliAction::Setup {
+                account: "personal".to_string(),
+                client_id: None,
+                client_secret: None,
+                calendar: None,
                 config_path,
                 config: google,
             }))

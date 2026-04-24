@@ -36,10 +36,16 @@ const KEYRING_SERVICE: &str = "rcal.microsoft";
 const GOOGLE_CALENDAR_BASE_URL: &str = "https://www.googleapis.com/calendar/v3";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const GOOGLE_SCOPES: &str = "https://www.googleapis.com/auth/calendar";
+const GOOGLE_SCOPES: &str = concat!(
+    "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+    " ",
+    "https://www.googleapis.com/auth/calendar.events"
+);
 const GOOGLE_KEYRING_SERVICE: &str = "rcal.google";
 pub const MICROSOFT_OFFICIAL_CLIENT_ID: &str = "9a49eaac-422b-4192-a65d-82dc8f43c11d";
 pub const MICROSOFT_DEFAULT_TENANT: &str = "common";
+pub const GOOGLE_OFFICIAL_CLIENT_ID: &str = "";
+pub const GOOGLE_OFFICIAL_CLIENT_SECRET: &str = "";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
@@ -360,9 +366,28 @@ impl GoogleAccountConfig {
         }
     }
 
+    pub fn new_official(id: impl Into<String>) -> Result<Self, ProviderError> {
+        let Some((client_id, client_secret)) = google_official_client_config() else {
+            return Err(ProviderError::Config(
+                "this rcal build does not include an official Google OAuth client yet; pass --client-id and --client-secret or finish the official Google client registration".to_string(),
+            ));
+        };
+        Ok(Self::new(id, client_id, client_secret))
+    }
+
     fn redirect_uri(&self) -> String {
         format!("http://127.0.0.1:{}/callback", self.redirect_port)
     }
+}
+
+pub fn google_official_client_config() -> Option<(String, Option<String>)> {
+    let client_id = GOOGLE_OFFICIAL_CLIENT_ID.trim();
+    if client_id.is_empty() {
+        return None;
+    }
+    let client_secret = (!GOOGLE_OFFICIAL_CLIENT_SECRET.trim().is_empty())
+        .then(|| GOOGLE_OFFICIAL_CLIENT_SECRET.to_string());
+    Some((GOOGLE_OFFICIAL_CLIENT_ID.to_string(), client_secret))
 }
 
 pub fn default_microsoft_cache_file() -> PathBuf {
