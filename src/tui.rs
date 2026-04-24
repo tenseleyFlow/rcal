@@ -12,7 +12,7 @@ use crate::{
     agenda::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
-    app::{AppState, CreateEventForm, CreateEventFormRowKind, ViewMode},
+    app::{AppState, CreateEventForm, CreateEventFormRowKind, RecurrenceEditChoice, ViewMode},
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
     },
@@ -92,6 +92,9 @@ impl Widget for AppView<'_> {
 
         if let Some(form) = self.app.create_form() {
             render_create_event_modal(form, area, buf, CreateModalStyles::new());
+        }
+        if let Some(choice) = self.app.recurrence_choice() {
+            render_recurrence_choice_modal(choice, area, buf, CreateModalStyles::new());
         }
     }
 }
@@ -903,6 +906,66 @@ fn render_create_event_modal(
     );
 }
 
+fn render_recurrence_choice_modal(
+    choice: &RecurrenceEditChoice,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: CreateModalStyles,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let modal = recurrence_choice_modal_area(area);
+    fill_rect(buf, modal, styles.panel);
+    draw_border(buf, modal, styles.border, BorderCharacters::normal());
+
+    let content = inset_rect(modal);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    write_centered(
+        buf,
+        content.y,
+        content.x,
+        content.width,
+        "Edit",
+        styles.title,
+    );
+
+    let mut y = content.y.saturating_add(2);
+    for row in choice.rows() {
+        if y >= content.bottom().saturating_sub(1) {
+            break;
+        }
+        let marker = if row.selected { ">" } else { " " };
+        write_padded_left(buf, y, content.x, 1, marker, styles.label);
+        write_left(
+            buf,
+            y,
+            content.x.saturating_add(2),
+            content.width.saturating_sub(2),
+            row.label,
+            if row.selected {
+                styles.title
+            } else {
+                styles.value
+            },
+        );
+        y = y.saturating_add(1);
+    }
+
+    write_centered(
+        buf,
+        content.bottom().saturating_sub(1),
+        content.x,
+        content.width,
+        "Enter select | Esc cancel",
+        styles.footer,
+    );
+}
+
 fn create_modal_area(area: Rect, form: &CreateEventForm) -> Rect {
     if area.width < 52 || area.height < 16 {
         return area;
@@ -911,6 +974,21 @@ fn create_modal_area(area: Rect, form: &CreateEventForm) -> Rect {
     let width = area.width.saturating_sub(4).min(72);
     let max_height = area.height.saturating_sub(4);
     let height = desired_create_modal_height(form, width).min(max_height);
+    Rect::new(
+        area.x + area.width.saturating_sub(width) / 2,
+        area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    )
+}
+
+fn recurrence_choice_modal_area(area: Rect) -> Rect {
+    if area.width < 36 || area.height < 9 {
+        return area;
+    }
+
+    let width = area.width.saturating_sub(4).min(36);
+    let height = 9.min(area.height.saturating_sub(4));
     Rect::new(
         area.x + area.width.saturating_sub(width) / 2,
         area.y + area.height.saturating_sub(height) / 2,
@@ -1812,7 +1890,10 @@ mod tests {
     use time::{Month, Time};
 
     use crate::{
-        agenda::{Event, EventDateTime, Holiday, InMemoryAgendaSource, Reminder, SourceMetadata},
+        agenda::{
+            Event, EventDateTime, Holiday, InMemoryAgendaSource, RecurrenceEnd,
+            RecurrenceFrequency, RecurrenceRule, Reminder, SourceMetadata,
+        },
         app::AppAction,
         calendar::CalendarDate,
     };
@@ -2144,6 +2225,53 @@ mod tests {
 
         assert!(rendered.contains("Edit"));
         assert!(rendered.contains("Planning"));
+    }
+
+    #[test]
+    fn recurring_edit_choice_modal_renders_over_day_view() {
+        let day = date(2026, Month::April, 23);
+        let recurring = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 10, 0))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = agenda_source(vec![recurring], Vec::new());
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Edit this occurrence"));
+        assert!(rendered.contains("Edit series"));
+        assert!(rendered.contains("Enter select"));
+    }
+
+    #[test]
+    fn recurring_instances_render_without_repeat_marker() {
+        let day = date(2026, Month::April, 23);
+        let recurring = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 10, 0))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = agenda_source(vec![recurring], Vec::new());
+        let mut app = AppState::new(day.add_days(1));
+        app.apply(AppAction::OpenDay);
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("09:00-10:00 Standup"));
+        assert!(!rendered.contains("repeat"));
+        assert!(!rendered.contains("recurring"));
     }
 
     #[test]

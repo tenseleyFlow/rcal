@@ -6,7 +6,8 @@ use time::{Month, Time, Weekday};
 use crate::{
     agenda::{
         AgendaSource, CreateEventDraft, CreateEventTiming, DayAgenda, Event, EventDateTime,
-        EventTiming, Reminder,
+        EventTiming, OccurrenceAnchor, RecurrenceEnd, RecurrenceFrequency, RecurrenceMonthlyRule,
+        RecurrenceRule, RecurrenceYearlyRule, Reminder, recurrence_ordinal_for_date,
     },
     calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK},
 };
@@ -23,6 +24,7 @@ pub struct AppState {
     today: CalendarDate,
     view_mode: ViewMode,
     create_form: Option<CreateEventForm>,
+    recurrence_choice: Option<RecurrenceEditChoice>,
     selected_day_event_id: Option<String>,
     should_quit: bool,
 }
@@ -38,6 +40,7 @@ impl AppState {
             today,
             view_mode: ViewMode::Month,
             create_form: None,
+            recurrence_choice: None,
             selected_day_event_id: None,
             should_quit: false,
         }
@@ -63,6 +66,10 @@ impl AppState {
         self.create_form.as_ref()
     }
 
+    pub const fn recurrence_choice(&self) -> Option<&RecurrenceEditChoice> {
+        self.recurrence_choice.as_ref()
+    }
+
     pub fn selected_day_event_id(&self) -> Option<&str> {
         self.selected_day_event_id.as_deref()
     }
@@ -71,8 +78,16 @@ impl AppState {
         self.create_form.is_some()
     }
 
+    pub const fn is_choosing_recurring_edit(&self) -> bool {
+        self.recurrence_choice.is_some()
+    }
+
     pub fn close_create_form(&mut self) {
         self.create_form = None;
+    }
+
+    pub fn close_recurrence_choice(&mut self) {
+        self.recurrence_choice = None;
     }
 
     pub fn set_create_form_error(&mut self, message: impl Into<String>) {
@@ -87,6 +102,63 @@ impl AppState {
         };
 
         form.handle_key(key)
+    }
+
+    pub fn handle_recurrence_choice_key(
+        &mut self,
+        key: KeyEvent,
+        source: &dyn AgendaSource,
+    ) -> RecurrenceChoiceInputResult {
+        if key.kind == KeyEventKind::Release {
+            return RecurrenceChoiceInputResult::Continue;
+        }
+
+        let Some(choice) = &mut self.recurrence_choice else {
+            return RecurrenceChoiceInputResult::Continue;
+        };
+
+        match key.code {
+            KeyCode::Esc => RecurrenceChoiceInputResult::Cancel,
+            KeyCode::Up => {
+                choice.select_previous();
+                RecurrenceChoiceInputResult::Continue
+            }
+            KeyCode::Down => {
+                choice.select_next();
+                RecurrenceChoiceInputResult::Continue
+            }
+            KeyCode::Enter => match choice.selected_action() {
+                RecurrenceEditChoiceAction::ThisOccurrence => {
+                    let series_id = choice.series_id.clone();
+                    let anchor = choice.anchor;
+                    self.recurrence_choice = None;
+                    if let Some(event) = selectable_day_events(self.selected_date, source)
+                        .into_iter()
+                        .find(|event| {
+                            event
+                                .occurrence()
+                                .map(|occurrence| {
+                                    occurrence.series_id == series_id && occurrence.anchor == anchor
+                                })
+                                .unwrap_or(false)
+                        })
+                    {
+                        self.create_form = Some(CreateEventForm::edit_occurrence(&event));
+                    }
+                    RecurrenceChoiceInputResult::Continue
+                }
+                RecurrenceEditChoiceAction::Series => {
+                    let series_id = choice.series_id.clone();
+                    self.recurrence_choice = None;
+                    if let Some(event) = source.local_event_by_id(&series_id) {
+                        self.create_form = Some(CreateEventForm::edit(&event));
+                    }
+                    RecurrenceChoiceInputResult::Continue
+                }
+                RecurrenceEditChoiceAction::Cancel => RecurrenceChoiceInputResult::Cancel,
+            },
+            _ => RecurrenceChoiceInputResult::Continue,
+        }
     }
 
     pub fn calendar_month(&self) -> CalendarMonth {
@@ -142,9 +214,10 @@ impl AppState {
             AppAction::CloseDay => {
                 self.view_mode = ViewMode::Month;
                 self.selected_day_event_id = None;
+                self.recurrence_choice = None;
             }
             AppAction::OpenCreate => {
-                if self.create_form.is_none() {
+                if self.create_form.is_none() && self.recurrence_choice.is_none() {
                     let context = match self.view_mode {
                         ViewMode::Month => CreateEventContext::EditableDate,
                         ViewMode::Day => CreateEventContext::FixedDate,
@@ -225,7 +298,14 @@ impl AppState {
             .into_iter()
             .find(|event| event.id == selected_id)
         {
-            self.create_form = Some(CreateEventForm::edit(&event));
+            if let Some(occurrence) = event.occurrence() {
+                self.recurrence_choice = Some(RecurrenceEditChoice::new(
+                    occurrence.series_id.clone(),
+                    occurrence.anchor,
+                ));
+            } else {
+                self.create_form = Some(CreateEventForm::edit(&event));
+            }
         }
     }
 
@@ -264,7 +344,92 @@ pub enum CreateEventContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventFormMode {
     Create,
-    Edit { event_id: String },
+    Edit {
+        event_id: String,
+    },
+    EditOccurrence {
+        series_id: String,
+        anchor: OccurrenceAnchor,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrenceEditChoice {
+    series_id: String,
+    anchor: OccurrenceAnchor,
+    selected: usize,
+}
+
+impl RecurrenceEditChoice {
+    const OPTIONS: [RecurrenceEditChoiceAction; 3] = [
+        RecurrenceEditChoiceAction::ThisOccurrence,
+        RecurrenceEditChoiceAction::Series,
+        RecurrenceEditChoiceAction::Cancel,
+    ];
+
+    fn new(series_id: String, anchor: OccurrenceAnchor) -> Self {
+        Self {
+            series_id,
+            anchor,
+            selected: 0,
+        }
+    }
+
+    pub fn rows(&self) -> Vec<RecurrenceEditChoiceRow> {
+        Self::OPTIONS
+            .iter()
+            .enumerate()
+            .map(|(index, action)| RecurrenceEditChoiceRow {
+                label: action.label(),
+                selected: index == self.selected,
+            })
+            .collect()
+    }
+
+    fn selected_action(&self) -> RecurrenceEditChoiceAction {
+        Self::OPTIONS[self.selected]
+    }
+
+    fn select_next(&mut self) {
+        self.selected = (self.selected + 1) % Self::OPTIONS.len();
+    }
+
+    fn select_previous(&mut self) {
+        self.selected = if self.selected == 0 {
+            Self::OPTIONS.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecurrenceEditChoiceRow {
+    pub label: &'static str,
+    pub selected: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecurrenceEditChoiceAction {
+    ThisOccurrence,
+    Series,
+    Cancel,
+}
+
+impl RecurrenceEditChoiceAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ThisOccurrence => "Edit this occurrence",
+            Self::Series => "Edit series",
+            Self::Cancel => "Cancel",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecurrenceChoiceInputResult {
+    Continue,
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +446,14 @@ pub struct CreateEventForm {
     location: String,
     notes: String,
     reminders: [bool; REMINDER_PRESETS.len()],
+    repeat: RepeatFrequency,
+    recurrence_interval: String,
+    weekly_days: [bool; DAYS_PER_WEEK],
+    monthly_mode: RecurrenceMonthlyFormMode,
+    yearly_mode: RecurrenceYearlyFormMode,
+    recurrence_end: RecurrenceEndFormMode,
+    recurrence_until_date: String,
+    recurrence_count: String,
     focused: usize,
     error: Option<String>,
 }
@@ -300,6 +473,14 @@ impl CreateEventForm {
             location: String::new(),
             notes: String::new(),
             reminders: [false; REMINDER_PRESETS.len()],
+            repeat: RepeatFrequency::None,
+            recurrence_interval: "1".to_string(),
+            weekly_days: weekly_days_for(selected_date.weekday()),
+            monthly_mode: RecurrenceMonthlyFormMode::DayOfMonth,
+            yearly_mode: RecurrenceYearlyFormMode::Date,
+            recurrence_end: RecurrenceEndFormMode::Never,
+            recurrence_until_date: selected_date.to_string(),
+            recurrence_count: "10".to_string(),
             focused: 0,
             error: None,
         }
@@ -335,7 +516,7 @@ impl CreateEventForm {
             }
         }
 
-        Self {
+        let mut form = Self {
             mode: EventFormMode::Edit {
                 event_id: event.id.clone(),
             },
@@ -350,9 +531,32 @@ impl CreateEventForm {
             location: event.location.clone().unwrap_or_default(),
             notes: event.notes.clone().unwrap_or_default(),
             reminders,
+            repeat: RepeatFrequency::None,
+            recurrence_interval: "1".to_string(),
+            weekly_days: weekly_days_for(selected_date.weekday()),
+            monthly_mode: RecurrenceMonthlyFormMode::DayOfMonth,
+            yearly_mode: RecurrenceYearlyFormMode::Date,
+            recurrence_end: RecurrenceEndFormMode::Never,
+            recurrence_until_date: selected_date.to_string(),
+            recurrence_count: "10".to_string(),
             focused: 0,
             error: None,
-        }
+        };
+        form.load_recurrence(event.recurrence.as_ref());
+        form
+    }
+
+    pub fn edit_occurrence(event: &Event) -> Self {
+        let Some(occurrence) = event.occurrence() else {
+            return Self::edit(event);
+        };
+        let mut form = Self::edit(event);
+        form.mode = EventFormMode::EditOccurrence {
+            series_id: occurrence.series_id.clone(),
+            anchor: occurrence.anchor,
+        };
+        form.repeat = RepeatFrequency::None;
+        form
     }
 
     pub fn mode(&self) -> &EventFormMode {
@@ -362,7 +566,7 @@ impl CreateEventForm {
     pub fn heading(&self) -> &'static str {
         match &self.mode {
             EventFormMode::Create => "Create",
-            EventFormMode::Edit { .. } => "Edit",
+            EventFormMode::Edit { .. } | EventFormMode::EditOccurrence { .. } => "Edit",
         }
     }
 
@@ -394,10 +598,10 @@ impl CreateEventForm {
 
         if ctrl_s(key) {
             return match self.submit() {
-                Ok(draft) => CreateEventInputResult::Submit(EventFormSubmission {
+                Ok(draft) => CreateEventInputResult::Submit(Box::new(EventFormSubmission {
                     mode: self.mode.clone(),
                     draft,
-                }),
+                })),
                 Err(err) => {
                     self.error = Some(err.to_string());
                     CreateEventInputResult::Continue
@@ -458,12 +662,14 @@ impl CreateEventForm {
 
         if self.all_day {
             let date = self.start_date()?;
+            let recurrence = self.recurrence_rule(date)?;
             return Ok(CreateEventDraft {
                 title,
                 timing: CreateEventTiming::AllDay { date },
                 location,
                 notes,
                 reminders,
+                recurrence,
             });
         }
 
@@ -480,6 +686,7 @@ impl CreateEventForm {
         if start >= end {
             return Err(CreateEventFormError::InvalidRange);
         }
+        let recurrence = self.recurrence_rule(start_date)?;
 
         Ok(CreateEventDraft {
             title,
@@ -487,6 +694,7 @@ impl CreateEventForm {
             location,
             notes,
             reminders,
+            recurrence,
         })
     }
 
@@ -499,6 +707,117 @@ impl CreateEventForm {
 
     fn end_date(&self) -> Result<CalendarDate, CreateEventFormError> {
         parse_date_field(&self.end_date, "end date")
+    }
+
+    fn load_recurrence(&mut self, recurrence: Option<&RecurrenceRule>) {
+        let Some(recurrence) = recurrence else {
+            return;
+        };
+        self.repeat = RepeatFrequency::from_rule(recurrence.frequency);
+        self.recurrence_interval = recurrence.interval().to_string();
+        if !recurrence.weekdays.is_empty() {
+            self.weekly_days = [false; DAYS_PER_WEEK];
+            for weekday in &recurrence.weekdays {
+                self.weekly_days[usize::from(weekday.number_days_from_sunday())] = true;
+            }
+        }
+        self.recurrence_end = match recurrence.end {
+            RecurrenceEnd::Never => RecurrenceEndFormMode::Never,
+            RecurrenceEnd::Until(date) => {
+                self.recurrence_until_date = date.to_string();
+                RecurrenceEndFormMode::Until
+            }
+            RecurrenceEnd::Count(count) => {
+                self.recurrence_count = count.to_string();
+                RecurrenceEndFormMode::Count
+            }
+        };
+        if let Some(monthly) = recurrence.monthly {
+            self.monthly_mode = match monthly {
+                RecurrenceMonthlyRule::DayOfMonth(_) => RecurrenceMonthlyFormMode::DayOfMonth,
+                RecurrenceMonthlyRule::WeekdayOrdinal { .. } => {
+                    RecurrenceMonthlyFormMode::WeekdayOrdinal
+                }
+            };
+        }
+        if let Some(yearly) = recurrence.yearly {
+            self.yearly_mode = match yearly {
+                RecurrenceYearlyRule::Date { .. } => RecurrenceYearlyFormMode::Date,
+                RecurrenceYearlyRule::WeekdayOrdinal { .. } => {
+                    RecurrenceYearlyFormMode::WeekdayOrdinal
+                }
+            };
+        }
+    }
+
+    fn recurrence_rule(
+        &self,
+        start_date: CalendarDate,
+    ) -> Result<Option<RecurrenceRule>, CreateEventFormError> {
+        if matches!(self.mode, EventFormMode::EditOccurrence { .. })
+            || self.repeat == RepeatFrequency::None
+        {
+            return Ok(None);
+        }
+
+        let interval = parse_positive_u16(&self.recurrence_interval, "interval")?;
+        let end = match self.recurrence_end {
+            RecurrenceEndFormMode::Never => RecurrenceEnd::Never,
+            RecurrenceEndFormMode::Until => {
+                RecurrenceEnd::Until(parse_date_field(&self.recurrence_until_date, "until date")?)
+            }
+            RecurrenceEndFormMode::Count => {
+                RecurrenceEnd::Count(parse_positive_u32(&self.recurrence_count, "count")?)
+            }
+        };
+        let frequency = self.repeat.frequency().expect("repeat is not none");
+        let mut rule = RecurrenceRule::new(frequency).with_interval(interval);
+        rule.end = end;
+
+        match self.repeat {
+            RepeatFrequency::Weekly => {
+                rule.weekdays = self
+                    .weekly_days
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, enabled)| enabled.then_some(weekday_at(index)))
+                    .collect();
+                if rule.weekdays.is_empty() {
+                    rule.weekdays.push(start_date.weekday());
+                }
+            }
+            RepeatFrequency::Monthly => {
+                rule.monthly = Some(match self.monthly_mode {
+                    RecurrenceMonthlyFormMode::DayOfMonth => {
+                        RecurrenceMonthlyRule::DayOfMonth(start_date.day())
+                    }
+                    RecurrenceMonthlyFormMode::WeekdayOrdinal => {
+                        RecurrenceMonthlyRule::WeekdayOrdinal {
+                            ordinal: recurrence_ordinal_for_date(start_date),
+                            weekday: start_date.weekday(),
+                        }
+                    }
+                });
+            }
+            RepeatFrequency::Yearly => {
+                rule.yearly = Some(match self.yearly_mode {
+                    RecurrenceYearlyFormMode::Date => RecurrenceYearlyRule::Date {
+                        month: start_date.month(),
+                        day: start_date.day(),
+                    },
+                    RecurrenceYearlyFormMode::WeekdayOrdinal => {
+                        RecurrenceYearlyRule::WeekdayOrdinal {
+                            month: start_date.month(),
+                            ordinal: recurrence_ordinal_for_date(start_date),
+                            weekday: start_date.weekday(),
+                        }
+                    }
+                });
+            }
+            RepeatFrequency::Daily | RepeatFrequency::None => {}
+        }
+
+        Ok(Some(rule))
     }
 
     fn visible_fields(&self) -> Vec<CreateEventField> {
@@ -516,6 +835,26 @@ impl CreateEventForm {
             CreateEventField::Notes,
         ]);
         fields.extend((0..REMINDER_PRESETS.len()).map(CreateEventField::Reminder));
+        if !matches!(self.mode, EventFormMode::EditOccurrence { .. }) {
+            fields.push(CreateEventField::Repeat);
+            if self.repeat != RepeatFrequency::None {
+                fields.push(CreateEventField::RecurrenceInterval);
+                match self.repeat {
+                    RepeatFrequency::Weekly => {
+                        fields.extend((0..DAYS_PER_WEEK).map(CreateEventField::WeeklyDay));
+                    }
+                    RepeatFrequency::Monthly => fields.push(CreateEventField::MonthlyMode),
+                    RepeatFrequency::Yearly => fields.push(CreateEventField::YearlyMode),
+                    RepeatFrequency::Daily | RepeatFrequency::None => {}
+                }
+                fields.push(CreateEventField::RecurrenceEnd);
+                match self.recurrence_end {
+                    RecurrenceEndFormMode::Until => fields.push(CreateEventField::UntilDate),
+                    RecurrenceEndFormMode::Count => fields.push(CreateEventField::OccurrenceCount),
+                    RecurrenceEndFormMode::Never => {}
+                }
+            }
+        }
         fields
     }
 
@@ -533,6 +872,20 @@ impl CreateEventForm {
                 let preset = REMINDER_PRESETS[index];
                 format!("{} {}", checkbox(self.reminders[index]), preset.label)
             }
+            CreateEventField::Repeat => self.repeat.label().to_string(),
+            CreateEventField::RecurrenceInterval => self.recurrence_interval.clone(),
+            CreateEventField::WeeklyDay(index) => {
+                format!(
+                    "{} {}",
+                    checkbox(self.weekly_days[index]),
+                    weekday_short_label(weekday_at(index))
+                )
+            }
+            CreateEventField::MonthlyMode => self.monthly_mode.label().to_string(),
+            CreateEventField::YearlyMode => self.yearly_mode.label().to_string(),
+            CreateEventField::RecurrenceEnd => self.recurrence_end.label().to_string(),
+            CreateEventField::UntilDate => self.recurrence_until_date.clone(),
+            CreateEventField::OccurrenceCount => self.recurrence_count.clone(),
         }
     }
 
@@ -561,6 +914,13 @@ impl CreateEventForm {
             CreateEventField::AllDay => self.all_day = !self.all_day,
             CreateEventField::Reminder(index) => self.reminders[index] = !self.reminders[index],
             CreateEventField::Notes => self.notes.push('\n'),
+            CreateEventField::Repeat => self.repeat = self.repeat.next(),
+            CreateEventField::WeeklyDay(index) => {
+                self.weekly_days[index] = !self.weekly_days[index]
+            }
+            CreateEventField::MonthlyMode => self.monthly_mode = self.monthly_mode.next(),
+            CreateEventField::YearlyMode => self.yearly_mode = self.yearly_mode.next(),
+            CreateEventField::RecurrenceEnd => self.recurrence_end = self.recurrence_end.next(),
             _ => {}
         }
         self.error = None;
@@ -576,7 +936,16 @@ impl CreateEventForm {
             CreateEventField::EndTime => Some(&mut self.end_time),
             CreateEventField::Location => Some(&mut self.location),
             CreateEventField::Notes => Some(&mut self.notes),
-            CreateEventField::AllDay | CreateEventField::Reminder(_) => None,
+            CreateEventField::RecurrenceInterval => Some(&mut self.recurrence_interval),
+            CreateEventField::UntilDate => Some(&mut self.recurrence_until_date),
+            CreateEventField::OccurrenceCount => Some(&mut self.recurrence_count),
+            CreateEventField::AllDay
+            | CreateEventField::Reminder(_)
+            | CreateEventField::Repeat
+            | CreateEventField::WeeklyDay(_)
+            | CreateEventField::MonthlyMode
+            | CreateEventField::YearlyMode
+            | CreateEventField::RecurrenceEnd => None,
         };
 
         if let Some(target) = target {
@@ -611,7 +980,7 @@ pub struct EventFormSubmission {
 pub enum CreateEventInputResult {
     Continue,
     Cancel,
-    Submit(EventFormSubmission),
+    Submit(Box<EventFormSubmission>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -619,6 +988,7 @@ pub enum CreateEventFormError {
     RequiredField(&'static str),
     InvalidDate { field: &'static str, value: String },
     InvalidTime { field: &'static str, value: String },
+    InvalidNumber { field: &'static str, value: String },
     InvalidRange,
 }
 
@@ -628,6 +998,9 @@ impl std::fmt::Display for CreateEventFormError {
             Self::RequiredField(field) => write!(f, "{field} is required"),
             Self::InvalidDate { field, value } => write!(f, "{field} '{value}' must be YYYY-MM-DD"),
             Self::InvalidTime { field, value } => write!(f, "{field} '{value}' must be HH:MM"),
+            Self::InvalidNumber { field, value } => {
+                write!(f, "{field} '{value}' must be a positive number")
+            }
             Self::InvalidRange => write!(f, "end must be after start"),
         }
     }
@@ -667,6 +1040,125 @@ const REMINDER_PRESETS: [ReminderPreset; 6] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepeatFrequency {
+    None,
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+impl RepeatFrequency {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Daily => "Daily",
+            Self::Weekly => "Weekly",
+            Self::Monthly => "Monthly",
+            Self::Yearly => "Yearly",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::None => Self::Daily,
+            Self::Daily => Self::Weekly,
+            Self::Weekly => Self::Monthly,
+            Self::Monthly => Self::Yearly,
+            Self::Yearly => Self::None,
+        }
+    }
+
+    const fn frequency(self) -> Option<RecurrenceFrequency> {
+        match self {
+            Self::None => None,
+            Self::Daily => Some(RecurrenceFrequency::Daily),
+            Self::Weekly => Some(RecurrenceFrequency::Weekly),
+            Self::Monthly => Some(RecurrenceFrequency::Monthly),
+            Self::Yearly => Some(RecurrenceFrequency::Yearly),
+        }
+    }
+
+    const fn from_rule(frequency: RecurrenceFrequency) -> Self {
+        match frequency {
+            RecurrenceFrequency::Daily => Self::Daily,
+            RecurrenceFrequency::Weekly => Self::Weekly,
+            RecurrenceFrequency::Monthly => Self::Monthly,
+            RecurrenceFrequency::Yearly => Self::Yearly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecurrenceMonthlyFormMode {
+    DayOfMonth,
+    WeekdayOrdinal,
+}
+
+impl RecurrenceMonthlyFormMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DayOfMonth => "Day of month",
+            Self::WeekdayOrdinal => "Nth weekday",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::DayOfMonth => Self::WeekdayOrdinal,
+            Self::WeekdayOrdinal => Self::DayOfMonth,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecurrenceYearlyFormMode {
+    Date,
+    WeekdayOrdinal,
+}
+
+impl RecurrenceYearlyFormMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Date => "Date",
+            Self::WeekdayOrdinal => "Nth weekday",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Date => Self::WeekdayOrdinal,
+            Self::WeekdayOrdinal => Self::Date,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecurrenceEndFormMode {
+    Never,
+    Until,
+    Count,
+}
+
+impl RecurrenceEndFormMode {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Never => "Never",
+            Self::Until => "Until date",
+            Self::Count => "Count",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Never => Self::Until,
+            Self::Until => Self::Count,
+            Self::Count => Self::Never,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CreateEventField {
     Title,
     AllDay,
@@ -677,6 +1169,14 @@ enum CreateEventField {
     Location,
     Notes,
     Reminder(usize),
+    Repeat,
+    RecurrenceInterval,
+    WeeklyDay(usize),
+    MonthlyMode,
+    YearlyMode,
+    RecurrenceEnd,
+    UntilDate,
+    OccurrenceCount,
 }
 
 impl CreateEventField {
@@ -691,13 +1191,21 @@ impl CreateEventField {
             Self::Location => "Location",
             Self::Notes => "Notes",
             Self::Reminder(_) => "Reminder",
+            Self::Repeat => "Repeat",
+            Self::RecurrenceInterval => "Interval",
+            Self::WeeklyDay(_) => "Weekly",
+            Self::MonthlyMode => "Monthly",
+            Self::YearlyMode => "Yearly",
+            Self::RecurrenceEnd => "Ends",
+            Self::UntilDate => "Until",
+            Self::OccurrenceCount => "Count",
         }
     }
 
     const fn kind(self) -> CreateEventFormRowKind {
         match self {
             Self::Notes => CreateEventFormRowKind::Multiline,
-            Self::AllDay | Self::Reminder(_) => CreateEventFormRowKind::Toggle,
+            Self::AllDay | Self::Reminder(_) | Self::WeeklyDay(_) => CreateEventFormRowKind::Toggle,
             _ => CreateEventFormRowKind::Text,
         }
     }
@@ -705,6 +1213,37 @@ impl CreateEventField {
 
 fn checkbox(enabled: bool) -> &'static str {
     if enabled { "[x]" } else { "[ ]" }
+}
+
+fn weekly_days_for(weekday: Weekday) -> [bool; DAYS_PER_WEEK] {
+    let mut days = [false; DAYS_PER_WEEK];
+    days[usize::from(weekday.number_days_from_sunday())] = true;
+    days
+}
+
+fn weekday_at(index: usize) -> Weekday {
+    match index {
+        0 => Weekday::Sunday,
+        1 => Weekday::Monday,
+        2 => Weekday::Tuesday,
+        3 => Weekday::Wednesday,
+        4 => Weekday::Thursday,
+        5 => Weekday::Friday,
+        6 => Weekday::Saturday,
+        _ => unreachable!("weekday index stays in range"),
+    }
+}
+
+fn weekday_short_label(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Sunday => "Sun",
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+    }
 }
 
 fn normalize_required(value: &str, field: &'static str) -> Result<String, CreateEventFormError> {
@@ -719,6 +1258,22 @@ fn normalize_required(value: &str, field: &'static str) -> Result<String, Create
 fn normalize_optional(value: &str) -> Option<String> {
     let trimmed = value.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn parse_positive_u16(value: &str, field: &'static str) -> Result<u16, CreateEventFormError> {
+    let parsed = value.trim().parse::<u16>().ok().filter(|value| *value > 0);
+    parsed.ok_or_else(|| CreateEventFormError::InvalidNumber {
+        field,
+        value: value.to_string(),
+    })
+}
+
+fn parse_positive_u32(value: &str, field: &'static str) -> Result<u32, CreateEventFormError> {
+    let parsed = value.trim().parse::<u32>().ok().filter(|value| *value > 0);
+    parsed.ok_or_else(|| CreateEventFormError::InvalidNumber {
+        field,
+        value: value.to_string(),
+    })
 }
 
 fn parse_date_field(
@@ -1014,7 +1569,7 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use time::{Month, Time};
 
-    use crate::agenda::{Holiday, InMemoryAgendaSource, SourceMetadata};
+    use crate::agenda::{Holiday, InMemoryAgendaSource, RecurrenceOrdinal, SourceMetadata};
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
@@ -1372,6 +1927,84 @@ mod tests {
     }
 
     #[test]
+    fn day_view_enter_on_recurring_event_opens_edit_choice() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), key(KeyCode::Enter)],
+        );
+
+        let choice = app.recurrence_choice().expect("choice modal opens");
+        assert_eq!(choice.rows()[0].label, "Edit this occurrence");
+        assert_eq!(app.selected_day_event_id(), Some("series#2026-04-23T09:00"));
+    }
+
+    #[test]
+    fn recurring_edit_choice_can_open_occurrence_or_series_edit() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+
+        let mut occurrence_app = AppState::new(day);
+        occurrence_app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        occurrence_app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        assert_eq!(
+            occurrence_app.handle_recurrence_choice_key(key(KeyCode::Enter), &source),
+            RecurrenceChoiceInputResult::Continue
+        );
+        assert_eq!(
+            occurrence_app.create_form().expect("form opens").mode(),
+            &EventFormMode::EditOccurrence {
+                series_id: "series".to_string(),
+                anchor: OccurrenceAnchor::Timed {
+                    start: at(day, 9, 0)
+                },
+            }
+        );
+
+        let mut series_app = AppState::new(day);
+        series_app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        series_app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        assert_eq!(
+            series_app.handle_recurrence_choice_key(key(KeyCode::Down), &source),
+            RecurrenceChoiceInputResult::Continue
+        );
+        assert_eq!(
+            series_app.handle_recurrence_choice_key(key(KeyCode::Enter), &source),
+            RecurrenceChoiceInputResult::Continue
+        );
+        assert_eq!(
+            series_app.create_form().expect("series form opens").mode(),
+            &EventFormMode::Edit {
+                event_id: "series".to_string()
+            }
+        );
+    }
+
+    #[test]
     fn day_view_reconciles_selection_when_event_leaves_day() {
         let day = date(2026, Month::April, 23);
         let next_day = date(2026, Month::April, 24);
@@ -1632,6 +2265,68 @@ mod tests {
 
         assert_eq!(draft.timing, CreateEventTiming::AllDay { date: day });
         assert_eq!(draft.reminders[0].minutes_before, 24 * 60);
+    }
+
+    #[test]
+    fn create_form_submits_weekly_recurrence() {
+        let day = date(2026, Month::April, 23);
+        let mut form = CreateEventForm::new(day, CreateEventContext::EditableDate);
+        form.title = "Practice".to_string();
+        form.repeat = RepeatFrequency::Weekly;
+        form.recurrence_interval = "2".to_string();
+        form.weekly_days = [false; DAYS_PER_WEEK];
+        form.weekly_days[usize::from(Weekday::Tuesday.number_days_from_sunday())] = true;
+        form.weekly_days[usize::from(Weekday::Thursday.number_days_from_sunday())] = true;
+        form.recurrence_end = RecurrenceEndFormMode::Count;
+        form.recurrence_count = "4".to_string();
+
+        let draft = form.submit().expect("form submits");
+        let recurrence = draft.recurrence.expect("recurrence submitted");
+
+        assert_eq!(recurrence.frequency, RecurrenceFrequency::Weekly);
+        assert_eq!(recurrence.interval, 2);
+        assert_eq!(recurrence.weekdays, [Weekday::Tuesday, Weekday::Thursday]);
+        assert_eq!(recurrence.end, RecurrenceEnd::Count(4));
+    }
+
+    #[test]
+    fn edit_series_form_preloads_recurrence_and_occurrence_form_hides_it() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Monthly,
+                interval: 1,
+                end: RecurrenceEnd::Until(day.add_days(60)),
+                weekdays: Vec::new(),
+                monthly: Some(RecurrenceMonthlyRule::WeekdayOrdinal {
+                    ordinal: RecurrenceOrdinal::Last,
+                    weekday: day.weekday(),
+                }),
+                yearly: None,
+            });
+
+        let form = CreateEventForm::edit(&event);
+
+        assert_eq!(form.repeat, RepeatFrequency::Monthly);
+        assert_eq!(form.monthly_mode, RecurrenceMonthlyFormMode::WeekdayOrdinal);
+        assert_eq!(form.recurrence_end, RecurrenceEndFormMode::Until);
+
+        let mut occurrence = event.clone();
+        occurrence.id = "series#2026-04-23T09:00".to_string();
+        occurrence.occurrence = Some(crate::agenda::OccurrenceMetadata {
+            series_id: "series".to_string(),
+            anchor: OccurrenceAnchor::Timed {
+                start: at(day, 9, 0),
+            },
+        });
+        let occurrence_form = CreateEventForm::edit_occurrence(&occurrence);
+
+        assert!(
+            !occurrence_form
+                .rows()
+                .iter()
+                .any(|row| row.label == "Repeat")
+        );
     }
 
     #[test]

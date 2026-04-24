@@ -16,7 +16,10 @@ use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
-    app::{AppState, CreateEventInputResult, EventFormMode, KeyboardInput, MouseInput},
+    app::{
+        AppState, CreateEventInputResult, EventFormMode, KeyboardInput, MouseInput,
+        RecurrenceChoiceInputResult,
+    },
     calendar::CalendarDate,
     tui::{
         AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
@@ -439,7 +442,10 @@ where
             return Ok(());
         }
 
-        let event = if !app.is_creating_event() && keyboard.is_waiting_for_digit() {
+        let event = if !app.is_creating_event()
+            && !app.is_choosing_recurring_edit()
+            && keyboard.is_waiting_for_digit()
+        {
             if event::poll(DIGIT_JUMP_TIMEOUT)? {
                 event::read()?
             } else {
@@ -453,30 +459,51 @@ where
         match event {
             Event::Key(key) => {
                 mouse.clear();
-                if app.is_creating_event() {
+                if app.is_choosing_recurring_edit() {
+                    match app.handle_recurrence_choice_key(key, &agenda_source) {
+                        RecurrenceChoiceInputResult::Continue => {}
+                        RecurrenceChoiceInputResult::Cancel => app.close_recurrence_choice(),
+                    }
+                } else if app.is_creating_event() {
                     match app.handle_create_key(key) {
                         CreateEventInputResult::Continue => {}
                         CreateEventInputResult::Cancel => app.close_create_form(),
-                        CreateEventInputResult::Submit(submission) => match submission.mode {
-                            EventFormMode::Create => {
-                                match agenda_source.create_event(submission.draft) {
-                                    Ok(_) => {
-                                        app.close_create_form();
-                                        app.reconcile_day_event_selection(&agenda_source);
+                        CreateEventInputResult::Submit(submission) => {
+                            let submission = *submission;
+                            match submission.mode {
+                                EventFormMode::Create => {
+                                    match agenda_source.create_event(submission.draft) {
+                                        Ok(_) => {
+                                            app.close_create_form();
+                                            app.reconcile_day_event_selection(&agenda_source);
+                                        }
+                                        Err(err) => app.set_create_form_error(err.to_string()),
                                     }
-                                    Err(err) => app.set_create_form_error(err.to_string()),
+                                }
+                                EventFormMode::Edit { event_id } => {
+                                    match agenda_source.update_event(&event_id, submission.draft) {
+                                        Ok(_) => {
+                                            app.close_create_form();
+                                            app.reconcile_day_event_selection(&agenda_source);
+                                        }
+                                        Err(err) => app.set_create_form_error(err.to_string()),
+                                    }
+                                }
+                                EventFormMode::EditOccurrence { series_id, anchor } => {
+                                    match agenda_source.update_occurrence(
+                                        &series_id,
+                                        anchor,
+                                        submission.draft,
+                                    ) {
+                                        Ok(_) => {
+                                            app.close_create_form();
+                                            app.reconcile_day_event_selection(&agenda_source);
+                                        }
+                                        Err(err) => app.set_create_form_error(err.to_string()),
+                                    }
                                 }
                             }
-                            EventFormMode::Edit { event_id } => {
-                                match agenda_source.update_event(&event_id, submission.draft) {
-                                    Ok(_) => {
-                                        app.close_create_form();
-                                        app.reconcile_day_event_selection(&agenda_source);
-                                    }
-                                    Err(err) => app.set_create_form_error(err.to_string()),
-                                }
-                            }
-                        },
+                        }
                     }
                 } else {
                     let action = keyboard.translate(key);
@@ -484,7 +511,7 @@ where
                 }
             }
             Event::Mouse(mouse_event) => {
-                if app.is_creating_event() {
+                if app.is_creating_event() || app.is_choosing_recurring_edit() {
                     continue;
                 }
                 keyboard.clear();

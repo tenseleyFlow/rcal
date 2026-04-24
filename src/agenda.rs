@@ -40,7 +40,7 @@ impl DateRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventDateTime {
     pub date: CalendarDate,
     pub time: Time,
@@ -141,6 +141,117 @@ impl EventTiming {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceFrequency {
+    Daily,
+    Weekly,
+    Monthly,
+    Yearly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceEnd {
+    Never,
+    Until(CalendarDate),
+    Count(u32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceOrdinal {
+    Number(u8),
+    Last,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceMonthlyRule {
+    DayOfMonth(u8),
+    WeekdayOrdinal {
+        ordinal: RecurrenceOrdinal,
+        weekday: Weekday,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecurrenceYearlyRule {
+    Date {
+        month: Month,
+        day: u8,
+    },
+    WeekdayOrdinal {
+        month: Month,
+        ordinal: RecurrenceOrdinal,
+        weekday: Weekday,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrenceRule {
+    pub frequency: RecurrenceFrequency,
+    pub interval: u16,
+    pub end: RecurrenceEnd,
+    pub weekdays: Vec<Weekday>,
+    pub monthly: Option<RecurrenceMonthlyRule>,
+    pub yearly: Option<RecurrenceYearlyRule>,
+}
+
+impl RecurrenceRule {
+    pub fn new(frequency: RecurrenceFrequency) -> Self {
+        Self {
+            frequency,
+            interval: 1,
+            end: RecurrenceEnd::Never,
+            weekdays: Vec::new(),
+            monthly: None,
+            yearly: None,
+        }
+    }
+
+    pub fn with_interval(mut self, interval: u16) -> Self {
+        self.interval = interval.max(1);
+        self
+    }
+
+    pub fn interval(&self) -> u16 {
+        self.interval.max(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum OccurrenceAnchor {
+    AllDay { date: CalendarDate },
+    Timed { start: EventDateTime },
+}
+
+impl OccurrenceAnchor {
+    pub const fn date(self) -> CalendarDate {
+        match self {
+            Self::AllDay { date } => date,
+            Self::Timed { start } => start.date,
+        }
+    }
+
+    fn storage_key(self) -> String {
+        match self {
+            Self::AllDay { date } => format!("{date}"),
+            Self::Timed { start } => {
+                format!("{}T{}", start.date, format_time(start.time))
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceMetadata {
+    pub series_id: String,
+    pub anchor: OccurrenceAnchor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OccurrenceOverride {
+    pub anchor: OccurrenceAnchor,
+    pub draft: CreateEventDraft,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     pub id: String,
@@ -150,6 +261,9 @@ pub struct Event {
     pub reminders: Vec<Reminder>,
     pub source: SourceMetadata,
     pub timing: EventTiming,
+    pub recurrence: Option<RecurrenceRule>,
+    pub occurrence: Option<OccurrenceMetadata>,
+    pub occurrence_overrides: Vec<OccurrenceOverride>,
 }
 
 impl Event {
@@ -167,6 +281,9 @@ impl Event {
             reminders: Vec::new(),
             source,
             timing: EventTiming::AllDay { date },
+            recurrence: None,
+            occurrence: None,
+            occurrence_overrides: Vec::new(),
         }
     }
 
@@ -189,6 +306,9 @@ impl Event {
             reminders: Vec::new(),
             source,
             timing: EventTiming::Timed { start, end },
+            recurrence: None,
+            occurrence: None,
+            occurrence_overrides: Vec::new(),
         })
     }
 
@@ -207,6 +327,11 @@ impl Event {
         self
     }
 
+    pub fn with_recurrence(mut self, recurrence: RecurrenceRule) -> Self {
+        self.recurrence = Some(recurrence);
+        self
+    }
+
     pub const fn is_all_day(&self) -> bool {
         self.timing.is_all_day()
     }
@@ -217,6 +342,14 @@ impl Event {
 
     pub fn is_local(&self) -> bool {
         self.source.source_id == "local"
+    }
+
+    pub const fn is_recurring_series(&self) -> bool {
+        self.recurrence.is_some()
+    }
+
+    pub const fn occurrence(&self) -> Option<&OccurrenceMetadata> {
+        self.occurrence.as_ref()
     }
 
     pub fn intersects_range(&self, range: DateRange) -> bool {
@@ -239,6 +372,7 @@ pub struct CreateEventDraft {
     pub location: Option<String>,
     pub notes: Option<String>,
     pub reminders: Vec<Reminder>,
+    pub recurrence: Option<RecurrenceRule>,
 }
 
 impl CreateEventDraft {
@@ -254,7 +388,13 @@ impl CreateEventDraft {
         event.location = self.location;
         event.notes = self.notes;
         event.reminders = self.reminders;
+        event.recurrence = self.recurrence;
         Ok(event)
+    }
+
+    fn without_recurrence(mut self) -> Self {
+        self.recurrence = None;
+        self
     }
 }
 
@@ -395,6 +535,10 @@ pub trait AgendaSource {
     fn events_intersecting(&self, range: DateRange) -> Vec<Event>;
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday>;
+
+    fn local_event_by_id(&self, _id: &str) -> Option<Event> {
+        None
+    }
 }
 
 #[derive(Debug)]
@@ -460,14 +604,71 @@ impl ConfiguredAgendaSource {
             return Err(LocalEventStoreError::EventNotEditable { id: id.to_string() });
         }
 
-        let event =
+        let mut event =
             draft
                 .into_event(id.to_string())
                 .map_err(|err| LocalEventStoreError::Encode {
                     path: self.events_file.clone(),
                     reason: err.to_string(),
                 })?;
+        let existing_overrides = std::mem::take(&mut events[index].occurrence_overrides);
+        event.occurrence_overrides = existing_overrides
+            .into_iter()
+            .filter(|override_record| event_generates_anchor(&event, override_record.anchor))
+            .collect();
         events[index] = event.clone();
+
+        if let Some(path) = &self.events_file {
+            write_events_file(path, &events)?;
+        }
+        self.events.events = events;
+        Ok(event)
+    }
+
+    pub fn update_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+        draft: CreateEventDraft,
+    ) -> Result<Event, LocalEventStoreError> {
+        let mut events = self.events.events().to_vec();
+        let Some(index) = events.iter().position(|event| event.id == series_id) else {
+            return Err(LocalEventStoreError::EventNotFound {
+                id: series_id.to_string(),
+            });
+        };
+        if !events[index].is_local() || !events[index].is_recurring_series() {
+            return Err(LocalEventStoreError::EventNotEditable {
+                id: series_id.to_string(),
+            });
+        }
+        if !event_generates_anchor(&events[index], anchor) {
+            return Err(LocalEventStoreError::OccurrenceNotFound {
+                id: series_id.to_string(),
+                anchor: anchor.storage_key(),
+            });
+        }
+
+        let override_record = OccurrenceOverride {
+            anchor,
+            draft: draft.without_recurrence(),
+        };
+        if let Some(existing) = events[index]
+            .occurrence_overrides
+            .iter_mut()
+            .find(|existing| existing.anchor == anchor)
+        {
+            *existing = override_record;
+        } else {
+            events[index].occurrence_overrides.push(override_record);
+        }
+
+        let event = occurrence_override_event(&events[index], anchor).ok_or_else(|| {
+            LocalEventStoreError::OccurrenceNotFound {
+                id: series_id.to_string(),
+                anchor: anchor.storage_key(),
+            }
+        })?;
 
         if let Some(path) = &self.events_file {
             write_events_file(path, &events)?;
@@ -498,6 +699,10 @@ impl AgendaSource for ConfiguredAgendaSource {
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday> {
         self.holidays.holidays_in(range)
+    }
+
+    fn local_event_by_id(&self, id: &str) -> Option<Event> {
+        self.events.local_event_by_id(id)
     }
 }
 
@@ -761,11 +966,17 @@ impl InMemoryAgendaSource {
 
 impl AgendaSource for InMemoryAgendaSource {
     fn events_intersecting(&self, range: DateRange) -> Vec<Event> {
-        self.events
+        let mut events = self
+            .events
             .iter()
-            .filter(|event| event.intersects_range(range))
-            .cloned()
-            .collect()
+            .flat_map(|event| events_intersecting_range(event, range))
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            event_sort_key(left)
+                .cmp(&event_sort_key(right))
+                .then(left.id.cmp(&right.id))
+        });
+        events
     }
 
     fn holidays_in(&self, range: DateRange) -> Vec<Holiday> {
@@ -774,6 +985,331 @@ impl AgendaSource for InMemoryAgendaSource {
             .filter(|holiday| range.contains_date(holiday.date))
             .cloned()
             .collect()
+    }
+
+    fn local_event_by_id(&self, id: &str) -> Option<Event> {
+        self.events
+            .iter()
+            .find(|event| event.id == id && event.is_local())
+            .cloned()
+    }
+}
+
+fn events_intersecting_range(event: &Event, range: DateRange) -> Vec<Event> {
+    if event.recurrence.is_none() {
+        return event
+            .intersects_range(range)
+            .then(|| event.clone())
+            .into_iter()
+            .collect();
+    }
+
+    expand_recurring_event(event, range)
+        .into_iter()
+        .filter(|event| event.intersects_range(range))
+        .collect()
+}
+
+fn expand_recurring_event(event: &Event, range: DateRange) -> Vec<Event> {
+    let Some(recurrence) = &event.recurrence else {
+        return Vec::new();
+    };
+    let Some(start_date) = event_start_date(event) else {
+        return Vec::new();
+    };
+
+    let mut events = Vec::new();
+    let final_date = range.end.add_days(-1);
+    let mut date = start_date;
+    let mut generated_count = 0_u32;
+
+    while date <= final_date {
+        if let RecurrenceEnd::Until(until) = recurrence.end
+            && date > until
+        {
+            break;
+        }
+
+        if recurs_on_date(date, start_date, recurrence) {
+            generated_count = generated_count.saturating_add(1);
+            if let RecurrenceEnd::Count(max_count) = recurrence.end
+                && generated_count > max_count
+            {
+                break;
+            }
+
+            let anchor = occurrence_anchor_for_date(event, date);
+            let instance = occurrence_override_event(event, anchor)
+                .unwrap_or_else(|| generated_occurrence_event(event, anchor));
+            events.push(instance);
+        }
+
+        date = date.add_days(1);
+    }
+
+    events
+}
+
+fn event_generates_anchor(event: &Event, anchor: OccurrenceAnchor) -> bool {
+    let Some(recurrence) = &event.recurrence else {
+        return false;
+    };
+    let Some(start_date) = event_start_date(event) else {
+        return false;
+    };
+    if anchor.date() < start_date || !recurs_on_date(anchor.date(), start_date, recurrence) {
+        return false;
+    }
+    if !anchor_is_within_recurrence_end(anchor.date(), start_date, recurrence) {
+        return false;
+    }
+    occurrence_anchor_for_date(event, anchor.date()) == anchor
+}
+
+fn anchor_is_within_recurrence_end(
+    anchor_date: CalendarDate,
+    start_date: CalendarDate,
+    recurrence: &RecurrenceRule,
+) -> bool {
+    if let RecurrenceEnd::Until(until) = recurrence.end
+        && anchor_date > until
+    {
+        return false;
+    }
+
+    if let RecurrenceEnd::Count(max_count) = recurrence.end {
+        let mut count = 0_u32;
+        let mut date = start_date;
+        while date <= anchor_date {
+            if recurs_on_date(date, start_date, recurrence) {
+                count = count.saturating_add(1);
+            }
+            date = date.add_days(1);
+        }
+        return count <= max_count;
+    }
+
+    true
+}
+
+fn occurrence_override_event(series: &Event, anchor: OccurrenceAnchor) -> Option<Event> {
+    let override_record = series
+        .occurrence_overrides
+        .iter()
+        .find(|override_record| override_record.anchor == anchor)?;
+    occurrence_event_from_draft(series, anchor, override_record.draft.clone()).ok()
+}
+
+fn generated_occurrence_event(series: &Event, anchor: OccurrenceAnchor) -> Event {
+    let mut event = series.clone();
+    event.id = occurrence_event_id(series, anchor);
+    event.timing = occurrence_timing(series, anchor);
+    event.occurrence = Some(OccurrenceMetadata {
+        series_id: series.id.clone(),
+        anchor,
+    });
+    event.recurrence = None;
+    event.occurrence_overrides = Vec::new();
+    event
+}
+
+fn occurrence_event_from_draft(
+    series: &Event,
+    anchor: OccurrenceAnchor,
+    draft: CreateEventDraft,
+) -> Result<Event, AgendaError> {
+    let mut event = draft
+        .without_recurrence()
+        .into_event(occurrence_event_id(series, anchor))?;
+    event.source = series.source.clone();
+    event.occurrence = Some(OccurrenceMetadata {
+        series_id: series.id.clone(),
+        anchor,
+    });
+    Ok(event)
+}
+
+fn occurrence_event_id(series: &Event, anchor: OccurrenceAnchor) -> String {
+    format!("{}#{}", series.id, anchor.storage_key())
+}
+
+fn occurrence_anchor_for_date(event: &Event, date: CalendarDate) -> OccurrenceAnchor {
+    match event.timing {
+        EventTiming::AllDay { .. } => OccurrenceAnchor::AllDay { date },
+        EventTiming::Timed { start, .. } => OccurrenceAnchor::Timed {
+            start: EventDateTime::new(date, start.time),
+        },
+    }
+}
+
+fn occurrence_timing(event: &Event, anchor: OccurrenceAnchor) -> EventTiming {
+    match (event.timing, anchor) {
+        (EventTiming::AllDay { .. }, OccurrenceAnchor::AllDay { date }) => {
+            EventTiming::AllDay { date }
+        }
+        (
+            EventTiming::Timed { start, end },
+            OccurrenceAnchor::Timed {
+                start: anchor_start,
+            },
+        ) => {
+            let duration_minutes = datetime_distance_minutes(start, end);
+            EventTiming::Timed {
+                start: anchor_start,
+                end: add_minutes(anchor_start, duration_minutes),
+            }
+        }
+        _ => event.timing,
+    }
+}
+
+fn event_start_date(event: &Event) -> Option<CalendarDate> {
+    match event.timing {
+        EventTiming::AllDay { date } => Some(date),
+        EventTiming::Timed { start, .. } => Some(start.date),
+    }
+}
+
+fn recurs_on_date(date: CalendarDate, start_date: CalendarDate, rule: &RecurrenceRule) -> bool {
+    if date < start_date {
+        return false;
+    }
+
+    match rule.frequency {
+        RecurrenceFrequency::Daily => {
+            days_between(start_date, date) % i32::from(rule.interval()) == 0
+        }
+        RecurrenceFrequency::Weekly => {
+            let days = days_between(start_date, date);
+            let week_index = days / 7;
+            let weekdays = recurrence_weekdays(rule, start_date);
+            week_index % i32::from(rule.interval()) == 0 && weekdays.contains(&date.weekday())
+        }
+        RecurrenceFrequency::Monthly => {
+            let months = months_between(start_date, date);
+            if months < 0 || months % i32::from(rule.interval()) != 0 {
+                return false;
+            }
+            let monthly = rule
+                .monthly
+                .unwrap_or(RecurrenceMonthlyRule::DayOfMonth(start_date.day()));
+            match monthly {
+                RecurrenceMonthlyRule::DayOfMonth(day) => {
+                    CalendarDate::from_ymd(date.year(), date.month(), day).ok() == Some(date)
+                }
+                RecurrenceMonthlyRule::WeekdayOrdinal { ordinal, weekday } => {
+                    weekday_ordinal_date(date.year(), date.month(), ordinal, weekday) == Some(date)
+                }
+            }
+        }
+        RecurrenceFrequency::Yearly => {
+            let years = date.year() - start_date.year();
+            if years < 0 || years % i32::from(rule.interval()) != 0 {
+                return false;
+            }
+            let yearly = rule.yearly.unwrap_or(RecurrenceYearlyRule::Date {
+                month: start_date.month(),
+                day: start_date.day(),
+            });
+            match yearly {
+                RecurrenceYearlyRule::Date { month, day } => {
+                    CalendarDate::from_ymd(date.year(), month, day).ok() == Some(date)
+                }
+                RecurrenceYearlyRule::WeekdayOrdinal {
+                    month,
+                    ordinal,
+                    weekday,
+                } => {
+                    date.month() == month
+                        && weekday_ordinal_date(date.year(), month, ordinal, weekday) == Some(date)
+                }
+            }
+        }
+    }
+}
+
+fn recurrence_weekdays(rule: &RecurrenceRule, start_date: CalendarDate) -> Vec<Weekday> {
+    if rule.weekdays.is_empty() {
+        vec![start_date.weekday()]
+    } else {
+        rule.weekdays.clone()
+    }
+}
+
+fn weekday_ordinal_date(
+    year: i32,
+    month: Month,
+    ordinal: RecurrenceOrdinal,
+    weekday: Weekday,
+) -> Option<CalendarDate> {
+    match ordinal {
+        RecurrenceOrdinal::Number(number) if (1..=4).contains(&number) => {
+            let first = CalendarDate::from_ymd(year, month, 1).ok()?;
+            let first_weekday = first.weekday().number_days_from_sunday();
+            let target_weekday = weekday.number_days_from_sunday();
+            let offset = (target_weekday + 7 - first_weekday) % 7;
+            let day = 1 + offset + (number - 1) * 7;
+            CalendarDate::from_ymd(year, month, day).ok()
+        }
+        RecurrenceOrdinal::Last => {
+            let mut date = CalendarDate::from_ymd(year, month, month.length(year)).ok()?;
+            while date.weekday() != weekday {
+                date = date.add_days(-1);
+            }
+            Some(date)
+        }
+        _ => None,
+    }
+}
+
+pub fn recurrence_ordinal_for_date(date: CalendarDate) -> RecurrenceOrdinal {
+    if date.day().saturating_add(7) > date.month().length(date.year()) {
+        RecurrenceOrdinal::Last
+    } else {
+        RecurrenceOrdinal::Number(((date.day() - 1) / 7) + 1)
+    }
+}
+
+fn days_between(start: CalendarDate, end: CalendarDate) -> i32 {
+    end.inner().to_julian_day() - start.inner().to_julian_day()
+}
+
+fn months_between(start: CalendarDate, end: CalendarDate) -> i32 {
+    (end.year() - start.year()) * 12 + i32::from(u8::from(end.month()))
+        - i32::from(u8::from(start.month()))
+}
+
+fn datetime_distance_minutes(start: EventDateTime, end: EventDateTime) -> i32 {
+    days_between(start.date, end.date) * 24 * 60 + time_minutes(end.time) - time_minutes(start.time)
+}
+
+fn add_minutes(start: EventDateTime, duration_minutes: i32) -> EventDateTime {
+    let absolute_minutes = time_minutes(start.time) + duration_minutes;
+    let day_offset = absolute_minutes.div_euclid(24 * 60);
+    let minute_of_day = absolute_minutes.rem_euclid(24 * 60);
+    EventDateTime::new(
+        start.date.add_days(day_offset),
+        Time::from_hms(
+            u8::try_from(minute_of_day / 60).expect("hour stays in range"),
+            u8::try_from(minute_of_day % 60).expect("minute stays in range"),
+            0,
+        )
+        .expect("computed time is valid"),
+    )
+}
+
+fn time_minutes(time: Time) -> i32 {
+    i32::from(time.hour()) * 60 + i32::from(time.minute())
+}
+
+fn event_sort_key(event: &Event) -> (CalendarDate, DayMinute, String) {
+    match event.timing {
+        EventTiming::AllDay { date } => (date, DayMinute::START, event.title.clone()),
+        EventTiming::Timed { start, .. } => (
+            start.date,
+            DayMinute::from_time(start.time),
+            event.title.clone(),
+        ),
     }
 }
 
@@ -810,6 +1346,10 @@ pub enum LocalEventStoreError {
     EventNotFound {
         id: String,
     },
+    OccurrenceNotFound {
+        id: String,
+        anchor: String,
+    },
     EventNotEditable {
         id: String,
     },
@@ -838,6 +1378,12 @@ impl fmt::Display for LocalEventStoreError {
                 path.display()
             ),
             Self::EventNotFound { id } => write!(f, "local event '{id}' was not found"),
+            Self::OccurrenceNotFound { id, anchor } => {
+                write!(
+                    f,
+                    "recurring occurrence '{anchor}' was not found for local event '{id}'"
+                )
+            }
             Self::EventNotEditable { id } => write!(f, "event '{id}' is not editable locally"),
             Self::Encode { path, reason } => {
                 if let Some(path) = path {
@@ -876,7 +1422,7 @@ fn load_events_file(path: &Path) -> Result<InMemoryAgendaSource, LocalEventStore
         }
     })?;
 
-    if file.version != LOCAL_EVENTS_VERSION {
+    if !matches!(file.version, 1 | LOCAL_EVENTS_VERSION) {
         return Err(LocalEventStoreError::UnsupportedVersion {
             path: path.to_path_buf(),
             version: file.version,
@@ -927,7 +1473,7 @@ fn write_events_file(path: &Path, events: &[Event]) -> Result<(), LocalEventStor
     })
 }
 
-const LOCAL_EVENTS_VERSION: u8 = 1;
+const LOCAL_EVENTS_VERSION: u8 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct LocalEventsFile {
@@ -952,6 +1498,10 @@ enum LocalEventRecord {
         notes: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reminders_minutes_before: Vec<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recurrence: Option<LocalRecurrenceRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        overrides: Vec<LocalOccurrenceOverrideRecord>,
     },
     AllDay {
         id: String,
@@ -963,6 +1513,10 @@ enum LocalEventRecord {
         notes: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         reminders_minutes_before: Vec<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recurrence: Option<LocalRecurrenceRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        overrides: Vec<LocalOccurrenceOverrideRecord>,
     },
 }
 
@@ -973,6 +1527,15 @@ impl LocalEventRecord {
             .iter()
             .map(|reminder| reminder.minutes_before)
             .collect::<Vec<_>>();
+        let recurrence = event
+            .recurrence
+            .as_ref()
+            .map(LocalRecurrenceRecord::from_rule);
+        let overrides = event
+            .occurrence_overrides
+            .iter()
+            .map(LocalOccurrenceOverrideRecord::from_override)
+            .collect::<Vec<_>>();
 
         match event.timing {
             EventTiming::AllDay { date } => Self::AllDay {
@@ -982,6 +1545,8 @@ impl LocalEventRecord {
                 location: event.location.clone(),
                 notes: event.notes.clone(),
                 reminders_minutes_before,
+                recurrence,
+                overrides,
             },
             EventTiming::Timed { start, end } => Self::Timed {
                 id: event.id.clone(),
@@ -993,6 +1558,8 @@ impl LocalEventRecord {
                 location: event.location.clone(),
                 notes: event.notes.clone(),
                 reminders_minutes_before,
+                recurrence,
+                overrides,
             },
         }
     }
@@ -1009,6 +1576,8 @@ impl LocalEventRecord {
                 location,
                 notes,
                 reminders_minutes_before,
+                recurrence,
+                overrides,
             } => {
                 let start = EventDateTime::new(
                     parse_local_date(&start_date, path)?,
@@ -1032,6 +1601,13 @@ impl LocalEventRecord {
                 event.location = empty_to_none(location);
                 event.notes = empty_to_none(notes);
                 event.reminders = reminders_from_minutes(reminders_minutes_before);
+                event.recurrence = recurrence
+                    .map(|recurrence| recurrence.into_rule(path))
+                    .transpose()?;
+                event.occurrence_overrides = overrides
+                    .into_iter()
+                    .map(|override_record| override_record.into_override(path))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(event)
             }
             Self::AllDay {
@@ -1041,6 +1617,8 @@ impl LocalEventRecord {
                 location,
                 notes,
                 reminders_minutes_before,
+                recurrence,
+                overrides,
             } => {
                 let mut event = Event::all_day(
                     id.clone(),
@@ -1051,9 +1629,442 @@ impl LocalEventRecord {
                 event.location = empty_to_none(location);
                 event.notes = empty_to_none(notes);
                 event.reminders = reminders_from_minutes(reminders_minutes_before);
+                event.recurrence = recurrence
+                    .map(|recurrence| recurrence.into_rule(path))
+                    .transpose()?;
+                event.occurrence_overrides = overrides
+                    .into_iter()
+                    .map(|override_record| override_record.into_override(path))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(event)
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalRecurrenceRecord {
+    frequency: String,
+    interval: u16,
+    #[serde(default)]
+    weekdays: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    monthly: Option<LocalRecurrenceMonthlyRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    yearly: Option<LocalRecurrenceYearlyRecord>,
+    end: LocalRecurrenceEndRecord,
+}
+
+impl LocalRecurrenceRecord {
+    fn from_rule(rule: &RecurrenceRule) -> Self {
+        Self {
+            frequency: match rule.frequency {
+                RecurrenceFrequency::Daily => "daily",
+                RecurrenceFrequency::Weekly => "weekly",
+                RecurrenceFrequency::Monthly => "monthly",
+                RecurrenceFrequency::Yearly => "yearly",
+            }
+            .to_string(),
+            interval: rule.interval(),
+            weekdays: rule
+                .weekdays
+                .iter()
+                .map(|weekday| weekday_name(*weekday))
+                .collect(),
+            monthly: rule.monthly.map(LocalRecurrenceMonthlyRecord::from_rule),
+            yearly: rule.yearly.map(LocalRecurrenceYearlyRecord::from_rule),
+            end: LocalRecurrenceEndRecord::from_rule(rule.end),
+        }
+    }
+
+    fn into_rule(self, path: &Path) -> Result<RecurrenceRule, LocalEventStoreError> {
+        let frequency = match self.frequency.as_str() {
+            "daily" => RecurrenceFrequency::Daily,
+            "weekly" => RecurrenceFrequency::Weekly,
+            "monthly" => RecurrenceFrequency::Monthly,
+            "yearly" => RecurrenceFrequency::Yearly,
+            value => {
+                return Err(LocalEventStoreError::Parse {
+                    path: path.to_path_buf(),
+                    reason: format!("invalid recurrence frequency '{value}'"),
+                });
+            }
+        };
+        let weekdays = self
+            .weekdays
+            .into_iter()
+            .map(|weekday| parse_weekday_record(&weekday, path))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(RecurrenceRule {
+            frequency,
+            interval: self.interval.max(1),
+            end: self.end.into_rule(path)?,
+            weekdays,
+            monthly: self
+                .monthly
+                .map(|monthly| monthly.into_rule(path))
+                .transpose()?,
+            yearly: self
+                .yearly
+                .map(|yearly| yearly.into_rule(path))
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum LocalRecurrenceEndRecord {
+    Never,
+    Until { date: String },
+    Count { count: u32 },
+}
+
+impl LocalRecurrenceEndRecord {
+    fn from_rule(end: RecurrenceEnd) -> Self {
+        match end {
+            RecurrenceEnd::Never => Self::Never,
+            RecurrenceEnd::Until(date) => Self::Until {
+                date: date.to_string(),
+            },
+            RecurrenceEnd::Count(count) => Self::Count { count },
+        }
+    }
+
+    fn into_rule(self, path: &Path) -> Result<RecurrenceEnd, LocalEventStoreError> {
+        match self {
+            Self::Never => Ok(RecurrenceEnd::Never),
+            Self::Until { date } => Ok(RecurrenceEnd::Until(parse_local_date(&date, path)?)),
+            Self::Count { count } => Ok(RecurrenceEnd::Count(count.max(1))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum LocalRecurrenceMonthlyRecord {
+    DayOfMonth {
+        day: u8,
+    },
+    WeekdayOrdinal {
+        ordinal: LocalRecurrenceOrdinalRecord,
+        weekday: LocalWeekdayRecord,
+    },
+}
+
+impl LocalRecurrenceMonthlyRecord {
+    fn from_rule(rule: RecurrenceMonthlyRule) -> Self {
+        match rule {
+            RecurrenceMonthlyRule::DayOfMonth(day) => Self::DayOfMonth { day },
+            RecurrenceMonthlyRule::WeekdayOrdinal { ordinal, weekday } => Self::WeekdayOrdinal {
+                ordinal: LocalRecurrenceOrdinalRecord::from_rule(ordinal),
+                weekday: LocalWeekdayRecord::from_weekday(weekday),
+            },
+        }
+    }
+
+    fn into_rule(self, _path: &Path) -> Result<RecurrenceMonthlyRule, LocalEventStoreError> {
+        Ok(match self {
+            Self::DayOfMonth { day } => RecurrenceMonthlyRule::DayOfMonth(day),
+            Self::WeekdayOrdinal { ordinal, weekday } => RecurrenceMonthlyRule::WeekdayOrdinal {
+                ordinal: ordinal.into_rule(),
+                weekday: weekday.into_weekday(),
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum LocalRecurrenceYearlyRecord {
+    Date {
+        month: u8,
+        day: u8,
+    },
+    WeekdayOrdinal {
+        month: u8,
+        ordinal: LocalRecurrenceOrdinalRecord,
+        weekday: LocalWeekdayRecord,
+    },
+}
+
+impl LocalRecurrenceYearlyRecord {
+    fn from_rule(rule: RecurrenceYearlyRule) -> Self {
+        match rule {
+            RecurrenceYearlyRule::Date { month, day } => Self::Date {
+                month: u8::from(month),
+                day,
+            },
+            RecurrenceYearlyRule::WeekdayOrdinal {
+                month,
+                ordinal,
+                weekday,
+            } => Self::WeekdayOrdinal {
+                month: u8::from(month),
+                ordinal: LocalRecurrenceOrdinalRecord::from_rule(ordinal),
+                weekday: LocalWeekdayRecord::from_weekday(weekday),
+            },
+        }
+    }
+
+    fn into_rule(self, path: &Path) -> Result<RecurrenceYearlyRule, LocalEventStoreError> {
+        Ok(match self {
+            Self::Date { month, day } => RecurrenceYearlyRule::Date {
+                month: parse_month_record(month, path)?,
+                day,
+            },
+            Self::WeekdayOrdinal {
+                month,
+                ordinal,
+                weekday,
+            } => RecurrenceYearlyRule::WeekdayOrdinal {
+                month: parse_month_record(month, path)?,
+                ordinal: ordinal.into_rule(),
+                weekday: weekday.into_weekday(),
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalRecurrenceOrdinalRecord {
+    First,
+    Second,
+    Third,
+    Fourth,
+    Last,
+}
+
+impl LocalRecurrenceOrdinalRecord {
+    fn from_rule(ordinal: RecurrenceOrdinal) -> Self {
+        match ordinal {
+            RecurrenceOrdinal::Number(1) => Self::First,
+            RecurrenceOrdinal::Number(2) => Self::Second,
+            RecurrenceOrdinal::Number(3) => Self::Third,
+            RecurrenceOrdinal::Number(4) => Self::Fourth,
+            RecurrenceOrdinal::Last | RecurrenceOrdinal::Number(_) => Self::Last,
+        }
+    }
+
+    const fn into_rule(self) -> RecurrenceOrdinal {
+        match self {
+            Self::First => RecurrenceOrdinal::Number(1),
+            Self::Second => RecurrenceOrdinal::Number(2),
+            Self::Third => RecurrenceOrdinal::Number(3),
+            Self::Fourth => RecurrenceOrdinal::Number(4),
+            Self::Last => RecurrenceOrdinal::Last,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LocalWeekdayRecord {
+    Sunday,
+    Monday,
+    Tuesday,
+    Wednesday,
+    Thursday,
+    Friday,
+    Saturday,
+}
+
+impl LocalWeekdayRecord {
+    const fn from_weekday(weekday: Weekday) -> Self {
+        match weekday {
+            Weekday::Sunday => Self::Sunday,
+            Weekday::Monday => Self::Monday,
+            Weekday::Tuesday => Self::Tuesday,
+            Weekday::Wednesday => Self::Wednesday,
+            Weekday::Thursday => Self::Thursday,
+            Weekday::Friday => Self::Friday,
+            Weekday::Saturday => Self::Saturday,
+        }
+    }
+
+    const fn into_weekday(self) -> Weekday {
+        match self {
+            Self::Sunday => Weekday::Sunday,
+            Self::Monday => Weekday::Monday,
+            Self::Tuesday => Weekday::Tuesday,
+            Self::Wednesday => Weekday::Wednesday,
+            Self::Thursday => Weekday::Thursday,
+            Self::Friday => Weekday::Friday,
+            Self::Saturday => Weekday::Saturday,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocalOccurrenceOverrideRecord {
+    anchor: LocalOccurrenceAnchorRecord,
+    event: LocalEventDraftRecord,
+}
+
+impl LocalOccurrenceOverrideRecord {
+    fn from_override(override_record: &OccurrenceOverride) -> Self {
+        Self {
+            anchor: LocalOccurrenceAnchorRecord::from_anchor(override_record.anchor),
+            event: LocalEventDraftRecord::from_draft(&override_record.draft),
+        }
+    }
+
+    fn into_override(self, path: &Path) -> Result<OccurrenceOverride, LocalEventStoreError> {
+        Ok(OccurrenceOverride {
+            anchor: self.anchor.into_anchor(path)?,
+            draft: self.event.into_draft(path)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum LocalOccurrenceAnchorRecord {
+    AllDay { date: String },
+    Timed { date: String, time: String },
+}
+
+impl LocalOccurrenceAnchorRecord {
+    fn from_anchor(anchor: OccurrenceAnchor) -> Self {
+        match anchor {
+            OccurrenceAnchor::AllDay { date } => Self::AllDay {
+                date: date.to_string(),
+            },
+            OccurrenceAnchor::Timed { start } => Self::Timed {
+                date: start.date.to_string(),
+                time: format_time(start.time),
+            },
+        }
+    }
+
+    fn into_anchor(self, path: &Path) -> Result<OccurrenceAnchor, LocalEventStoreError> {
+        Ok(match self {
+            Self::AllDay { date } => OccurrenceAnchor::AllDay {
+                date: parse_local_date(&date, path)?,
+            },
+            Self::Timed { date, time } => OccurrenceAnchor::Timed {
+                start: EventDateTime::new(
+                    parse_local_date(&date, path)?,
+                    parse_local_time(&time, path)?,
+                ),
+            },
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "timing", rename_all = "snake_case")]
+enum LocalEventDraftRecord {
+    Timed {
+        title: String,
+        start_date: String,
+        start_time: String,
+        end_date: String,
+        end_time: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reminders_minutes_before: Vec<u16>,
+    },
+    AllDay {
+        title: String,
+        date: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        location: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notes: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reminders_minutes_before: Vec<u16>,
+    },
+}
+
+impl LocalEventDraftRecord {
+    fn from_draft(draft: &CreateEventDraft) -> Self {
+        let reminders_minutes_before = draft
+            .reminders
+            .iter()
+            .map(|reminder| reminder.minutes_before)
+            .collect::<Vec<_>>();
+        match draft.timing {
+            CreateEventTiming::Timed { start, end } => Self::Timed {
+                title: draft.title.clone(),
+                start_date: start.date.to_string(),
+                start_time: format_time(start.time),
+                end_date: end.date.to_string(),
+                end_time: format_time(end.time),
+                location: draft.location.clone(),
+                notes: draft.notes.clone(),
+                reminders_minutes_before,
+            },
+            CreateEventTiming::AllDay { date } => Self::AllDay {
+                title: draft.title.clone(),
+                date: date.to_string(),
+                location: draft.location.clone(),
+                notes: draft.notes.clone(),
+                reminders_minutes_before,
+            },
+        }
+    }
+
+    fn into_draft(self, path: &Path) -> Result<CreateEventDraft, LocalEventStoreError> {
+        Ok(match self {
+            Self::Timed {
+                title,
+                start_date,
+                start_time,
+                end_date,
+                end_time,
+                location,
+                notes,
+                reminders_minutes_before,
+            } => {
+                let start = EventDateTime::new(
+                    parse_local_date(&start_date, path)?,
+                    parse_local_time(&start_time, path)?,
+                );
+                let end = EventDateTime::new(
+                    parse_local_date(&end_date, path)?,
+                    parse_local_time(&end_time, path)?,
+                );
+                if start >= end {
+                    return Err(LocalEventStoreError::Parse {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "invalid override range: start {start:?} must be before end {end:?}"
+                        ),
+                    });
+                }
+
+                CreateEventDraft {
+                    title,
+                    timing: CreateEventTiming::Timed { start, end },
+                    location: empty_to_none(location),
+                    notes: empty_to_none(notes),
+                    reminders: reminders_from_minutes(reminders_minutes_before),
+                    recurrence: None,
+                }
+            }
+            Self::AllDay {
+                title,
+                date,
+                location,
+                notes,
+                reminders_minutes_before,
+            } => CreateEventDraft {
+                title,
+                timing: CreateEventTiming::AllDay {
+                    date: parse_local_date(&date, path)?,
+                },
+                location: empty_to_none(location),
+                notes: empty_to_none(notes),
+                reminders: reminders_from_minutes(reminders_minutes_before),
+                recurrence: None,
+            },
+        })
     }
 }
 
@@ -1075,6 +2086,42 @@ fn empty_to_none(value: Option<String>) -> Option<String> {
         } else {
             Some(trimmed.to_string())
         }
+    })
+}
+
+fn weekday_name(weekday: Weekday) -> String {
+    match weekday {
+        Weekday::Sunday => "sunday",
+        Weekday::Monday => "monday",
+        Weekday::Tuesday => "tuesday",
+        Weekday::Wednesday => "wednesday",
+        Weekday::Thursday => "thursday",
+        Weekday::Friday => "friday",
+        Weekday::Saturday => "saturday",
+    }
+    .to_string()
+}
+
+fn parse_weekday_record(value: &str, path: &Path) -> Result<Weekday, LocalEventStoreError> {
+    match value {
+        "sunday" => Ok(Weekday::Sunday),
+        "monday" => Ok(Weekday::Monday),
+        "tuesday" => Ok(Weekday::Tuesday),
+        "wednesday" => Ok(Weekday::Wednesday),
+        "thursday" => Ok(Weekday::Thursday),
+        "friday" => Ok(Weekday::Friday),
+        "saturday" => Ok(Weekday::Saturday),
+        _ => Err(LocalEventStoreError::Parse {
+            path: path.to_path_buf(),
+            reason: format!("invalid weekday '{value}'"),
+        }),
+    }
+}
+
+fn parse_month_record(value: u8, path: &Path) -> Result<Month, LocalEventStoreError> {
+    Month::try_from(value).map_err(|_| LocalEventStoreError::Parse {
+        path: path.to_path_buf(),
+        reason: format!("invalid month '{value}'"),
     })
 }
 
@@ -1640,6 +2687,212 @@ mod tests {
     }
 
     #[test]
+    fn daily_recurrence_expands_with_interval_and_count() {
+        let start = date_ymd(2026, Month::April, 1);
+        let event = Event::all_day("daily", "Every other day", start, source()).with_recurrence(
+            RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 2,
+                end: RecurrenceEnd::Count(3),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            },
+        );
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let range = DateRange::new(start, date_ymd(2026, Month::April, 10)).expect("valid range");
+
+        let dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .filter_map(|event| event.timing.date())
+            .collect::<Vec<_>>();
+
+        assert_eq!(dates, [date_ymd(2026, Month::April, 1), date(3), date(5)]);
+    }
+
+    #[test]
+    fn weekly_recurrence_supports_multiple_days_and_interval() {
+        let start = date_ymd(2026, Month::April, 5);
+        let event =
+            Event::all_day("weekly", "Workout", start, source()).with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Weekly,
+                interval: 2,
+                end: RecurrenceEnd::Never,
+                weekdays: vec![Weekday::Sunday, Weekday::Tuesday],
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let range = DateRange::new(start, date_ymd(2026, Month::April, 23)).expect("valid range");
+
+        let dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .filter_map(|event| event.timing.date())
+            .collect::<Vec<_>>();
+
+        assert_eq!(dates, [date(5), date(7), date(19), date(21)]);
+    }
+
+    #[test]
+    fn monthly_recurrence_skips_invalid_day_of_month_dates() {
+        let start = date_ymd(2026, Month::January, 31);
+        let event = Event::all_day("month-day", "Month end", start, source()).with_recurrence(
+            RecurrenceRule {
+                frequency: RecurrenceFrequency::Monthly,
+                interval: 1,
+                end: RecurrenceEnd::Never,
+                weekdays: Vec::new(),
+                monthly: Some(RecurrenceMonthlyRule::DayOfMonth(31)),
+                yearly: None,
+            },
+        );
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let range = DateRange::new(start, date_ymd(2026, Month::April, 1)).expect("valid range");
+
+        let dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .filter_map(|event| event.timing.date())
+            .collect::<Vec<_>>();
+
+        assert_eq!(dates, [start, date_ymd(2026, Month::March, 31)]);
+    }
+
+    #[test]
+    fn monthly_recurrence_supports_last_weekday_rules() {
+        let start = date_ymd(2026, Month::April, 30);
+        let event = Event::all_day("last-thursday", "Review", start, source()).with_recurrence(
+            RecurrenceRule {
+                frequency: RecurrenceFrequency::Monthly,
+                interval: 1,
+                end: RecurrenceEnd::Count(3),
+                weekdays: Vec::new(),
+                monthly: Some(RecurrenceMonthlyRule::WeekdayOrdinal {
+                    ordinal: RecurrenceOrdinal::Last,
+                    weekday: Weekday::Thursday,
+                }),
+                yearly: None,
+            },
+        );
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let range = DateRange::new(start, date_ymd(2026, Month::July, 1)).expect("valid range");
+
+        let dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .filter_map(|event| event.timing.date())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            dates,
+            [
+                date_ymd(2026, Month::April, 30),
+                date_ymd(2026, Month::May, 28),
+                date_ymd(2026, Month::June, 25)
+            ]
+        );
+    }
+
+    #[test]
+    fn yearly_recurrence_skips_invalid_dates_and_supports_weekday_ordinal() {
+        let leap_day = date_ymd(2024, Month::February, 29);
+        let leap =
+            Event::all_day("leap", "Leap", leap_day, source()).with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Yearly,
+                interval: 1,
+                end: RecurrenceEnd::Never,
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: Some(RecurrenceYearlyRule::Date {
+                    month: Month::February,
+                    day: 29,
+                }),
+            });
+        let thanksgiving = Event::all_day(
+            "thanksgiving",
+            "Thanksgiving",
+            date_ymd(2026, Month::November, 26),
+            source(),
+        )
+        .with_recurrence(RecurrenceRule {
+            frequency: RecurrenceFrequency::Yearly,
+            interval: 1,
+            end: RecurrenceEnd::Count(2),
+            weekdays: Vec::new(),
+            monthly: None,
+            yearly: Some(RecurrenceYearlyRule::WeekdayOrdinal {
+                month: Month::November,
+                ordinal: RecurrenceOrdinal::Number(4),
+                weekday: Weekday::Thursday,
+            }),
+        });
+        let source =
+            InMemoryAgendaSource::with_events_and_holidays(vec![leap, thanksgiving], Vec::new());
+        let range = DateRange::new(
+            date_ymd(2024, Month::January, 1),
+            date_ymd(2029, Month::January, 1),
+        )
+        .expect("valid range");
+
+        let ids_and_dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .map(|event| (event.id, event.timing.date().expect("all-day date")))
+            .collect::<Vec<_>>();
+
+        assert!(ids_and_dates.contains(&("leap#2024-02-29".to_string(), leap_day)));
+        assert!(ids_and_dates.contains(&(
+            "leap#2028-02-29".to_string(),
+            date_ymd(2028, Month::February, 29)
+        )));
+        assert!(
+            !ids_and_dates
+                .iter()
+                .any(|(_, date)| *date == date_ymd(2025, Month::February, 28))
+        );
+        assert!(ids_and_dates.contains(&(
+            "thanksgiving#2026-11-26".to_string(),
+            date_ymd(2026, Month::November, 26)
+        )));
+        assert!(ids_and_dates.contains(&(
+            "thanksgiving#2027-11-25".to_string(),
+            date_ymd(2027, Month::November, 25)
+        )));
+    }
+
+    #[test]
+    fn recurring_cross_midnight_events_intersect_each_visible_day() {
+        let start = date(23);
+        let event = Event::timed(
+            "late",
+            "Late shift",
+            at(start, 23, 0),
+            at(start.add_days(1), 1, 0),
+            source(),
+        )
+        .expect("valid recurring event")
+        .with_recurrence(RecurrenceRule {
+            frequency: RecurrenceFrequency::Daily,
+            interval: 1,
+            end: RecurrenceEnd::Count(2),
+            weekdays: Vec::new(),
+            monthly: None,
+            yearly: None,
+        });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+
+        let agenda = DayAgenda::from_source(start.add_days(1), &source);
+
+        assert_eq!(agenda.timed_events.len(), 2);
+        assert!(agenda.timed_events[0].starts_before_day);
+        assert_eq!(agenda.timed_events[0].visible_end.as_minutes(), 60);
+        assert_eq!(agenda.timed_events[1].visible_start.as_minutes(), 23 * 60);
+        assert!(agenda.timed_events[1].ends_after_day);
+    }
+
+    #[test]
     fn invalid_ranges_are_rejected() {
         let day = date(23);
 
@@ -1680,6 +2933,7 @@ mod tests {
                 location: Some("War room".to_string()),
                 notes: Some("Bring notes".to_string()),
                 reminders: vec![Reminder::minutes_before(10), Reminder::minutes_before(60)],
+                recurrence: None,
             })
             .expect("timed event saves");
         source
@@ -1689,11 +2943,12 @@ mod tests {
                 location: None,
                 notes: None,
                 reminders: vec![Reminder::minutes_before(24 * 60)],
+                recurrence: None,
             })
             .expect("all-day event saves");
 
         let body = std::fs::read_to_string(&path).expect("event file exists");
-        assert!(body.contains(r#""version": 1"#));
+        assert!(body.contains(r#""version": 2"#));
         assert!(body.contains(r#""reminders_minutes_before""#));
 
         let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
@@ -1738,6 +2993,7 @@ mod tests {
                 location: None,
                 notes: None,
                 reminders: Vec::new(),
+                recurrence: None,
             })
             .expect("event saves");
 
@@ -1750,6 +3006,7 @@ mod tests {
                     location: Some("Room 2".to_string()),
                     notes: Some("Moved".to_string()),
                     reminders: vec![Reminder::minutes_before(5)],
+                    recurrence: None,
                 },
             )
             .expect("event updates");
@@ -1771,6 +3028,192 @@ mod tests {
     }
 
     #[test]
+    fn local_event_store_loads_version_one_and_rewrites_version_two_on_save() {
+        let path = temp_events_path("version-one");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        std::fs::create_dir_all(path.parent().expect("path has parent"))
+            .expect("parent can be created");
+        std::fs::write(
+            &path,
+            r#"{
+  "version": 1,
+  "events": [
+    {
+      "id": "old",
+      "title": "Old file",
+      "date": "2026-04-23"
+    }
+  ]
+}"#,
+        )
+        .expect("file can be written");
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("version one file loads");
+
+        source
+            .update_event(
+                "old",
+                CreateEventDraft {
+                    title: "Rewritten".to_string(),
+                    timing: CreateEventTiming::AllDay { date: date(23) },
+                    location: None,
+                    notes: None,
+                    reminders: Vec::new(),
+                    recurrence: None,
+                },
+            )
+            .expect("event update saves");
+
+        let body = std::fs::read_to_string(&path).expect("event file exists");
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert!(body.contains(r#""version": 2"#));
+        assert!(body.contains("Rewritten"));
+    }
+
+    #[test]
+    fn local_event_store_saves_recurring_series_and_occurrence_overrides() {
+        let path = temp_events_path("recurring-overrides");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(3),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+        let anchor = OccurrenceAnchor::Timed {
+            start: at(day.add_days(1), 9, 0),
+        };
+
+        source
+            .update_occurrence(
+                &event.id,
+                anchor,
+                CreateEventDraft {
+                    title: "Moved standup".to_string(),
+                    timing: CreateEventTiming::Timed {
+                        start: at(day.add_days(1), 10, 0),
+                        end: at(day.add_days(1), 10, 30),
+                    },
+                    location: Some("Room 2".to_string()),
+                    notes: None,
+                    reminders: vec![Reminder::minutes_before(5)],
+                    recurrence: None,
+                },
+            )
+            .expect("occurrence override saves");
+
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day.add_days(1), &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_eq!(agenda.timed_events.len(), 1);
+        let overridden = &agenda.timed_events[0].event;
+        assert_eq!(overridden.title, "Moved standup");
+        assert_eq!(overridden.location.as_deref(), Some("Room 2"));
+        assert_eq!(
+            overridden.occurrence().map(|occurrence| occurrence.anchor),
+            Some(anchor)
+        );
+    }
+
+    #[test]
+    fn series_edits_drop_overrides_whose_anchor_no_longer_generates() {
+        let path = temp_events_path("series-edit-overrides");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(3),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+        let anchor = OccurrenceAnchor::Timed {
+            start: at(day.add_days(1), 9, 0),
+        };
+        source
+            .update_occurrence(
+                &event.id,
+                anchor,
+                CreateEventDraft {
+                    title: "Override".to_string(),
+                    timing: CreateEventTiming::Timed {
+                        start: at(day.add_days(1), 10, 0),
+                        end: at(day.add_days(1), 10, 30),
+                    },
+                    location: None,
+                    notes: None,
+                    reminders: Vec::new(),
+                    recurrence: None,
+                },
+            )
+            .expect("override saves");
+
+        let updated = source
+            .update_event(
+                &event.id,
+                CreateEventDraft {
+                    title: "Standup".to_string(),
+                    timing: CreateEventTiming::Timed {
+                        start: at(day, 9, 0),
+                        end: at(day, 9, 30),
+                    },
+                    location: None,
+                    notes: None,
+                    reminders: Vec::new(),
+                    recurrence: Some(RecurrenceRule {
+                        frequency: RecurrenceFrequency::Weekly,
+                        interval: 1,
+                        end: RecurrenceEnd::Never,
+                        weekdays: vec![day.weekday()],
+                        monthly: None,
+                        yearly: None,
+                    }),
+                },
+            )
+            .expect("series update saves");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert!(updated.occurrence_overrides.is_empty());
+    }
+
+    #[test]
     fn local_event_store_rejects_missing_and_non_local_updates() {
         let day = date(23);
         let mut source = ConfiguredAgendaSource::new(
@@ -1789,6 +3232,7 @@ mod tests {
             location: None,
             notes: None,
             reminders: Vec::new(),
+            recurrence: None,
         };
 
         assert!(matches!(
