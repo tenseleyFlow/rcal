@@ -10,7 +10,8 @@ use serde::Deserialize;
 use crate::{
     app::{KeyBindingError, KeyBindingOverrides, KeyBindings},
     providers::{
-        MicrosoftAccountConfig, MicrosoftProviderConfig, ProviderConfig, ProviderCreateTarget,
+        MICROSOFT_DEFAULT_TENANT, MICROSOFT_OFFICIAL_CLIENT_ID, MicrosoftAccountConfig,
+        MicrosoftProviderConfig, ProviderConfig, ProviderCreateTarget,
     },
 };
 
@@ -37,12 +38,10 @@ create_target = "local"
 
 [providers.microsoft]
 # Microsoft Graph provider for Outlook / Microsoft 365 calendars.
-# Current development builds require your own Microsoft Entra app client_id.
-# Use tenant = "consumers" for personal Outlook/Hotmail accounts and
-# tenant = "organizations" for work or school Microsoft 365 accounts.
+# rcal ships an official public/native Microsoft client ID.
+# Advanced users may override client_id and tenant inside an account block.
 enabled = false
 default_account = "work"
-default_calendar = "CALENDAR_ID"
 sync_past_days = 30
 sync_future_days = 365
 # Provider cache is separate from the local events file.
@@ -50,10 +49,8 @@ sync_future_days = 365
 
 [[providers.microsoft.accounts]]
 id = "work"
-client_id = "AZURE_APP_CLIENT_ID"
-tenant = "organizations"
 redirect_port = 8765
-calendars = ["CALENDAR_ID"]
+calendars = []
 
 [keybindings]
 # Normal month/day app commands. Modal/form editing keys are fixed for now.
@@ -182,6 +179,139 @@ pub fn init_config_file(path: Option<PathBuf>, force: bool) -> Result<PathBuf, C
     })?;
 
     Ok(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicrosoftSetupConfig {
+    pub account_id: String,
+    pub calendar_id: String,
+    pub calendar_name: String,
+    pub sync_past_days: i32,
+    pub sync_future_days: i32,
+    pub redirect_port: u16,
+}
+
+pub fn write_microsoft_setup_config(
+    path: Option<PathBuf>,
+    setup: &MicrosoftSetupConfig,
+) -> Result<PathBuf, ConfigError> {
+    let path = match path {
+        Some(path) => expand_user_path(path)?,
+        None => default_config_file(),
+    };
+    let existing = if path.exists() {
+        fs::read_to_string(&path).map_err(|err| ConfigError::Read {
+            path: path.clone(),
+            reason: err.to_string(),
+        })?
+    } else {
+        String::new()
+    };
+    let body = microsoft_setup_config_body(&existing, setup);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| ConfigError::Write {
+            path: parent.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+    }
+    fs::write(&path, body).map_err(|err| ConfigError::Write {
+        path: path.clone(),
+        reason: err.to_string(),
+    })?;
+    Ok(path)
+}
+
+fn microsoft_setup_config_body(existing: &str, setup: &MicrosoftSetupConfig) -> String {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        if is_toml_table_header(line) {
+            skipping = is_managed_provider_header(line);
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    body.push_str(&format!(
+        concat!(
+            "[providers]\n",
+            "create_target = \"microsoft\"\n\n",
+            "[providers.microsoft]\n",
+            "enabled = true\n",
+            "default_account = {account}\n",
+            "default_calendar = {calendar}\n",
+            "sync_past_days = {sync_past_days}\n",
+            "sync_future_days = {sync_future_days}\n\n",
+            "[[providers.microsoft.accounts]]\n",
+            "id = {account}\n",
+            "redirect_port = {redirect_port}\n",
+            "calendars = [{calendar}]\n",
+            "# Selected calendar: {calendar_name}\n"
+        ),
+        account = toml_string(&setup.account_id),
+        calendar = toml_string(&setup.calendar_id),
+        calendar_name = toml_comment_value(&setup.calendar_name),
+        redirect_port = setup.redirect_port,
+        sync_past_days = setup.sync_past_days.max(0),
+        sync_future_days = setup.sync_future_days.max(1),
+    ));
+    body
+}
+
+fn is_toml_table_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('[') && trimmed.ends_with(']')
+}
+
+fn is_managed_provider_header(line: &str) -> bool {
+    let trimmed = line.trim();
+    let name = trimmed
+        .trim_start_matches('[')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches(']')
+        .trim();
+    name == "providers" || name == "providers.microsoft" || name == "providers.microsoft.accounts"
+}
+
+fn toml_string(value: &str) -> String {
+    let mut quoted = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            value if value.is_control() => {
+                quoted.push_str(&format!("\\u{:04x}", u32::from(value)));
+            }
+            value => quoted.push(value),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+fn toml_comment_value(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
 }
 
 fn raw_config_to_user_config(raw: RawConfig, path: &Path) -> Result<UserConfig, ConfigError> {
@@ -347,8 +477,8 @@ struct RawMicrosoftProviderConfig {
 #[serde(deny_unknown_fields)]
 struct RawMicrosoftAccountConfig {
     id: String,
-    client_id: String,
-    tenant: String,
+    client_id: Option<String>,
+    tenant: Option<String>,
     redirect_port: Option<u16>,
     calendars: Option<Vec<String>>,
 }
@@ -464,8 +594,12 @@ impl RawMicrosoftAccountConfig {
     fn into_config(self) -> MicrosoftAccountConfig {
         MicrosoftAccountConfig {
             id: self.id,
-            client_id: self.client_id,
-            tenant: self.tenant,
+            client_id: self
+                .client_id
+                .unwrap_or_else(|| MICROSOFT_OFFICIAL_CLIENT_ID.to_string()),
+            tenant: self
+                .tenant
+                .unwrap_or_else(|| MICROSOFT_DEFAULT_TENANT.to_string()),
             redirect_port: self.redirect_port.unwrap_or(8765),
             calendars: self.calendars.unwrap_or_default(),
         }
@@ -653,6 +787,92 @@ calendars = ["cal-1"]
         );
         assert_eq!(config.providers.microsoft.sync_past_days, 7);
         assert_eq!(config.providers.microsoft.sync_future_days, 90);
+        assert_eq!(config.providers.microsoft.accounts[0].redirect_port, 9001);
+    }
+
+    #[test]
+    fn microsoft_provider_defaults_to_official_public_client() {
+        let path = temp_config_path("providers-official/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers.microsoft]
+enabled = true
+default_account = "work"
+default_calendar = "cal-1"
+
+[[providers.microsoft.accounts]]
+id = "work"
+calendars = ["cal-1"]
+"#,
+        )
+        .expect("config writes");
+
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        let account = &config.providers.microsoft.accounts[0];
+        assert_eq!(account.client_id, MICROSOFT_OFFICIAL_CLIENT_ID);
+        assert_eq!(account.tenant, MICROSOFT_DEFAULT_TENANT);
+    }
+
+    #[test]
+    fn microsoft_setup_config_preserves_unrelated_sections() {
+        let path = temp_config_path("providers-setup/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[paths]
+events_file = "./events.json"
+
+[providers]
+create_target = "local"
+
+[providers.microsoft]
+enabled = false
+
+[[providers.microsoft.accounts]]
+id = "old"
+calendars = []
+
+[keybindings]
+quit = ["q"]
+"#,
+        )
+        .expect("config writes");
+
+        write_microsoft_setup_config(
+            Some(path.clone()),
+            &MicrosoftSetupConfig {
+                account_id: "work".to_string(),
+                calendar_id: "cal-1".to_string(),
+                calendar_name: "Calendar\nInjected".to_string(),
+                sync_past_days: 7,
+                sync_future_days: 90,
+                redirect_port: 9001,
+            },
+        )
+        .expect("setup config writes");
+        let body = fs::read_to_string(&path).expect("config reads");
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        assert!(body.contains("[paths]"));
+        assert!(body.contains("[keybindings]"));
+        assert!(body.contains("# Selected calendar: Calendar Injected"));
+        assert!(!body.contains("id = \"old\""));
+        assert_eq!(
+            config.providers.create_target,
+            ProviderCreateTarget::Microsoft
+        );
+        assert_eq!(
+            config.providers.microsoft.default_calendar.as_deref(),
+            Some("cal-1")
+        );
         assert_eq!(config.providers.microsoft.accounts[0].redirect_port, 9001);
     }
 

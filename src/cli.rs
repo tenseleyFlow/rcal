@@ -23,13 +23,15 @@ use crate::{
     },
     calendar::CalendarDate,
     config::{
-        ConfigError, ConfigHolidaySource, UserConfig, init_config_file, load_discovered_config,
-        load_explicit_config,
+        ConfigError, ConfigHolidaySource, MicrosoftSetupConfig, UserConfig, default_config_file,
+        init_config_file, load_discovered_config, load_explicit_config,
+        write_microsoft_setup_config,
     },
     providers::{
-        KeyringMicrosoftTokenStore, MicrosoftProviderConfig, MicrosoftProviderRuntime,
-        ProviderConfig, ProviderError, ReqwestMicrosoftHttpClient, inspect_token, list_calendars,
-        login_device_code_or_browser, logout,
+        KeyringMicrosoftTokenStore, MicrosoftAccountConfig, MicrosoftCalendarInfo,
+        MicrosoftProviderConfig, MicrosoftProviderRuntime, ProviderConfig, ProviderError,
+        ReqwestMicrosoftHttpClient, inspect_token, list_calendars, login_device_code_or_browser,
+        logout,
     },
     reminders::{
         ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file,
@@ -56,6 +58,7 @@ const HELP: &str = concat!(
     "  rcal providers microsoft auth logout --account ID\n",
     "  rcal providers microsoft auth inspect --account ID\n",
     "  rcal providers microsoft calendars list --account ID\n",
+    "  rcal providers microsoft setup --account ID [--browser] [--calendar ID]\n",
     "  rcal providers microsoft sync [--account ID]\n",
     "  rcal providers microsoft status\n\n",
     "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
@@ -147,6 +150,13 @@ pub enum ProviderCliAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MicrosoftCliAction {
+    Setup {
+        account: String,
+        browser: bool,
+        calendar: Option<String>,
+        config_path: PathBuf,
+        config: MicrosoftProviderConfig,
+    },
     AuthLogin {
         account: String,
         browser: bool,
@@ -219,6 +229,8 @@ pub enum CliError {
     UnknownProviderCommand(String),
     MissingProviderAccount,
     DuplicateProviderAccount,
+    MissingProviderCalendar,
+    DuplicateProviderCalendar,
     MissingReminderCommand,
     UnknownReminderCommand(String),
     DuplicateStateFile,
@@ -278,6 +290,10 @@ impl fmt::Display for CliError {
             }
             Self::MissingProviderAccount => write!(f, "--account requires a Microsoft account id"),
             Self::DuplicateProviderAccount => write!(f, "--account may only be provided once"),
+            Self::MissingProviderCalendar => {
+                write!(f, "--calendar requires a Microsoft calendar id")
+            }
+            Self::DuplicateProviderCalendar => write!(f, "--calendar may only be provided once"),
             Self::MissingReminderCommand => write!(
                 f,
                 "reminders requires one of: run, install, uninstall, status, test"
@@ -427,10 +443,18 @@ where
         return parse_config_args(args.into_iter().skip(1), config_selection.path);
     }
 
+    let is_setup = is_microsoft_setup_command(&args);
     let config = match &config_selection {
         ConfigSelection {
             no_config: true, ..
         } => UserConfig::empty(),
+        ConfigSelection {
+            path: Some(path), ..
+        } if is_setup => match load_explicit_config(path.clone()) {
+            Ok(config) => config,
+            Err(ConfigError::Missing { .. }) => UserConfig::empty(),
+            Err(err) => return Err(err.into()),
+        },
         ConfigSelection {
             path: Some(path), ..
         } => load_explicit_config(path.clone())?,
@@ -438,6 +462,14 @@ where
     };
 
     parse_args_with_config(args, today, config, config_selection.path)
+}
+
+fn is_microsoft_setup_command(args: &[OsString]) -> bool {
+    matches!(
+        (args.first(), args.get(1), args.get(2)),
+        (Some(first), Some(second), Some(third))
+            if first == "providers" && second == "microsoft" && third == "setup"
+    )
 }
 
 fn parse_args_with_config<I>(
@@ -465,7 +497,10 @@ where
     if let Some(first) = args.first()
         && first == "providers"
     {
-        return parse_provider_args(args.into_iter().skip(1), &user_config);
+        let config_path = explicit_config_path
+            .or_else(|| user_config.path.clone())
+            .unwrap_or_else(default_config_file);
+        return parse_provider_args(args.into_iter().skip(1), &user_config, config_path);
     }
 
     parse_calendar_args(args, today, user_config)
@@ -768,7 +803,11 @@ where
     Ok(CliAction::Config(ConfigCliAction::Init { path, force }))
 }
 
-fn parse_provider_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
+fn parse_provider_args<I>(
+    args: I,
+    user_config: &UserConfig,
+    config_path: PathBuf,
+) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -779,7 +818,9 @@ where
     };
 
     match command {
-        "microsoft" => parse_microsoft_provider_args(args, &user_config.providers.microsoft),
+        "microsoft" => {
+            parse_microsoft_provider_args(args, &user_config.providers.microsoft, config_path)
+        }
         "--help" | "-h" => Ok(CliAction::Help),
         _ => Err(CliError::UnknownProviderCommand(command.to_string())),
     }
@@ -788,6 +829,7 @@ where
 fn parse_microsoft_provider_args<I>(
     args: I,
     config: &MicrosoftProviderConfig,
+    config_path: PathBuf,
 ) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -801,6 +843,7 @@ where
     match command {
         "auth" => parse_microsoft_auth_args(args, config),
         "calendars" => parse_microsoft_calendars_args(args, config),
+        "setup" => parse_microsoft_setup_args(args, config, config_path),
         "sync" => parse_microsoft_sync_args(args, config),
         "status" => no_extra_provider_args(
             args,
@@ -855,6 +898,56 @@ where
             "microsoft auth {command}"
         ))),
     }
+}
+
+fn parse_microsoft_setup_args<I>(
+    args: I,
+    config: &MicrosoftProviderConfig,
+    config_path: PathBuf,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut browser = false;
+    let mut account = None;
+    let mut calendar = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--browser" {
+            browser = true;
+            continue;
+        }
+        if arg == "--calendar" {
+            if calendar.is_some() {
+                return Err(CliError::DuplicateProviderCalendar);
+            }
+            calendar = Some(display_arg(
+                &args.next().ok_or(CliError::MissingProviderCalendar)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--calendar="))
+        {
+            if calendar.is_some() {
+                return Err(CliError::DuplicateProviderCalendar);
+            }
+            calendar = Some(value.to_string());
+            continue;
+        }
+        parse_account_arg(arg, &mut args, &mut account)?;
+    }
+
+    Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+        MicrosoftCliAction::Setup {
+            account: account.ok_or(CliError::MissingProviderAccount)?,
+            browser,
+            calendar,
+            config_path,
+            config: config.clone(),
+        },
+    )))
 }
 
 fn parse_microsoft_calendars_args<I>(
@@ -1236,6 +1329,48 @@ fn run_microsoft_action(
     let http = ReqwestMicrosoftHttpClient;
     let token_store = KeyringMicrosoftTokenStore;
     let result = match action {
+        MicrosoftCliAction::Setup {
+            account,
+            browser,
+            calendar,
+            config_path,
+            config,
+        } => (|| {
+            let account_config = MicrosoftAccountConfig::new_official(account.clone());
+            login_device_code_or_browser(&account_config, &http, &token_store, stdout, browser)?;
+            let calendars = list_calendars(&account_config, &http, &token_store)?;
+            let calendar = choose_setup_calendar(&calendars, calendar.as_deref())?;
+            let setup = MicrosoftSetupConfig {
+                account_id: account.clone(),
+                calendar_id: calendar.id.clone(),
+                calendar_name: calendar.name.clone(),
+                sync_past_days: config.sync_past_days,
+                sync_future_days: config.sync_future_days,
+                redirect_port: account_config.redirect_port,
+            };
+            let written = write_microsoft_setup_config(Some(config_path), &setup)
+                .map_err(|err| ProviderError::Config(err.to_string()))?;
+            let _ = writeln!(
+                stdout,
+                "selected Microsoft calendar '{}' ({})",
+                calendar.name, calendar.id
+            );
+            let _ = writeln!(stdout, "wrote config {}", written.display());
+            let setup_config = microsoft_setup_provider_config(config, account_config, calendar);
+            let mut runtime = MicrosoftProviderRuntime::load(setup_config)?;
+            let summary = runtime.sync(
+                Some(&account),
+                &http,
+                &token_store,
+                CalendarDate::from(default_start_date()),
+            )?;
+            let _ = writeln!(
+                stdout,
+                "synced accounts={} calendars={} events={}",
+                summary.accounts, summary.calendars, summary.events
+            );
+            Ok(())
+        })(),
         MicrosoftCliAction::AuthLogin {
             account,
             browser,
@@ -1389,6 +1524,62 @@ fn run_microsoft_action(
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => provider_error_exit(stderr, err),
     }
+}
+
+fn choose_setup_calendar<'a>(
+    calendars: &'a [MicrosoftCalendarInfo],
+    requested: Option<&str>,
+) -> Result<&'a MicrosoftCalendarInfo, ProviderError> {
+    if let Some(requested) = requested {
+        let calendar = calendars
+            .iter()
+            .find(|calendar| calendar.id == requested)
+            .ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "Microsoft calendar '{requested}' was not found for this account"
+                ))
+            })?;
+        if !calendar.can_edit {
+            return Err(ProviderError::Config(format!(
+                "Microsoft calendar '{}' is read-only; choose an editable calendar",
+                calendar.name
+            )));
+        }
+        return Ok(calendar);
+    }
+
+    calendars
+        .iter()
+        .find(|calendar| calendar.can_edit && calendar.is_default)
+        .or_else(|| calendars.iter().find(|calendar| calendar.can_edit))
+        .ok_or_else(|| {
+            ProviderError::Config(
+                "no editable Microsoft calendars were found for this account".to_string(),
+            )
+        })
+}
+
+fn microsoft_setup_provider_config(
+    mut config: MicrosoftProviderConfig,
+    mut account: MicrosoftAccountConfig,
+    calendar: &MicrosoftCalendarInfo,
+) -> MicrosoftProviderConfig {
+    config.enabled = true;
+    config.default_account = Some(account.id.clone());
+    config.default_calendar = Some(calendar.id.clone());
+    account.calendars = vec![calendar.id.clone()];
+
+    if let Some(existing) = config
+        .accounts
+        .iter_mut()
+        .find(|existing| existing.id == account.id)
+    {
+        *existing = account;
+    } else {
+        config.accounts.push(account);
+    }
+
+    config
 }
 
 fn run_reminder_action(
@@ -1815,11 +2006,14 @@ fn provider_error_exit(stderr: &mut impl Write, err: ProviderError) -> std::proc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs};
+    use std::{
+        env, fs,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     use crate::app::{KeyBindingOverrides, KeyCommand};
     use crate::calendar::CalendarMonth;
-    use crate::providers::{MicrosoftAccountConfig, ProviderCreateTarget};
+    use crate::providers::{MicrosoftAccountConfig, MicrosoftCalendarInfo, ProviderCreateTarget};
     use time::Month;
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
@@ -1830,9 +2024,12 @@ mod tests {
         OsString::from(value)
     }
 
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
     fn temp_path(name: &str) -> PathBuf {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         env::temp_dir()
-            .join(format!("rcal-cli-test-{}", std::process::id()))
+            .join(format!("rcal-cli-test-{}-{counter}", std::process::id()))
             .join(name)
     }
 
@@ -2373,6 +2570,149 @@ create_event = ["n"]
                 },
             ))
         );
+    }
+
+    #[test]
+    fn microsoft_setup_command_parses_with_calendar_and_config_path() {
+        let today = date(2026, Month::April, 23);
+        let user_config = config_with_microsoft_provider();
+        let microsoft = user_config.providers.microsoft.clone();
+        let config_path = PathBuf::from("/tmp/rcal/setup-config.toml");
+
+        let action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("microsoft"),
+                arg("setup"),
+                arg("--account"),
+                arg("work"),
+                arg("--browser"),
+                arg("--calendar=cal-2"),
+            ],
+            today.into(),
+            user_config,
+            Some(config_path.clone()),
+        )
+        .expect("setup parses");
+
+        assert_eq!(
+            action,
+            CliAction::Providers(ProviderCliAction::Microsoft(MicrosoftCliAction::Setup {
+                account: "work".to_string(),
+                browser: true,
+                calendar: Some("cal-2".to_string()),
+                config_path,
+                config: microsoft,
+            }))
+        );
+    }
+
+    #[test]
+    fn microsoft_setup_allows_missing_explicit_config_file() {
+        let today = date(2026, Month::April, 23);
+        let path = temp_path("missing-setup/config.toml");
+        let root = path
+            .parent()
+            .expect("config dir")
+            .parent()
+            .expect("test root")
+            .to_path_buf();
+        let _ = fs::remove_dir_all(&root);
+
+        let action = parse_runtime_args(
+            [
+                arg("--config"),
+                path.as_os_str().to_os_string(),
+                arg("providers"),
+                arg("microsoft"),
+                arg("setup"),
+                arg("--account"),
+                arg("work"),
+            ],
+            today.into(),
+        )
+        .expect("setup parses without a preexisting config");
+
+        assert_eq!(
+            action,
+            CliAction::Providers(ProviderCliAction::Microsoft(MicrosoftCliAction::Setup {
+                account: "work".to_string(),
+                browser: false,
+                calendar: None,
+                config_path: path,
+                config: MicrosoftProviderConfig::default(),
+            }))
+        );
+    }
+
+    #[test]
+    fn microsoft_setup_calendar_selection_prefers_editable_default() {
+        let calendars = vec![
+            MicrosoftCalendarInfo {
+                id: "readonly".to_string(),
+                name: "Holidays".to_string(),
+                can_edit: false,
+                is_default: true,
+            },
+            MicrosoftCalendarInfo {
+                id: "cal".to_string(),
+                name: "Calendar".to_string(),
+                can_edit: true,
+                is_default: true,
+            },
+            MicrosoftCalendarInfo {
+                id: "other".to_string(),
+                name: "Other".to_string(),
+                can_edit: true,
+                is_default: false,
+            },
+        ];
+
+        let calendar =
+            choose_setup_calendar(&calendars, None).expect("default editable calendar selected");
+
+        assert_eq!(calendar.id, "cal");
+    }
+
+    #[test]
+    fn microsoft_setup_calendar_selection_uses_first_editable_fallback() {
+        let calendars = vec![
+            MicrosoftCalendarInfo {
+                id: "readonly".to_string(),
+                name: "Holidays".to_string(),
+                can_edit: false,
+                is_default: true,
+            },
+            MicrosoftCalendarInfo {
+                id: "work".to_string(),
+                name: "Work".to_string(),
+                can_edit: true,
+                is_default: false,
+            },
+        ];
+
+        let calendar =
+            choose_setup_calendar(&calendars, None).expect("first editable calendar selected");
+
+        assert_eq!(calendar.id, "work");
+    }
+
+    #[test]
+    fn microsoft_setup_calendar_selection_rejects_missing_or_readonly_requested_calendar() {
+        let calendars = vec![MicrosoftCalendarInfo {
+            id: "readonly".to_string(),
+            name: "Holidays".to_string(),
+            can_edit: false,
+            is_default: false,
+        }];
+
+        let missing =
+            choose_setup_calendar(&calendars, Some("missing")).expect_err("missing calendar fails");
+        let readonly = choose_setup_calendar(&calendars, Some("readonly"))
+            .expect_err("readonly calendar fails");
+
+        assert!(missing.to_string().contains("was not found"));
+        assert!(readonly.to_string().contains("read-only"));
     }
 
     #[test]

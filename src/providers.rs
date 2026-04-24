@@ -32,6 +32,8 @@ const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
 const LOGIN_BASE_URL: &str = "https://login.microsoftonline.com";
 const MICROSOFT_SCOPES: &str = "offline_access User.Read Calendars.ReadWrite";
 const KEYRING_SERVICE: &str = "rcal.microsoft";
+pub const MICROSOFT_OFFICIAL_CLIENT_ID: &str = "9a49eaac-422b-4192-a65d-82dc8f43c11d";
+pub const MICROSOFT_DEFAULT_TENANT: &str = "common";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
@@ -184,6 +186,16 @@ pub struct MicrosoftAccountConfig {
 }
 
 impl MicrosoftAccountConfig {
+    pub fn new_official(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            client_id: MICROSOFT_OFFICIAL_CLIENT_ID.to_string(),
+            tenant: MICROSOFT_DEFAULT_TENANT.to_string(),
+            redirect_port: 8765,
+            calendars: Vec::new(),
+        }
+    }
+
     pub fn token_url(&self) -> String {
         format!("{LOGIN_BASE_URL}/{}/oauth2/v2.0/token", self.tenant)
     }

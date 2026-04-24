@@ -25,7 +25,9 @@ rcal [--config PATH|--no-config] [--date YYYY-MM-DD] [--events-file PATH] [--hol
 rcal config init [--path PATH] [--force]
 rcal providers microsoft auth login --account ID [--browser]
 rcal providers microsoft auth logout --account ID
+rcal providers microsoft auth inspect --account ID
 rcal providers microsoft calendars list --account ID
+rcal providers microsoft setup --account ID [--browser] [--calendar ID]
 rcal providers microsoft sync [--account ID]
 rcal providers microsoft status
 rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
@@ -110,42 +112,35 @@ Microsoft Graph is the first remote provider. It is cache-first: the TUI reads
 the local Microsoft cache instantly, and you refresh remote data explicitly:
 
 ```sh
-rcal providers microsoft auth login --account work
-rcal providers microsoft calendars list --account work
-rcal providers microsoft sync --account work
+rcal providers microsoft setup --account work --browser
+rcal
 ```
 
-For the current development release, users provide their own Microsoft Entra
-app registration `client_id` in `config.toml`. A future production release can
-ship an rcal-owned public/native client ID so end users do not need to create an
-Azure app. No client secret is used or stored; rcal stores user tokens in the OS
-keychain.
+The setup command uses rcal's official public/native Microsoft client ID, opens
+the Microsoft login flow, selects your default editable calendar, writes
+`~/.config/rcal/config.toml`, performs the first sync, and sets new event
+creation to Microsoft by default. No client secret is used or stored; rcal
+stores user tokens in the OS keychain.
+
+Use `--calendar CALENDAR_ID` if you already know which editable calendar to use.
+You can list calendars later with:
+
+```sh
+rcal providers microsoft calendars list --account work
+```
 
 ### Microsoft Account Setup
 
-Create a config file:
+The normal setup flow is:
 
 ```sh
-rcal config init
+rcal providers microsoft setup --account work --browser
+rcal providers microsoft status
+rcal
 ```
 
-Register a temporary local test app in the Microsoft Entra admin center:
-
-- Name: `rcal local test` or similar.
-- Supported account type:
-  - Personal Outlook/Hotmail/Live accounts: **Personal Microsoft accounts
-    only**.
-  - Work or school Microsoft 365 accounts: **Accounts in any organizational
-    directory**.
-- Redirect URI: platform **Mobile and desktop applications**, value
-  `http://localhost:8765/callback`.
-- API permissions: Microsoft Graph delegated `User.Read` and
-  `Calendars.ReadWrite`.
-- If Azure refuses the account type change with
-  `api.requestedAccessTokenVersion`, set the app manifest's
-  `requestedAccessTokenVersion` or `accessTokenAcceptedVersion` to `2`.
-
-Then edit `~/.config/rcal/config.toml`:
+For advanced testing, you may still override the Microsoft app registration in
+`config.toml`. Omit `client_id` and `tenant` to use rcal's official public app:
 
 ```toml
 [providers]
@@ -160,21 +155,16 @@ sync_future_days = 365
 
 [[providers.microsoft.accounts]]
 id = "work"
-client_id = "AZURE_APP_CLIENT_ID"
-tenant = "consumers"      # personal accounts
-# tenant = "organizations" # work/school accounts
+# client_id = "AZURE_APP_CLIENT_ID"
+# tenant = "common"
 redirect_port = 8765
 calendars = ["CALENDAR_ID"]
 ```
 
-Authenticate, list calendars, then copy the editable calendar ID into both
-`default_calendar` and `calendars`:
+Manual sync remains available:
 
 ```sh
-rcal providers microsoft auth login --account work --browser
-rcal providers microsoft calendars list --account work
 rcal providers microsoft sync --account work
-rcal
 ```
 
 Use `rcal providers microsoft auth inspect --account work` to inspect safe
