@@ -25,6 +25,7 @@ pub struct AppState {
     view_mode: ViewMode,
     create_form: Option<CreateEventForm>,
     recurrence_choice: Option<RecurrenceEditChoice>,
+    delete_choice: Option<EventDeleteChoice>,
     selected_day_event_id: Option<String>,
     should_quit: bool,
 }
@@ -41,6 +42,7 @@ impl AppState {
             view_mode: ViewMode::Month,
             create_form: None,
             recurrence_choice: None,
+            delete_choice: None,
             selected_day_event_id: None,
             should_quit: false,
         }
@@ -70,6 +72,10 @@ impl AppState {
         self.recurrence_choice.as_ref()
     }
 
+    pub const fn delete_choice(&self) -> Option<&EventDeleteChoice> {
+        self.delete_choice.as_ref()
+    }
+
     pub fn selected_day_event_id(&self) -> Option<&str> {
         self.selected_day_event_id.as_deref()
     }
@@ -82,12 +88,26 @@ impl AppState {
         self.recurrence_choice.is_some()
     }
 
+    pub const fn is_confirming_delete(&self) -> bool {
+        self.delete_choice.is_some()
+    }
+
     pub fn close_create_form(&mut self) {
         self.create_form = None;
     }
 
     pub fn close_recurrence_choice(&mut self) {
         self.recurrence_choice = None;
+    }
+
+    pub fn close_delete_choice(&mut self) {
+        self.delete_choice = None;
+    }
+
+    pub fn set_delete_error(&mut self, message: impl Into<String>) {
+        if let Some(choice) = &mut self.delete_choice {
+            choice.error = Some(message.into());
+        }
     }
 
     pub fn set_create_form_error(&mut self, message: impl Into<String>) {
@@ -161,6 +181,54 @@ impl AppState {
         }
     }
 
+    pub fn handle_delete_choice_key(&mut self, key: KeyEvent) -> EventDeleteInputResult {
+        if key.kind == KeyEventKind::Release {
+            return EventDeleteInputResult::Continue;
+        }
+
+        let Some(choice) = &mut self.delete_choice else {
+            return EventDeleteInputResult::Continue;
+        };
+
+        match key.code {
+            KeyCode::Esc => EventDeleteInputResult::Cancel,
+            KeyCode::Up => {
+                choice.select_previous();
+                EventDeleteInputResult::Continue
+            }
+            KeyCode::Down => {
+                choice.select_next();
+                EventDeleteInputResult::Continue
+            }
+            KeyCode::Enter => match choice.selected_action() {
+                EventDeleteChoiceAction::Cancel => EventDeleteInputResult::Cancel,
+                EventDeleteChoiceAction::DeleteEvent => {
+                    EventDeleteInputResult::Submit(EventDeleteSubmission::Event {
+                        event_id: choice.event_id().to_string(),
+                    })
+                }
+                EventDeleteChoiceAction::DeleteThisOccurrence => {
+                    let EventDeleteTarget::Occurrence { series_id, anchor } = &choice.target else {
+                        return EventDeleteInputResult::Continue;
+                    };
+                    EventDeleteInputResult::Submit(EventDeleteSubmission::Occurrence {
+                        series_id: series_id.clone(),
+                        anchor: *anchor,
+                    })
+                }
+                EventDeleteChoiceAction::DeleteSeries => {
+                    let EventDeleteTarget::Occurrence { series_id, .. } = &choice.target else {
+                        return EventDeleteInputResult::Continue;
+                    };
+                    EventDeleteInputResult::Submit(EventDeleteSubmission::Series {
+                        series_id: series_id.clone(),
+                    })
+                }
+            },
+            _ => EventDeleteInputResult::Continue,
+        }
+    }
+
     pub fn calendar_month(&self) -> CalendarMonth {
         CalendarMonth::from_dates(self.selected_date, self.today)
     }
@@ -215,14 +283,27 @@ impl AppState {
                 self.view_mode = ViewMode::Month;
                 self.selected_day_event_id = None;
                 self.recurrence_choice = None;
+                self.delete_choice = None;
             }
             AppAction::OpenCreate => {
-                if self.create_form.is_none() && self.recurrence_choice.is_none() {
+                if self.create_form.is_none()
+                    && self.recurrence_choice.is_none()
+                    && self.delete_choice.is_none()
+                {
                     let context = match self.view_mode {
                         ViewMode::Month => CreateEventContext::EditableDate,
                         ViewMode::Day => CreateEventContext::FixedDate,
                     };
                     self.create_form = Some(CreateEventForm::new(self.selected_date, context));
+                }
+            }
+            AppAction::OpenDelete if self.view_mode == ViewMode::Day => {
+                if self.create_form.is_none()
+                    && self.recurrence_choice.is_none()
+                    && self.delete_choice.is_none()
+                    && let Some(source) = source
+                {
+                    self.open_selected_event_for_delete(source);
                 }
             }
             AppAction::MoveDays(days) if self.view_mode == ViewMode::Month => {
@@ -264,7 +345,8 @@ impl AppState {
             AppAction::MoveDays(_)
             | AppAction::SelectDate(_)
             | AppAction::JumpToDay(_)
-            | AppAction::JumpToWeekday(_) => {}
+            | AppAction::JumpToWeekday(_)
+            | AppAction::OpenDelete => {}
         }
     }
 
@@ -309,6 +391,19 @@ impl AppState {
         }
     }
 
+    fn open_selected_event_for_delete(&mut self, source: &dyn AgendaSource) {
+        self.reconcile_day_event_selection(source);
+        let Some(selected_id) = self.selected_day_event_id.as_deref() else {
+            return;
+        };
+        if let Some(event) = selectable_day_events(self.selected_date, source)
+            .into_iter()
+            .find(|event| event.id == selected_id)
+        {
+            self.delete_choice = Some(EventDeleteChoice::for_event(&event));
+        }
+    }
+
     fn weekday_in_selected_week(&self, weekday: Weekday) -> Option<CalendarDate> {
         let month = self.calendar_month();
         let selected = month.selected_cell()?;
@@ -332,6 +427,7 @@ pub enum AppAction {
     OpenDay,
     CloseDay,
     OpenCreate,
+    OpenDelete,
     Quit,
 }
 
@@ -430,6 +526,157 @@ impl RecurrenceEditChoiceAction {
 pub enum RecurrenceChoiceInputResult {
     Continue,
     Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventDeleteChoice {
+    target: EventDeleteTarget,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl EventDeleteChoice {
+    fn for_event(event: &Event) -> Self {
+        let target = if let Some(occurrence) = event.occurrence() {
+            EventDeleteTarget::Occurrence {
+                series_id: occurrence.series_id.clone(),
+                anchor: occurrence.anchor,
+            }
+        } else {
+            EventDeleteTarget::Event {
+                event_id: event.id.clone(),
+            }
+        };
+
+        Self {
+            target,
+            selected: 0,
+            error: None,
+        }
+    }
+
+    pub fn heading(&self) -> &'static str {
+        "Delete"
+    }
+
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    pub fn rows(&self) -> Vec<EventDeleteChoiceRow> {
+        self.actions()
+            .into_iter()
+            .enumerate()
+            .map(|(index, action)| EventDeleteChoiceRow {
+                label: action.label(),
+                selected: index == self.selected,
+                dangerous: action.is_dangerous(),
+            })
+            .collect()
+    }
+
+    fn actions(&self) -> Vec<EventDeleteChoiceAction> {
+        match self.target {
+            EventDeleteTarget::Event { .. } => vec![
+                EventDeleteChoiceAction::DeleteEvent,
+                EventDeleteChoiceAction::Cancel,
+            ],
+            EventDeleteTarget::Occurrence { .. } => vec![
+                EventDeleteChoiceAction::DeleteThisOccurrence,
+                EventDeleteChoiceAction::DeleteSeries,
+                EventDeleteChoiceAction::Cancel,
+            ],
+        }
+    }
+
+    fn selected_action(&self) -> EventDeleteChoiceAction {
+        self.actions()[self.selected]
+    }
+
+    fn select_next(&mut self) {
+        let len = self.actions().len();
+        self.selected = (self.selected + 1) % len;
+        self.error = None;
+    }
+
+    fn select_previous(&mut self) {
+        let len = self.actions().len();
+        self.selected = if self.selected == 0 {
+            len - 1
+        } else {
+            self.selected - 1
+        };
+        self.error = None;
+    }
+
+    fn event_id(&self) -> &str {
+        match &self.target {
+            EventDeleteTarget::Event { event_id } => event_id,
+            EventDeleteTarget::Occurrence { series_id, .. } => series_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EventDeleteTarget {
+    Event {
+        event_id: String,
+    },
+    Occurrence {
+        series_id: String,
+        anchor: OccurrenceAnchor,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDeleteChoiceRow {
+    pub label: &'static str,
+    pub selected: bool,
+    pub dangerous: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventDeleteChoiceAction {
+    DeleteEvent,
+    DeleteThisOccurrence,
+    DeleteSeries,
+    Cancel,
+}
+
+impl EventDeleteChoiceAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DeleteEvent => "Delete event",
+            Self::DeleteThisOccurrence => "Delete this occurrence",
+            Self::DeleteSeries => "Delete series",
+            Self::Cancel => "Cancel",
+        }
+    }
+
+    const fn is_dangerous(self) -> bool {
+        !matches!(self, Self::Cancel)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDeleteSubmission {
+    Event {
+        event_id: String,
+    },
+    Occurrence {
+        series_id: String,
+        anchor: OccurrenceAnchor,
+    },
+    Series {
+        series_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventDeleteInputResult {
+    Continue,
+    Cancel,
+    Submit(EventDeleteSubmission),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1431,6 +1678,11 @@ impl KeyboardInput {
             return AppAction::OpenCreate;
         }
 
+        if value.eq_ignore_ascii_case(&'d') {
+            self.clear();
+            return AppAction::OpenDelete;
+        }
+
         if value.is_ascii_digit() {
             return self.translate_digit(value);
         }
@@ -2002,6 +2254,110 @@ mod tests {
                 event_id: "series".to_string()
             }
         );
+    }
+
+    #[test]
+    fn day_view_d_opens_delete_choice_for_selected_local_event() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![local_timed_event(
+                "local-time",
+                "Standup",
+                at(day, 9, 0),
+                at(day, 9, 30),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), char_key('d')],
+        );
+
+        let choice = app.delete_choice().expect("delete modal opens");
+        assert_eq!(choice.rows()[0].label, "Delete event");
+        assert_eq!(
+            app.handle_delete_choice_key(key(KeyCode::Enter)),
+            EventDeleteInputResult::Submit(EventDeleteSubmission::Event {
+                event_id: "local-time".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn day_view_d_opens_recurring_delete_choices() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("series", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Daily,
+                interval: 1,
+                end: RecurrenceEnd::Count(2),
+                weekdays: Vec::new(),
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), char_key('d')],
+        );
+
+        let choice = app.delete_choice().expect("delete modal opens");
+        let rows = choice.rows();
+        assert_eq!(rows[0].label, "Delete this occurrence");
+        assert_eq!(rows[1].label, "Delete series");
+        assert_eq!(
+            app.handle_delete_choice_key(key(KeyCode::Enter)),
+            EventDeleteInputResult::Submit(EventDeleteSubmission::Occurrence {
+                series_id: "series".to_string(),
+                anchor: OccurrenceAnchor::Timed {
+                    start: at(day, 9, 0)
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn delete_choice_up_and_down_do_not_change_day_event_selection() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![local_timed_event(
+                "local-time",
+                "Standup",
+                at(day, 9, 0),
+                at(day, 9, 30),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), char_key('d')],
+        );
+
+        assert_eq!(
+            app.handle_delete_choice_key(key(KeyCode::Down)),
+            EventDeleteInputResult::Continue
+        );
+        assert_eq!(
+            app.handle_delete_choice_key(key(KeyCode::Up)),
+            EventDeleteInputResult::Continue
+        );
+
+        assert_eq!(app.selected_day_event_id(), Some("local-time"));
+        assert!(app.delete_choice().expect("choice stays open").rows()[0].selected);
     }
 
     #[test]

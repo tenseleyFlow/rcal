@@ -12,7 +12,10 @@ use crate::{
     agenda::{
         AgendaSource, DayAgenda, DayMinute, EmptyAgendaSource, Event, EventTiming, TimedAgendaEvent,
     },
-    app::{AppState, CreateEventForm, CreateEventFormRowKind, RecurrenceEditChoice, ViewMode},
+    app::{
+        AppState, CreateEventForm, CreateEventFormRowKind, EventDeleteChoice, RecurrenceEditChoice,
+        ViewMode,
+    },
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
     },
@@ -95,6 +98,9 @@ impl Widget for AppView<'_> {
         }
         if let Some(choice) = self.app.recurrence_choice() {
             render_recurrence_choice_modal(choice, area, buf, CreateModalStyles::new());
+        }
+        if let Some(choice) = self.app.delete_choice() {
+            render_delete_choice_modal(choice, area, buf, CreateModalStyles::new());
         }
     }
 }
@@ -954,6 +960,80 @@ fn render_recurrence_choice_modal(
             },
         );
         y = y.saturating_add(1);
+    }
+
+    write_centered(
+        buf,
+        content.bottom().saturating_sub(1),
+        content.x,
+        content.width,
+        "Enter select | Esc cancel",
+        styles.footer,
+    );
+}
+
+fn render_delete_choice_modal(
+    choice: &EventDeleteChoice,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: CreateModalStyles,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let modal = recurrence_choice_modal_area(area);
+    fill_rect(buf, modal, styles.panel);
+    draw_border(buf, modal, styles.border, BorderCharacters::normal());
+
+    let content = inset_rect(modal);
+    if content.width == 0 || content.height == 0 {
+        return;
+    }
+
+    write_centered(
+        buf,
+        content.y,
+        content.x,
+        content.width,
+        choice.heading(),
+        styles.error,
+    );
+
+    let mut y = content.y.saturating_add(2);
+    for row in choice.rows() {
+        if y >= content.bottom().saturating_sub(2) {
+            break;
+        }
+        let marker = if row.selected { ">" } else { " " };
+        let row_style = if row.selected && row.dangerous {
+            styles.error
+        } else if row.selected {
+            styles.title
+        } else {
+            styles.value
+        };
+        write_padded_left(buf, y, content.x, 1, marker, styles.label);
+        write_left(
+            buf,
+            y,
+            content.x.saturating_add(2),
+            content.width.saturating_sub(2),
+            row.label,
+            row_style,
+        );
+        y = y.saturating_add(1);
+    }
+
+    if let Some(error) = choice.error() {
+        write_left(
+            buf,
+            content.bottom().saturating_sub(2),
+            content.x,
+            content.width,
+            error,
+            styles.error,
+        );
     }
 
     write_centered(
@@ -2248,6 +2328,29 @@ mod tests {
 
         assert!(rendered.contains("Edit this occurrence"));
         assert!(rendered.contains("Edit series"));
+        assert!(rendered.contains("Enter select"));
+    }
+
+    #[test]
+    fn delete_choice_modal_renders_over_day_view() {
+        let day = date(2026, Month::April, 23);
+        let source = agenda_source(
+            vec![local_timed_event(
+                "planning",
+                "Planning",
+                at(day, 9, 0),
+                at(day, 10, 0),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        app.apply_with_agenda_source(AppAction::OpenDelete, &source);
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Delete"));
+        assert!(rendered.contains("Delete event"));
         assert!(rendered.contains("Enter select"));
     }
 

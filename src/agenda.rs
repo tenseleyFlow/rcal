@@ -264,6 +264,7 @@ pub struct Event {
     pub recurrence: Option<RecurrenceRule>,
     pub occurrence: Option<OccurrenceMetadata>,
     pub occurrence_overrides: Vec<OccurrenceOverride>,
+    pub deleted_occurrences: Vec<OccurrenceAnchor>,
 }
 
 impl Event {
@@ -284,6 +285,7 @@ impl Event {
             recurrence: None,
             occurrence: None,
             occurrence_overrides: Vec::new(),
+            deleted_occurrences: Vec::new(),
         }
     }
 
@@ -309,6 +311,7 @@ impl Event {
             recurrence: None,
             occurrence: None,
             occurrence_overrides: Vec::new(),
+            deleted_occurrences: Vec::new(),
         })
     }
 
@@ -616,6 +619,11 @@ impl ConfiguredAgendaSource {
             .into_iter()
             .filter(|override_record| event_generates_anchor(&event, override_record.anchor))
             .collect();
+        let existing_deleted_occurrences = std::mem::take(&mut events[index].deleted_occurrences);
+        event.deleted_occurrences = existing_deleted_occurrences
+            .into_iter()
+            .filter(|anchor| event_generates_anchor(&event, *anchor))
+            .collect();
         events[index] = event.clone();
 
         if let Some(path) = &self.events_file {
@@ -662,6 +670,9 @@ impl ConfiguredAgendaSource {
         } else {
             events[index].occurrence_overrides.push(override_record);
         }
+        events[index]
+            .deleted_occurrences
+            .retain(|deleted_anchor| *deleted_anchor != anchor);
 
         let event = occurrence_override_event(&events[index], anchor).ok_or_else(|| {
             LocalEventStoreError::OccurrenceNotFound {
@@ -675,6 +686,60 @@ impl ConfiguredAgendaSource {
         }
         self.events.events = events;
         Ok(event)
+    }
+
+    pub fn delete_event(&mut self, id: &str) -> Result<Event, LocalEventStoreError> {
+        let mut events = self.events.events().to_vec();
+        let Some(index) = events.iter().position(|event| event.id == id) else {
+            return Err(LocalEventStoreError::EventNotFound { id: id.to_string() });
+        };
+        if !events[index].is_local() {
+            return Err(LocalEventStoreError::EventNotEditable { id: id.to_string() });
+        }
+
+        let deleted = events.remove(index);
+        if let Some(path) = &self.events_file {
+            write_events_file(path, &events)?;
+        }
+        self.events.events = events;
+        Ok(deleted)
+    }
+
+    pub fn delete_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+    ) -> Result<(), LocalEventStoreError> {
+        let mut events = self.events.events().to_vec();
+        let Some(index) = events.iter().position(|event| event.id == series_id) else {
+            return Err(LocalEventStoreError::EventNotFound {
+                id: series_id.to_string(),
+            });
+        };
+        if !events[index].is_local() || !events[index].is_recurring_series() {
+            return Err(LocalEventStoreError::EventNotEditable {
+                id: series_id.to_string(),
+            });
+        }
+        if !event_generates_anchor(&events[index], anchor) {
+            return Err(LocalEventStoreError::OccurrenceNotFound {
+                id: series_id.to_string(),
+                anchor: anchor.storage_key(),
+            });
+        }
+
+        events[index]
+            .occurrence_overrides
+            .retain(|override_record| override_record.anchor != anchor);
+        if !events[index].deleted_occurrences.contains(&anchor) {
+            events[index].deleted_occurrences.push(anchor);
+        }
+
+        if let Some(path) = &self.events_file {
+            write_events_file(path, &events)?;
+        }
+        self.events.events = events;
+        Ok(())
     }
 
     fn next_local_event_id(&self, title: &str) -> String {
@@ -1039,6 +1104,10 @@ fn expand_recurring_event(event: &Event, range: DateRange) -> Vec<Event> {
             }
 
             let anchor = occurrence_anchor_for_date(event, date);
+            if event.deleted_occurrences.contains(&anchor) {
+                date = date.add_days(1);
+                continue;
+            }
             let instance = occurrence_override_event(event, anchor)
                 .unwrap_or_else(|| generated_occurrence_event(event, anchor));
             events.push(instance);
@@ -1110,6 +1179,7 @@ fn generated_occurrence_event(series: &Event, anchor: OccurrenceAnchor) -> Event
     });
     event.recurrence = None;
     event.occurrence_overrides = Vec::new();
+    event.deleted_occurrences = Vec::new();
     event
 }
 
@@ -1511,6 +1581,8 @@ enum LocalEventRecord {
         recurrence: Option<LocalRecurrenceRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         overrides: Vec<LocalOccurrenceOverrideRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deleted_occurrences: Vec<LocalOccurrenceAnchorRecord>,
     },
     AllDay {
         id: String,
@@ -1526,6 +1598,8 @@ enum LocalEventRecord {
         recurrence: Option<LocalRecurrenceRecord>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         overrides: Vec<LocalOccurrenceOverrideRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        deleted_occurrences: Vec<LocalOccurrenceAnchorRecord>,
     },
 }
 
@@ -1545,6 +1619,12 @@ impl LocalEventRecord {
             .iter()
             .map(LocalOccurrenceOverrideRecord::from_override)
             .collect::<Vec<_>>();
+        let deleted_occurrences = event
+            .deleted_occurrences
+            .iter()
+            .copied()
+            .map(LocalOccurrenceAnchorRecord::from_anchor)
+            .collect::<Vec<_>>();
 
         match event.timing {
             EventTiming::AllDay { date } => Self::AllDay {
@@ -1556,6 +1636,7 @@ impl LocalEventRecord {
                 reminders_minutes_before,
                 recurrence,
                 overrides,
+                deleted_occurrences,
             },
             EventTiming::Timed { start, end } => Self::Timed {
                 id: event.id.clone(),
@@ -1569,6 +1650,7 @@ impl LocalEventRecord {
                 reminders_minutes_before,
                 recurrence,
                 overrides,
+                deleted_occurrences,
             },
         }
     }
@@ -1587,6 +1669,7 @@ impl LocalEventRecord {
                 reminders_minutes_before,
                 recurrence,
                 overrides,
+                deleted_occurrences,
             } => {
                 let start = EventDateTime::new(
                     parse_local_date(&start_date, path)?,
@@ -1617,6 +1700,10 @@ impl LocalEventRecord {
                     .into_iter()
                     .map(|override_record| override_record.into_override(path))
                     .collect::<Result<Vec<_>, _>>()?;
+                event.deleted_occurrences = deleted_occurrences
+                    .into_iter()
+                    .map(|anchor| anchor.into_anchor(path))
+                    .collect::<Result<Vec<_>, _>>()?;
                 Ok(event)
             }
             Self::AllDay {
@@ -1628,6 +1715,7 @@ impl LocalEventRecord {
                 reminders_minutes_before,
                 recurrence,
                 overrides,
+                deleted_occurrences,
             } => {
                 let mut event = Event::all_day(
                     id.clone(),
@@ -1644,6 +1732,10 @@ impl LocalEventRecord {
                 event.occurrence_overrides = overrides
                     .into_iter()
                     .map(|override_record| override_record.into_override(path))
+                    .collect::<Result<Vec<_>, _>>()?;
+                event.deleted_occurrences = deleted_occurrences
+                    .into_iter()
+                    .map(|anchor| anchor.into_anchor(path))
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(event)
             }
@@ -3180,6 +3272,146 @@ mod tests {
             overridden.occurrence().map(|occurrence| occurrence.anchor),
             Some(anchor)
         );
+    }
+
+    #[test]
+    fn local_event_store_deletes_single_event_and_persists() {
+        let path = temp_events_path("delete-event");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Planning".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 10, 0),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: None,
+            })
+            .expect("event saves");
+
+        let deleted = source.delete_event(&event.id).expect("event deletes");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day, &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_eq!(deleted.id, event.id);
+        assert!(agenda.is_empty());
+    }
+
+    #[test]
+    fn local_event_store_deletes_one_recurring_occurrence_and_persists() {
+        let path = temp_events_path("delete-occurrence");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(3),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+        let deleted_anchor = OccurrenceAnchor::Timed {
+            start: at(day.add_days(1), 9, 0),
+        };
+
+        source
+            .update_occurrence(
+                &event.id,
+                deleted_anchor,
+                CreateEventDraft {
+                    title: "Moved".to_string(),
+                    timing: CreateEventTiming::Timed {
+                        start: at(day.add_days(1), 10, 0),
+                        end: at(day.add_days(1), 10, 30),
+                    },
+                    location: None,
+                    notes: None,
+                    reminders: Vec::new(),
+                    recurrence: None,
+                },
+            )
+            .expect("override saves before delete");
+        source
+            .delete_occurrence(&event.id, deleted_anchor)
+            .expect("occurrence deletes");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+
+        let first = DayAgenda::from_source(day, &reloaded);
+        let second = DayAgenda::from_source(day.add_days(1), &reloaded);
+        let third = DayAgenda::from_source(day.add_days(2), &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert_eq!(first.timed_events.len(), 1);
+        assert!(second.timed_events.is_empty());
+        assert_eq!(third.timed_events.len(), 1);
+        let stored = reloaded
+            .local_event_by_id(&event.id)
+            .expect("series exists");
+        assert_eq!(stored.deleted_occurrences, vec![deleted_anchor]);
+        assert!(stored.occurrence_overrides.is_empty());
+    }
+
+    #[test]
+    fn local_event_store_delete_series_removes_all_occurrences() {
+        let path = temp_events_path("delete-series");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Standup".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 9, 30),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+                recurrence: Some(RecurrenceRule {
+                    frequency: RecurrenceFrequency::Daily,
+                    interval: 1,
+                    end: RecurrenceEnd::Count(3),
+                    weekdays: Vec::new(),
+                    monthly: None,
+                    yearly: None,
+                }),
+            })
+            .expect("recurring event saves");
+
+        source.delete_event(&event.id).expect("series deletes");
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let range = DateRange::new(day, day.add_days(4)).expect("valid range");
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert!(reloaded.events_intersecting(range).is_empty());
     }
 
     #[test]

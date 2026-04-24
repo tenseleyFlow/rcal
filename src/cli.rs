@@ -17,8 +17,8 @@ use time::{Date, OffsetDateTime, format_description};
 use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
     app::{
-        AppState, CreateEventInputResult, EventFormMode, KeyboardInput, MouseInput,
-        RecurrenceChoiceInputResult,
+        AppState, CreateEventInputResult, EventDeleteInputResult, EventDeleteSubmission,
+        EventFormMode, KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
     },
     calendar::CalendarDate,
     tui::{
@@ -44,13 +44,14 @@ const HELP: &str = concat!(
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
     "  + opens the Create event modal.\n",
+    "  In day view, d opens the Delete confirmation for the selected local event.\n",
     "  In day view, Left/Right move to the previous or next day.\n",
     "  Digits jump immediately; a quick second digit refines the selected day.\n",
     "  Weekday initials jump within the selected week.\n\n",
     "Mouse:\n",
     "  Left click selects a visible date; left click the selected date again to open day view.\n\n",
     "Notes:\n",
-    "  Real calendar-account integration, editing, deletion, and reminder notifications are not in this milestone.\n",
+    "  Real calendar-account integration and reminder notifications are not in this milestone.\n",
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -444,6 +445,7 @@ where
 
         let event = if !app.is_creating_event()
             && !app.is_choosing_recurring_edit()
+            && !app.is_confirming_delete()
             && keyboard.is_waiting_for_digit()
         {
             if event::poll(DIGIT_JUMP_TIMEOUT)? {
@@ -459,7 +461,33 @@ where
         match event {
             Event::Key(key) => {
                 mouse.clear();
-                if app.is_choosing_recurring_edit() {
+                if app.is_confirming_delete() {
+                    match app.handle_delete_choice_key(key) {
+                        EventDeleteInputResult::Continue => {}
+                        EventDeleteInputResult::Cancel => app.close_delete_choice(),
+                        EventDeleteInputResult::Submit(submission) => match submission {
+                            EventDeleteSubmission::Event { event_id }
+                            | EventDeleteSubmission::Series {
+                                series_id: event_id,
+                            } => match agenda_source.delete_event(&event_id) {
+                                Ok(_) => {
+                                    app.close_delete_choice();
+                                    app.reconcile_day_event_selection(&agenda_source);
+                                }
+                                Err(err) => app.set_delete_error(err.to_string()),
+                            },
+                            EventDeleteSubmission::Occurrence { series_id, anchor } => {
+                                match agenda_source.delete_occurrence(&series_id, anchor) {
+                                    Ok(()) => {
+                                        app.close_delete_choice();
+                                        app.reconcile_day_event_selection(&agenda_source);
+                                    }
+                                    Err(err) => app.set_delete_error(err.to_string()),
+                                }
+                            }
+                        },
+                    }
+                } else if app.is_choosing_recurring_edit() {
                     match app.handle_recurrence_choice_key(key, &agenda_source) {
                         RecurrenceChoiceInputResult::Continue => {}
                         RecurrenceChoiceInputResult::Cancel => app.close_recurrence_choice(),
@@ -511,7 +539,10 @@ where
                 }
             }
             Event::Mouse(mouse_event) => {
-                if app.is_creating_event() || app.is_choosing_recurring_edit() {
+                if app.is_creating_event()
+                    || app.is_choosing_recurring_edit()
+                    || app.is_confirming_delete()
+                {
                     continue;
                 }
                 keyboard.clear();

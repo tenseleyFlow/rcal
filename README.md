@@ -50,6 +50,7 @@ access.
 
 - Arrow keys move the selected date.
 - `+` opens the Create event modal.
+- In day view, `d` opens the Delete confirmation for the selected local event.
 - `Enter` opens the focused day view.
 - `Esc` returns from day view to month view.
 - `q` exits.
@@ -64,9 +65,9 @@ access.
   day view.
 
 Created events are stored locally as JSON and are shown immediately in month,
-week, and day views. The create modal supports timed events, single-day all-day
-events, location, notes, and multiple reminder offsets; reminder notifications
-are not delivered yet.
+week, and day views. The create/edit modal supports timed events, single-day
+all-day events, recurrence, location, notes, and multiple reminder offsets.
+Reminder notifications are not delivered yet.
 
 ## Layout
 
@@ -78,7 +79,6 @@ back to a focused day summary.
 
 - Real account integrations for Outlook, Google Calendar, Exchange, and similar
   providers are not implemented yet.
-- Editing or deleting existing events is not implemented yet.
 - Reminder offsets are stored but do not trigger notifications yet.
 - Packaging is currently source-based through Cargo.
 
