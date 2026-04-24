@@ -9,8 +9,11 @@ use std::{
 
 use directories::ProjectDirs;
 use fs2::FileExt;
+#[cfg(not(target_os = "macos"))]
 use notify_rust::Notification;
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "macos")]
+use std::process::Command;
 use time::{Date, Duration, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 use crate::{
@@ -103,13 +106,68 @@ pub struct SystemNotifier;
 
 impl Notifier for SystemNotifier {
     fn notify(&mut self, reminder: &ReminderInstance) -> Result<(), ReminderError> {
-        Notification::new()
-            .summary(&reminder.notification_title())
-            .body(&reminder.notification_body())
-            .show()
-            .map(|_| ())
-            .map_err(|err| ReminderError::Notification(err.to_string()))
+        show_system_notification(
+            &reminder.notification_title(),
+            &reminder.notification_body(),
+        )
     }
+}
+
+pub const fn notification_backend_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "macos-osascript"
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        "notify-rust"
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn show_system_notification(summary: &str, body: &str) -> Result<(), ReminderError> {
+    let output = Command::new("osascript")
+        .args(macos_display_notification_args(summary, body))
+        .output()
+        .map_err(|err| ReminderError::Notification(format!("osascript failed: {err}")))?;
+
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(ReminderError::Notification(format!(
+        "osascript exited with {}: {}",
+        output.status,
+        stderr.trim()
+    )))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_display_notification_args(summary: &str, body: &str) -> Vec<String> {
+    [
+        "-e",
+        "on run argv",
+        "-e",
+        "display notification (item 2 of argv) with title (item 1 of argv)",
+        "-e",
+        "end run",
+        summary,
+        body,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn show_system_notification(summary: &str, body: &str) -> Result<(), ReminderError> {
+    Notification::new()
+        .summary(summary)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|err| ReminderError::Notification(err.to_string()))
 }
 
 pub fn default_state_file() -> PathBuf {
@@ -758,5 +816,24 @@ mod tests {
         assert_eq!(reminder.notification_title(), "Reminder: Planning");
         assert!(reminder.notification_body().contains("Starts at 09:00"));
         assert!(reminder.notification_body().contains("Location: Room 1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_notification_uses_osascript_with_separate_user_text_args() {
+        let args = macos_display_notification_args(
+            "Reminder: Planning \"review\"",
+            "Starts now\nLocation: Room 1",
+        );
+
+        assert_eq!(args[0], "-e");
+        assert_eq!(args[1], "on run argv");
+        assert_eq!(
+            args[3],
+            "display notification (item 2 of argv) with title (item 1 of argv)"
+        );
+        assert_eq!(args[5], "end run");
+        assert_eq!(args[6], "Reminder: Planning \"review\"");
+        assert_eq!(args[7], "Starts now\nLocation: Room 1");
     }
 }

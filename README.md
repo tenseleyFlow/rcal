@@ -30,7 +30,7 @@ rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
 rcal reminders install [--events-file PATH]
 rcal reminders uninstall
 rcal reminders status
-rcal reminders test
+rcal reminders test [--verbose]
 ```
 
 Options:
@@ -76,7 +76,9 @@ week, and day views. The create/edit modal supports timed events, single-day
 all-day events, recurrence, location, notes, and multiple reminder offsets.
 Reminder notifications are delivered by a user-level background service. Use
 `rcal reminders install` to install it, `rcal reminders status` to inspect it,
-and `rcal reminders test` to send a test notification.
+and `rcal reminders test` to send a test notification. On macOS, notification
+delivery uses `osascript` because it is more reliable for CLI-launched
+notifications than the generic notification backend.
 
 ## Layout
 

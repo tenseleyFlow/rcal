@@ -23,8 +23,8 @@ use crate::{
     },
     calendar::CalendarDate,
     reminders::{
-        ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file, run_daemon,
-        run_once, test_notification,
+        ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file,
+        notification_backend_name, run_daemon, run_once, test_notification,
     },
     services::{
         ServiceConfig, ServiceError, SystemCommandRunner, install_service, service_status,
@@ -46,7 +46,7 @@ const HELP: &str = concat!(
     "  rcal reminders install [--events-file PATH]\n",
     "  rcal reminders uninstall\n",
     "  rcal reminders status\n",
-    "  rcal reminders test\n\n",
+    "  rcal reminders test [--verbose]\n\n",
     "Options:\n",
     "  --date YYYY-MM-DD                   Open with the given date selected.\n",
     "  --events-file PATH                  Read and write local user events at PATH.\n",
@@ -113,7 +113,7 @@ pub enum ReminderCliAction {
     Install { events_file: PathBuf },
     Uninstall,
     Status,
-    Test,
+    Test { verbose: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,7 +436,7 @@ where
         "install" => parse_reminder_install_args(args),
         "uninstall" => no_extra_reminder_args(args, ReminderCliAction::Uninstall),
         "status" => no_extra_reminder_args(args, ReminderCliAction::Status),
-        "test" => no_extra_reminder_args(args, ReminderCliAction::Test),
+        "test" => parse_reminder_test_args(args),
         "--help" | "-h" => Ok(CliAction::Help),
         _ => Err(CliError::UnknownReminderCommand(command.to_string())),
     }
@@ -543,6 +543,24 @@ where
     }))
 }
 
+fn parse_reminder_test_args<I>(args: I) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut verbose = false;
+
+    for arg in args {
+        if arg == "--verbose" {
+            verbose = true;
+            continue;
+        }
+
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+
+    Ok(CliAction::Reminders(ReminderCliAction::Test { verbose }))
+}
+
 fn no_extra_reminder_args<I>(args: I, action: ReminderCliAction) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -644,8 +662,15 @@ fn run_reminder_action(
                 Err(err) => service_error_exit(stderr, err),
             }
         }
-        ReminderCliAction::Test => {
+        ReminderCliAction::Test { verbose } => {
             let mut notifier = SystemNotifier;
+            if verbose {
+                let _ = writeln!(
+                    stdout,
+                    "notification_backend={}",
+                    notification_backend_name()
+                );
+            }
             match test_notification(&mut notifier) {
                 Ok(()) => {
                     let _ = writeln!(stdout, "sent test reminder notification");
@@ -1174,6 +1199,22 @@ mod tests {
             CliAction::Reminders(ReminderCliAction::Install {
                 events_file: PathBuf::from("/tmp/events.json"),
             })
+        );
+    }
+
+    #[test]
+    fn reminder_test_accepts_verbose_diagnostic_flag() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [arg("reminders"), arg("test"), arg("--verbose")],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Reminders(ReminderCliAction::Test { verbose: true })
         );
     }
 
