@@ -2425,7 +2425,10 @@ mod tests {
     use std::{
         cell::RefCell,
         collections::{HashMap, VecDeque},
+        sync::atomic::{AtomicUsize, Ordering},
     };
+
+    static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid date")
@@ -2436,8 +2439,12 @@ mod tests {
     }
 
     fn temp_path(name: &str) -> PathBuf {
+        let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         env::temp_dir()
-            .join(format!("rcal-provider-test-{}", std::process::id()))
+            .join(format!(
+                "rcal-provider-test-{}-{counter}",
+                std::process::id()
+            ))
             .join(name)
     }
 
