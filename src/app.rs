@@ -5,7 +5,8 @@ use time::{Month, Time, Weekday};
 
 use crate::{
     agenda::{
-        AgendaSource, CreateEventDraft, CreateEventTiming, DayAgenda, EventDateTime, Reminder,
+        AgendaSource, CreateEventDraft, CreateEventTiming, DayAgenda, Event, EventDateTime,
+        EventTiming, Reminder,
     },
     calendar::{CalendarDate, CalendarMonth, DAYS_PER_WEEK},
 };
@@ -22,6 +23,7 @@ pub struct AppState {
     today: CalendarDate,
     view_mode: ViewMode,
     create_form: Option<CreateEventForm>,
+    selected_day_event_id: Option<String>,
     should_quit: bool,
 }
 
@@ -36,6 +38,7 @@ impl AppState {
             today,
             view_mode: ViewMode::Month,
             create_form: None,
+            selected_day_event_id: None,
             should_quit: false,
         }
     }
@@ -58,6 +61,10 @@ impl AppState {
 
     pub const fn create_form(&self) -> Option<&CreateEventForm> {
         self.create_form.as_ref()
+    }
+
+    pub fn selected_day_event_id(&self) -> Option<&str> {
+        self.selected_day_event_id.as_deref()
     }
 
     pub const fn is_creating_event(&self) -> bool {
@@ -93,12 +100,49 @@ impl AppState {
         DayAgenda::from_source(self.selected_date, source)
     }
 
+    pub fn reconcile_day_event_selection(&mut self, source: &dyn AgendaSource) {
+        if self.view_mode != ViewMode::Day {
+            self.selected_day_event_id = None;
+            return;
+        }
+
+        let events = selectable_day_events(self.selected_date, source);
+        if let Some(selected_id) = &self.selected_day_event_id
+            && events.iter().any(|event| &event.id == selected_id)
+        {
+            return;
+        }
+
+        self.selected_day_event_id = events.first().map(|event| event.id.clone());
+    }
+
     pub fn apply(&mut self, action: AppAction) {
+        self.apply_resolved(action, None);
+    }
+
+    pub fn apply_with_agenda_source(&mut self, action: AppAction, source: &dyn AgendaSource) {
+        self.apply_resolved(action, Some(source));
+    }
+
+    fn apply_resolved(&mut self, action: AppAction, source: Option<&dyn AgendaSource>) {
         match action {
             AppAction::Noop => {}
             AppAction::Quit => self.should_quit = true,
-            AppAction::OpenDay => self.view_mode = ViewMode::Day,
-            AppAction::CloseDay => self.view_mode = ViewMode::Month,
+            AppAction::OpenDay if self.view_mode == ViewMode::Day => {
+                if let Some(source) = source {
+                    self.open_selected_event_for_edit(source);
+                }
+            }
+            AppAction::OpenDay => {
+                self.view_mode = ViewMode::Day;
+                if let Some(source) = source {
+                    self.reconcile_day_event_selection(source);
+                }
+            }
+            AppAction::CloseDay => {
+                self.view_mode = ViewMode::Month;
+                self.selected_day_event_id = None;
+            }
             AppAction::OpenCreate => {
                 if self.create_form.is_none() {
                     let context = match self.view_mode {
@@ -115,6 +159,21 @@ impl AppState {
                 if self.view_mode == ViewMode::Day && matches!(days, -1 | 1) =>
             {
                 self.selected_date = self.selected_date.add_days(days);
+                if let Some(source) = source {
+                    self.reconcile_day_event_selection(source);
+                } else {
+                    self.selected_day_event_id = None;
+                }
+            }
+            AppAction::MoveDays(-7) if self.view_mode == ViewMode::Day => {
+                if let Some(source) = source {
+                    self.move_day_event_selection(source, -1);
+                }
+            }
+            AppAction::MoveDays(7) if self.view_mode == ViewMode::Day => {
+                if let Some(source) = source {
+                    self.move_day_event_selection(source, 1);
+                }
             }
             AppAction::SelectDate(date) if self.view_mode == ViewMode::Month => {
                 self.selected_date = date;
@@ -133,6 +192,40 @@ impl AppState {
             | AppAction::SelectDate(_)
             | AppAction::JumpToDay(_)
             | AppAction::JumpToWeekday(_) => {}
+        }
+    }
+
+    fn move_day_event_selection(&mut self, source: &dyn AgendaSource, delta: i32) {
+        let events = selectable_day_events(self.selected_date, source);
+        if events.is_empty() {
+            self.selected_day_event_id = None;
+            return;
+        }
+
+        let current_index = self
+            .selected_day_event_id
+            .as_ref()
+            .and_then(|id| events.iter().position(|event| &event.id == id))
+            .unwrap_or(0);
+        let len = events.len();
+        let next_index = if delta < 0 {
+            (current_index + len - 1) % len
+        } else {
+            (current_index + 1) % len
+        };
+        self.selected_day_event_id = Some(events[next_index].id.clone());
+    }
+
+    fn open_selected_event_for_edit(&mut self, source: &dyn AgendaSource) {
+        self.reconcile_day_event_selection(source);
+        let Some(selected_id) = self.selected_day_event_id.as_deref() else {
+            return;
+        };
+        if let Some(event) = selectable_day_events(self.selected_date, source)
+            .into_iter()
+            .find(|event| event.id == selected_id)
+        {
+            self.create_form = Some(CreateEventForm::edit(&event));
         }
     }
 
@@ -169,7 +262,14 @@ pub enum CreateEventContext {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventFormMode {
+    Create,
+    Edit { event_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateEventForm {
+    mode: EventFormMode,
     context: CreateEventContext,
     selected_date: CalendarDate,
     title: String,
@@ -188,6 +288,7 @@ pub struct CreateEventForm {
 impl CreateEventForm {
     pub fn new(selected_date: CalendarDate, context: CreateEventContext) -> Self {
         Self {
+            mode: EventFormMode::Create,
             context,
             selected_date,
             title: String::new(),
@@ -201,6 +302,67 @@ impl CreateEventForm {
             reminders: [false; REMINDER_PRESETS.len()],
             focused: 0,
             error: None,
+        }
+    }
+
+    pub fn edit(event: &Event) -> Self {
+        let (all_day, start_date, start_time, end_date, end_time, selected_date) =
+            match event.timing {
+                EventTiming::AllDay { date } => (
+                    true,
+                    date.to_string(),
+                    "09:00".to_string(),
+                    date.to_string(),
+                    "10:00".to_string(),
+                    date,
+                ),
+                EventTiming::Timed { start, end } => (
+                    false,
+                    start.date.to_string(),
+                    format_time_field(start.time),
+                    end.date.to_string(),
+                    format_time_field(end.time),
+                    start.date,
+                ),
+            };
+        let mut reminders = [false; REMINDER_PRESETS.len()];
+        for reminder in &event.reminders {
+            if let Some(index) = REMINDER_PRESETS
+                .iter()
+                .position(|preset| preset.minutes == reminder.minutes_before)
+            {
+                reminders[index] = true;
+            }
+        }
+
+        Self {
+            mode: EventFormMode::Edit {
+                event_id: event.id.clone(),
+            },
+            context: CreateEventContext::EditableDate,
+            selected_date,
+            title: event.title.clone(),
+            all_day,
+            start_date,
+            start_time,
+            end_date,
+            end_time,
+            location: event.location.clone().unwrap_or_default(),
+            notes: event.notes.clone().unwrap_or_default(),
+            reminders,
+            focused: 0,
+            error: None,
+        }
+    }
+
+    pub fn mode(&self) -> &EventFormMode {
+        &self.mode
+    }
+
+    pub fn heading(&self) -> &'static str {
+        match &self.mode {
+            EventFormMode::Create => "Create",
+            EventFormMode::Edit { .. } => "Edit",
         }
     }
 
@@ -232,7 +394,10 @@ impl CreateEventForm {
 
         if ctrl_s(key) {
             return match self.submit() {
-                Ok(draft) => CreateEventInputResult::Submit(draft),
+                Ok(draft) => CreateEventInputResult::Submit(EventFormSubmission {
+                    mode: self.mode.clone(),
+                    draft,
+                }),
                 Err(err) => {
                     self.error = Some(err.to_string());
                     CreateEventInputResult::Continue
@@ -437,10 +602,16 @@ pub enum CreateEventFormRowKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventFormSubmission {
+    pub mode: EventFormMode,
+    pub draft: CreateEventDraft,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateEventInputResult {
     Continue,
     Cancel,
-    Submit(CreateEventDraft),
+    Submit(EventFormSubmission),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -612,6 +783,25 @@ fn parse_time_field(value: &str, field: &'static str) -> Result<Time, CreateEven
         field,
         value: value.to_string(),
     })
+}
+
+fn format_time_field(time: Time) -> String {
+    format!("{:02}:{:02}", time.hour(), time.minute())
+}
+
+fn selectable_day_events(date: CalendarDate, source: &dyn AgendaSource) -> Vec<Event> {
+    let agenda = DayAgenda::from_source(date, source);
+    agenda
+        .all_day_events
+        .into_iter()
+        .chain(
+            agenda
+                .timed_events
+                .into_iter()
+                .map(|agenda_event| agenda_event.event),
+        )
+        .filter(Event::is_local)
+        .collect()
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -822,12 +1012,38 @@ fn ctrl_s(key: KeyEvent) -> bool {
 mod tests {
     use super::*;
     use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
-    use time::Month;
+    use time::{Month, Time};
 
     use crate::agenda::{Holiday, InMemoryAgendaSource, SourceMetadata};
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
         CalendarDate::from_ymd(year, month, day).expect("valid test date")
+    }
+
+    fn at(date: CalendarDate, hour: u8, minute: u8) -> EventDateTime {
+        EventDateTime::new(
+            date,
+            Time::from_hms(hour, minute, 0).expect("valid test time"),
+        )
+    }
+
+    fn local_timed_event(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
+        Event::timed(id, title, start, end, SourceMetadata::local())
+            .expect("valid local timed event")
+    }
+
+    fn local_all_day_event(id: &str, title: &str, date: CalendarDate) -> Event {
+        Event::all_day(id, title, date, SourceMetadata::local())
+    }
+
+    fn fixture_timed_event(
+        id: &str,
+        title: &str,
+        start: EventDateTime,
+        end: EventDateTime,
+    ) -> Event {
+        Event::timed(id, title, start, end, SourceMetadata::fixture())
+            .expect("valid fixture timed event")
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -863,6 +1079,18 @@ mod tests {
         for key in keys {
             let action = input.translate(key);
             app.apply(action);
+        }
+    }
+
+    fn apply_keys_with_source(
+        app: &mut AppState,
+        input: &mut KeyboardInput,
+        source: &dyn AgendaSource,
+        keys: impl IntoIterator<Item = KeyEvent>,
+    ) {
+        for key in keys {
+            let action = input.translate(key);
+            app.apply_with_agenda_source(action, source);
         }
     }
 
@@ -1056,6 +1284,152 @@ mod tests {
     }
 
     #[test]
+    fn day_view_selects_first_local_event_and_skips_non_local_items() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![
+                Event::all_day("fixture-all", "A Fixture", day, SourceMetadata::fixture()),
+                local_all_day_event("local-all", "Release", day),
+                fixture_timed_event("fixture-time", "Fixture", at(day, 8, 0), at(day, 9, 0)),
+                local_timed_event("local-time", "Standup", at(day, 9, 0), at(day, 9, 30)),
+            ],
+            vec![Holiday::new(
+                "holiday",
+                "Holiday",
+                day,
+                SourceMetadata::fixture(),
+            )],
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(&mut app, &mut input, &source, [key(KeyCode::Enter)]);
+
+        assert_eq!(app.view_mode(), ViewMode::Day);
+        assert_eq!(app.selected_day_event_id(), Some("local-all"));
+    }
+
+    #[test]
+    fn day_view_up_and_down_cycle_local_event_selection() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![
+                local_all_day_event("local-all", "Release", day),
+                local_timed_event("local-time", "Standup", at(day, 9, 0), at(day, 9, 30)),
+            ],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), key(KeyCode::Down)],
+        );
+
+        assert_eq!(app.selected_date(), day);
+        assert_eq!(app.selected_day_event_id(), Some("local-time"));
+
+        apply_keys_with_source(&mut app, &mut input, &source, [key(KeyCode::Down)]);
+        assert_eq!(app.selected_day_event_id(), Some("local-all"));
+
+        apply_keys_with_source(&mut app, &mut input, &source, [key(KeyCode::Up)]);
+        assert_eq!(app.selected_day_event_id(), Some("local-time"));
+    }
+
+    #[test]
+    fn day_view_enter_opens_edit_for_selected_local_event() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![local_timed_event(
+                "local-time",
+                "Standup",
+                at(day, 9, 0),
+                at(day, 9, 30),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), key(KeyCode::Enter)],
+        );
+
+        let form = app.create_form().expect("edit form opens");
+        assert_eq!(
+            form.mode(),
+            &EventFormMode::Edit {
+                event_id: "local-time".to_string()
+            }
+        );
+        assert_eq!(form.rows()[0].value, "Standup");
+    }
+
+    #[test]
+    fn day_view_reconciles_selection_when_event_leaves_day() {
+        let day = date(2026, Month::April, 23);
+        let next_day = date(2026, Month::April, 24);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![
+                local_timed_event("move", "Move", at(day, 8, 0), at(day, 9, 0)),
+                local_timed_event("stay", "Stay", at(day, 10, 0), at(day, 11, 0)),
+            ],
+            Vec::new(),
+        );
+        let moved_source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![
+                local_timed_event("move", "Move", at(next_day, 8, 0), at(next_day, 9, 0)),
+                local_timed_event("stay", "Stay", at(day, 10, 0), at(day, 11, 0)),
+            ],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+
+        assert_eq!(app.selected_day_event_id(), Some("move"));
+
+        app.reconcile_day_event_selection(&moved_source);
+
+        assert_eq!(app.selected_date(), day);
+        assert_eq!(app.selected_day_event_id(), Some("stay"));
+    }
+
+    #[test]
+    fn edit_form_up_and_down_keep_day_event_selection() {
+        let day = date(2026, Month::April, 23);
+        let source = InMemoryAgendaSource::with_events_and_holidays(
+            vec![local_timed_event(
+                "local-time",
+                "Standup",
+                at(day, 9, 0),
+                at(day, 9, 30),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        let mut input = KeyboardInput::default();
+        apply_keys_with_source(
+            &mut app,
+            &mut input,
+            &source,
+            [key(KeyCode::Enter), key(KeyCode::Enter)],
+        );
+
+        assert_eq!(
+            app.handle_create_key(key(KeyCode::Down)),
+            CreateEventInputResult::Continue
+        );
+        assert_eq!(app.selected_day_event_id(), Some("local-time"));
+        assert!(app.create_form().expect("form stays open").rows()[1].focused);
+    }
+
+    #[test]
     fn quit_action_marks_app_done() {
         let mut app = AppState::new(date(2026, Month::April, 23));
         let mut input = KeyboardInput::default();
@@ -1141,6 +1515,72 @@ mod tests {
 
         assert_eq!(result, CreateEventInputResult::Continue);
         assert_eq!(form.error(), Some("title is required"));
+    }
+
+    #[test]
+    fn edit_form_preloads_timed_event_fields() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("local-time", "Standup", at(day, 9, 0), at(day, 9, 30))
+            .with_location("Room 1")
+            .with_notes("Bring notes")
+            .with_reminders(vec![
+                Reminder::minutes_before(10),
+                Reminder::minutes_before(60),
+            ]);
+
+        let form = CreateEventForm::edit(&event);
+
+        assert_eq!(
+            form.mode(),
+            &EventFormMode::Edit {
+                event_id: "local-time".to_string()
+            }
+        );
+        assert_eq!(form.title, "Standup");
+        assert!(!form.all_day);
+        assert_eq!(form.start_date, "2026-04-23");
+        assert_eq!(form.start_time, "09:00");
+        assert_eq!(form.end_date, "2026-04-23");
+        assert_eq!(form.end_time, "09:30");
+        assert_eq!(form.location, "Room 1");
+        assert_eq!(form.notes, "Bring notes");
+        assert!(form.reminders[1]);
+        assert!(form.reminders[4]);
+    }
+
+    #[test]
+    fn edit_form_preloads_all_day_event_and_can_switch_to_timed() {
+        let day = date(2026, Month::April, 23);
+        let event = local_all_day_event("local-all", "Release", day);
+        let mut form = CreateEventForm::edit(&event);
+
+        assert!(form.all_day);
+        assert_eq!(form.start_date, "2026-04-23");
+        assert_eq!(form.start_time, "09:00");
+        assert_eq!(form.end_time, "10:00");
+
+        form.all_day = false;
+        let draft = form.submit().expect("all-day edit can become timed");
+
+        assert_eq!(
+            draft.timing,
+            CreateEventTiming::Timed {
+                start: EventDateTime::new(day, Time::from_hms(9, 0, 0).expect("valid time")),
+                end: EventDateTime::new(day, Time::from_hms(10, 0, 0).expect("valid time")),
+            }
+        );
+    }
+
+    #[test]
+    fn edit_form_can_switch_timed_event_to_all_day() {
+        let day = date(2026, Month::April, 23);
+        let event = local_timed_event("local-time", "Standup", at(day, 9, 0), at(day, 9, 30));
+        let mut form = CreateEventForm::edit(&event);
+
+        form.all_day = true;
+        let draft = form.submit().expect("timed edit can become all day");
+
+        assert_eq!(draft.timing, CreateEventTiming::AllDay { date: day });
     }
 
     #[test]

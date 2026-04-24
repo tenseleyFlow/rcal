@@ -452,6 +452,7 @@ struct DayViewStyles {
     timeline_event: Style,
     holiday: Style,
     event: Style,
+    selected_event: Style,
 }
 
 impl DayViewStyles {
@@ -467,6 +468,10 @@ impl DayViewStyles {
             timeline_event: Style::new().fg(Color::White).bg(Color::Blue),
             holiday: Style::new().fg(Color::Yellow),
             event: Style::new().fg(Color::White),
+            selected_event: Style::new()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD),
         }
     }
 }
@@ -743,7 +748,13 @@ fn render_day_view(
     match layout.mode {
         DayViewLayoutMode::Split | DayViewLayoutMode::Stacked => {
             if let Some(agenda_area) = layout.agenda_area {
-                render_agenda_panel(&agenda, agenda_area, buf, styles);
+                render_agenda_panel(
+                    &agenda,
+                    app.selected_day_event_id(),
+                    agenda_area,
+                    buf,
+                    styles,
+                );
             }
 
             if let Some(timeline_area) = layout.timeline_area {
@@ -821,7 +832,7 @@ fn render_create_event_modal(
         content.y,
         content.x,
         content.width,
-        "Create",
+        form.heading(),
         styles.title,
     );
     let label_width = 12.min(content.width.saturating_sub(1));
@@ -942,7 +953,13 @@ fn create_modal_value_lines(
     }
 }
 
-fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles: DayViewStyles) {
+fn render_agenda_panel(
+    agenda: &DayAgenda,
+    selected_event_id: Option<&str>,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: DayViewStyles,
+) {
     render_panel(area, "Agenda", buf, styles);
 
     let content = inset_rect(area);
@@ -1001,6 +1018,7 @@ fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles:
             y = render_event_detail_lines(
                 event,
                 &format!("- {}", event.title),
+                selected_event_id == Some(event.id.as_str()),
                 content,
                 y,
                 buf,
@@ -1041,6 +1059,7 @@ fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles:
                 y = render_event_detail_lines(
                     &agenda_event.event,
                     &agenda_event_line(agenda_event),
+                    selected_event_id == Some(agenda_event.event.id.as_str()),
                     content,
                     y,
                     buf,
@@ -1054,12 +1073,23 @@ fn render_agenda_panel(agenda: &DayAgenda, area: Rect, buf: &mut Buffer, styles:
 fn render_event_detail_lines(
     event: &Event,
     first_line: &str,
+    selected: bool,
     content: Rect,
     mut y: u16,
     buf: &mut Buffer,
     styles: DayViewStyles,
 ) -> u16 {
-    write_left(buf, y, content.x, content.width, first_line, styles.event);
+    let first_line = if selected {
+        format!("> {first_line}")
+    } else {
+        format!("  {first_line}")
+    };
+    let style = if selected {
+        styles.selected_event
+    } else {
+        styles.event
+    };
+    write_left(buf, y, content.x, content.width, &first_line, style);
     y += 1;
 
     if let Some(location) = &event.location {
@@ -1819,6 +1849,21 @@ mod tests {
         buffer
     }
 
+    fn render_app_buffer_with_agenda_source<S>(
+        app: &AppState,
+        width: u16,
+        height: u16,
+        agenda_source: &S,
+    ) -> Buffer
+    where
+        S: AgendaSource,
+    {
+        let area = Rect::new(0, 0, width, height);
+        let mut buffer = Buffer::empty(area);
+        AppView::with_agenda_source(app, agenda_source).render(area, &mut buffer);
+        buffer
+    }
+
     fn buffer_lines(buffer: &Buffer) -> Vec<String> {
         buffer_to_string(buffer)
             .lines()
@@ -1890,6 +1935,10 @@ mod tests {
         SourceMetadata::fixture()
     }
 
+    fn local_source_metadata() -> SourceMetadata {
+        SourceMetadata::local()
+    }
+
     fn at(date: CalendarDate, hour: u8, minute: u8) -> EventDateTime {
         EventDateTime::new(
             date,
@@ -1899,6 +1948,11 @@ mod tests {
 
     fn timed_event(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
         Event::timed(id, title, start, end, source_metadata()).expect("valid test event")
+    }
+
+    fn local_timed_event(id: &str, title: &str, start: EventDateTime, end: EventDateTime) -> Event {
+        Event::timed(id, title, start, end, local_source_metadata())
+            .expect("valid local timed event")
     }
 
     fn agenda_source(events: Vec<Event>, holidays: Vec<Holiday>) -> InMemoryAgendaSource {
@@ -2068,6 +2122,28 @@ mod tests {
         assert!(rendered.contains("Start date"));
         assert!(rendered.contains("Reminder"));
         assert!(rendered.contains("Ctrl-S save"));
+    }
+
+    #[test]
+    fn edit_modal_uses_edit_title() {
+        let day = date(2026, Month::April, 23);
+        let source = agenda_source(
+            vec![local_timed_event(
+                "planning",
+                "Planning",
+                at(day, 9, 0),
+                at(day, 10, 0),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+
+        let rendered = render_app_to_string_with_agenda_source(&app, 84, 26, &source);
+
+        assert!(rendered.contains("Edit"));
+        assert!(rendered.contains("Planning"));
     }
 
     #[test]
@@ -2417,6 +2493,42 @@ mod tests {
         assert!(rendered.contains("@ War room"));
         assert!(rendered.contains("Reminders: 10m, 1h"));
         assert!(rendered.contains("Bring notes"));
+    }
+
+    #[test]
+    fn day_view_highlights_selected_local_event() {
+        let day = date(2026, Month::April, 23);
+        let source = agenda_source(
+            vec![local_timed_event(
+                "planning",
+                "Planning",
+                at(day, 9, 0),
+                at(day, 10, 0),
+            )],
+            Vec::new(),
+        );
+        let mut app = AppState::new(day);
+        app.apply_with_agenda_source(AppAction::OpenDay, &source);
+
+        let buffer = render_app_buffer_with_agenda_source(&app, 84, 18, &source);
+        let rendered = buffer_to_string(&buffer);
+        let selected_position = rendered
+            .lines()
+            .enumerate()
+            .find_map(|(row, line)| {
+                line.find("> 09:00-10:00 Planning")
+                    .map(|column| (column, row))
+            })
+            .expect("selected event is rendered");
+        let selected_cell = buffer
+            .cell((
+                u16::try_from(selected_position.0).expect("column fits"),
+                u16::try_from(selected_position.1).expect("row fits"),
+            ))
+            .expect("selected cell exists");
+
+        assert_eq!(selected_cell.bg, Color::Blue);
+        assert!(selected_cell.modifier.contains(Modifier::BOLD));
     }
 
     #[test]

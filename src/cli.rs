@@ -16,7 +16,7 @@ use time::{Date, OffsetDateTime, format_description};
 
 use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
-    app::{AppState, CreateEventInputResult, KeyboardInput, MouseInput},
+    app::{AppState, CreateEventInputResult, EventFormMode, KeyboardInput, MouseInput},
     calendar::CalendarDate,
     tui::{
         AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
@@ -457,16 +457,30 @@ where
                     match app.handle_create_key(key) {
                         CreateEventInputResult::Continue => {}
                         CreateEventInputResult::Cancel => app.close_create_form(),
-                        CreateEventInputResult::Submit(draft) => {
-                            match agenda_source.create_event(draft) {
-                                Ok(_) => app.close_create_form(),
-                                Err(err) => app.set_create_form_error(err.to_string()),
+                        CreateEventInputResult::Submit(submission) => match submission.mode {
+                            EventFormMode::Create => {
+                                match agenda_source.create_event(submission.draft) {
+                                    Ok(_) => {
+                                        app.close_create_form();
+                                        app.reconcile_day_event_selection(&agenda_source);
+                                    }
+                                    Err(err) => app.set_create_form_error(err.to_string()),
+                                }
                             }
-                        }
+                            EventFormMode::Edit { event_id } => {
+                                match agenda_source.update_event(&event_id, submission.draft) {
+                                    Ok(_) => {
+                                        app.close_create_form();
+                                        app.reconcile_day_event_selection(&agenda_source);
+                                    }
+                                    Err(err) => app.set_create_form_error(err.to_string()),
+                                }
+                            }
+                        },
                     }
                 } else {
                     let action = keyboard.translate(key);
-                    app.apply(action);
+                    app.apply_with_agenda_source(action, &agenda_source);
                 }
             }
             Event::Mouse(mouse_event) => {
@@ -479,7 +493,7 @@ where
                 let target_date =
                     hit_test_app_date(&app, area, mouse_event.column, mouse_event.row);
                 let action = mouse.translate(mouse_event, target_date, app.selected_date());
-                app.apply(action);
+                app.apply_with_agenda_source(action, &agenda_source);
             }
             Event::Resize(_, _) => {
                 keyboard.clear();

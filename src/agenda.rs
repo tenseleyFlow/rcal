@@ -215,6 +215,10 @@ impl Event {
         self.timing.is_timed()
     }
 
+    pub fn is_local(&self) -> bool {
+        self.source.source_id == "local"
+    }
+
     pub fn intersects_range(&self, range: DateRange) -> bool {
         match self.timing {
             EventTiming::AllDay { date } => range.contains_date(date),
@@ -440,6 +444,35 @@ impl ConfiguredAgendaSource {
             write_events_file(path, &events)?;
         }
         self.events.push_event(event.clone());
+        Ok(event)
+    }
+
+    pub fn update_event(
+        &mut self,
+        id: &str,
+        draft: CreateEventDraft,
+    ) -> Result<Event, LocalEventStoreError> {
+        let mut events = self.events.events().to_vec();
+        let Some(index) = events.iter().position(|event| event.id == id) else {
+            return Err(LocalEventStoreError::EventNotFound { id: id.to_string() });
+        };
+        if !events[index].is_local() {
+            return Err(LocalEventStoreError::EventNotEditable { id: id.to_string() });
+        }
+
+        let event =
+            draft
+                .into_event(id.to_string())
+                .map_err(|err| LocalEventStoreError::Encode {
+                    path: self.events_file.clone(),
+                    reason: err.to_string(),
+                })?;
+        events[index] = event.clone();
+
+        if let Some(path) = &self.events_file {
+            write_events_file(path, &events)?;
+        }
+        self.events.events = events;
         Ok(event)
     }
 
@@ -774,6 +807,12 @@ pub enum LocalEventStoreError {
         path: PathBuf,
         version: u8,
     },
+    EventNotFound {
+        id: String,
+    },
+    EventNotEditable {
+        id: String,
+    },
     Encode {
         path: Option<PathBuf>,
         reason: String,
@@ -798,6 +837,8 @@ impl fmt::Display for LocalEventStoreError {
                 "unsupported local events file version {version} in {}",
                 path.display()
             ),
+            Self::EventNotFound { id } => write!(f, "local event '{id}' was not found"),
+            Self::EventNotEditable { id } => write!(f, "event '{id}' is not editable locally"),
             Self::Encode { path, reason } => {
                 if let Some(path) = path {
                     write!(f, "failed to encode {}: {reason}", path.display())
@@ -1678,6 +1719,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             [10, 60]
         );
+    }
+
+    #[test]
+    fn local_event_store_updates_existing_event_id_and_persists() {
+        let path = temp_events_path("update");
+        let _ = std::fs::remove_dir_all(path.parent().expect("path has parent"));
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("missing event file is empty");
+        let event = source
+            .create_event(CreateEventDraft {
+                title: "Planning".to_string(),
+                timing: CreateEventTiming::Timed {
+                    start: at(day, 9, 0),
+                    end: at(day, 10, 0),
+                },
+                location: None,
+                notes: None,
+                reminders: Vec::new(),
+            })
+            .expect("event saves");
+
+        let updated = source
+            .update_event(
+                &event.id,
+                CreateEventDraft {
+                    title: "Updated planning".to_string(),
+                    timing: CreateEventTiming::AllDay { date: day },
+                    location: Some("Room 2".to_string()),
+                    notes: Some("Moved".to_string()),
+                    reminders: vec![Reminder::minutes_before(5)],
+                },
+            )
+            .expect("event updates");
+
+        assert_eq!(updated.id, event.id);
+        assert!(updated.is_local());
+
+        let reloaded = ConfiguredAgendaSource::from_events_file(&path, HolidayProvider::off())
+            .expect("saved file reloads");
+        let agenda = DayAgenda::from_source(day, &reloaded);
+
+        let _ = std::fs::remove_dir_all(path.parent().expect("test dir exists"));
+
+        assert!(agenda.timed_events.is_empty());
+        assert_eq!(agenda.all_day_events.len(), 1);
+        assert_eq!(agenda.all_day_events[0].id, event.id);
+        assert_eq!(agenda.all_day_events[0].title, "Updated planning");
+        assert_eq!(agenda.all_day_events[0].location.as_deref(), Some("Room 2"));
+    }
+
+    #[test]
+    fn local_event_store_rejects_missing_and_non_local_updates() {
+        let day = date(23);
+        let mut source = ConfiguredAgendaSource::new(
+            InMemoryAgendaSource::with_events_and_holidays(
+                vec![timed("fixture", "Fixture", at(day, 8, 0), at(day, 9, 0))],
+                Vec::new(),
+            ),
+            HolidayProvider::off(),
+        );
+        let draft = CreateEventDraft {
+            title: "Updated".to_string(),
+            timing: CreateEventTiming::Timed {
+                start: at(day, 10, 0),
+                end: at(day, 11, 0),
+            },
+            location: None,
+            notes: None,
+            reminders: Vec::new(),
+        };
+
+        assert!(matches!(
+            source
+                .update_event("missing", draft.clone())
+                .expect_err("missing event fails"),
+            LocalEventStoreError::EventNotFound { .. }
+        ));
+        assert!(matches!(
+            source
+                .update_event("fixture", draft)
+                .expect_err("fixture event fails"),
+            LocalEventStoreError::EventNotEditable { .. }
+        ));
     }
 
     #[test]
