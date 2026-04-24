@@ -1180,8 +1180,7 @@ fn recurs_on_date(date: CalendarDate, start_date: CalendarDate, rule: &Recurrenc
             days_between(start_date, date) % i32::from(rule.interval()) == 0
         }
         RecurrenceFrequency::Weekly => {
-            let days = days_between(start_date, date);
-            let week_index = days / 7;
+            let week_index = calendar_weeks_between(start_date, date);
             let weekdays = recurrence_weekdays(rule, start_date);
             week_index % i32::from(rule.interval()) == 0 && weekdays.contains(&date.weekday())
         }
@@ -1234,6 +1233,16 @@ fn recurrence_weekdays(rule: &RecurrenceRule, start_date: CalendarDate) -> Vec<W
     } else {
         rule.weekdays.clone()
     }
+}
+
+fn calendar_weeks_between(start: CalendarDate, end: CalendarDate) -> i32 {
+    let start_week = sunday_of_week(start);
+    let end_week = sunday_of_week(end);
+    days_between(start_week, end_week) / 7
+}
+
+fn sunday_of_week(date: CalendarDate) -> CalendarDate {
+    date.add_days(-i32::from(date.weekday().number_days_from_sunday()))
 }
 
 fn weekday_ordinal_date(
@@ -2733,6 +2742,43 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(dates, [date(5), date(7), date(19), date(21)]);
+    }
+
+    #[test]
+    fn weekly_interval_uses_calendar_weeks_not_rolling_start_windows() {
+        let start = date_ymd(2026, Month::April, 15);
+        let event =
+            Event::all_day("class", "CS412", start, source()).with_recurrence(RecurrenceRule {
+                frequency: RecurrenceFrequency::Weekly,
+                interval: 2,
+                end: RecurrenceEnd::Until(date_ymd(2026, Month::May, 15)),
+                weekdays: vec![Weekday::Monday, Weekday::Wednesday, Weekday::Friday],
+                monthly: None,
+                yearly: None,
+            });
+        let source = InMemoryAgendaSource::with_events_and_holidays(vec![event], Vec::new());
+        let range = DateRange::new(
+            date_ymd(2026, Month::April, 1),
+            date_ymd(2026, Month::May, 1),
+        )
+        .expect("valid range");
+
+        let dates = source
+            .events_intersecting(range)
+            .into_iter()
+            .filter_map(|event| event.timing.date())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            dates,
+            [
+                date_ymd(2026, Month::April, 15),
+                date_ymd(2026, Month::April, 17),
+                date_ymd(2026, Month::April, 27),
+                date_ymd(2026, Month::April, 29),
+            ]
+        );
+        assert!(!dates.contains(&date_ymd(2026, Month::April, 20)));
     }
 
     #[test]
