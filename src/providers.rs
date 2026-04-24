@@ -3411,6 +3411,26 @@ fn google_error_message(response: MicrosoftHttpResponse) -> String {
     }
 }
 
+fn google_oauth_error_message(response: MicrosoftHttpResponse) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(&response.body)
+        && let Some(error) = graph_string(&value, "error")
+    {
+        let description = graph_string(&value, "error_description");
+        return match description {
+            Some(description) if !description.is_empty() => {
+                format!("Google OAuth {}: {error}: {description}", response.status)
+            }
+            _ => format!("Google OAuth {}: {error}", response.status),
+        };
+    }
+    let body = response.body.trim();
+    if body.is_empty() {
+        format!("Google OAuth HTTP {}", response.status)
+    } else {
+        format!("Google OAuth HTTP {}: {body}", response.status)
+    }
+}
+
 fn parse_oauth_json(response: MicrosoftHttpResponse) -> Result<Value, ProviderError> {
     if response.status != 200 {
         return Err(ProviderError::Auth(graph_error_message(response)));
@@ -3436,7 +3456,7 @@ fn google_token_from_response(
     existing_refresh_token: Option<String>,
 ) -> Result<GoogleToken, ProviderError> {
     if response.status != 200 {
-        return Err(ProviderError::Auth(google_error_message(response)));
+        return Err(ProviderError::Auth(google_oauth_error_message(response)));
     }
     let value = serde_json::from_str::<Value>(&response.body)
         .map_err(|err| ProviderError::Auth(format!("Google token response is invalid: {err}")))?;
@@ -4488,32 +4508,32 @@ impl fmt::Display for ProviderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Config(reason) => write!(f, "provider config error: {reason}"),
-            Self::Auth(reason) => write!(f, "Microsoft auth error: {reason}"),
-            Self::Keyring(reason) => write!(f, "Microsoft token keyring error: {reason}"),
-            Self::Http(reason) => write!(f, "Microsoft HTTP error: {reason}"),
+            Self::Auth(reason) => write!(f, "provider auth error: {reason}"),
+            Self::Keyring(reason) => write!(f, "provider token keyring error: {reason}"),
+            Self::Http(reason) => write!(f, "provider HTTP error: {reason}"),
             Self::Graph(reason) => write!(f, "Microsoft Graph error: {reason}"),
             Self::Api(reason) => write!(f, "provider API error: {reason}"),
-            Self::Mapping(reason) => write!(f, "Microsoft event mapping error: {reason}"),
+            Self::Mapping(reason) => write!(f, "provider event mapping error: {reason}"),
             Self::Validation(reason) => write!(f, "{reason}"),
-            Self::NotFound(id) => write!(f, "Microsoft event '{id}' was not found"),
+            Self::NotFound(id) => write!(f, "provider event '{id}' was not found"),
             Self::CacheRead { path, reason } => {
                 write!(
                     f,
-                    "failed to read Microsoft cache {}: {reason}",
+                    "failed to read provider cache {}: {reason}",
                     path.display()
                 )
             }
             Self::CacheParse { path, reason } => {
                 write!(
                     f,
-                    "failed to parse Microsoft cache {}: {reason}",
+                    "failed to parse provider cache {}: {reason}",
                     path.display()
                 )
             }
             Self::CacheWrite { path, reason } => {
                 write!(
                     f,
-                    "failed to write Microsoft cache {}: {reason}",
+                    "failed to write provider cache {}: {reason}",
                     path.display()
                 )
             }
@@ -4972,6 +4992,24 @@ mod tests {
             Some("google:personal:primary:master")
         );
         assert!(master.recurrence.is_some());
+    }
+
+    #[test]
+    fn google_oauth_errors_parse_top_level_error_response() {
+        let response = RecordingHttpClient::json(
+            400,
+            json!({
+                "error": "invalid_request",
+                "error_description": "client_secret is missing."
+            }),
+        );
+
+        let err = google_token_from_response(response, None).expect_err("400 fails");
+
+        assert_eq!(
+            err.to_string(),
+            "provider auth error: Google OAuth 400: invalid_request: client_secret is missing."
+        );
     }
 
     #[test]
