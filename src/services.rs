@@ -26,14 +26,14 @@ pub struct ServiceConfig {
 }
 
 impl ServiceConfig {
-    pub fn new(events_file: PathBuf) -> Result<Self, ServiceError> {
+    pub fn new(events_file: PathBuf, state_file: PathBuf) -> Result<Self, ServiceError> {
         let executable = std::env::current_exe().map_err(|err| ServiceError::CurrentExe {
             reason: err.to_string(),
         })?;
         Ok(Self {
             executable,
             events_file,
-            state_file: default_state_file(),
+            state_file,
             log_file: default_log_file(),
         })
     }

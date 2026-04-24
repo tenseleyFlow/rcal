@@ -1,4 +1,8 @@
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -1912,56 +1916,35 @@ fn selectable_day_events(date: CalendarDate, source: &dyn AgendaSource) -> Vec<E
         .collect()
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardInput {
     pending: PendingKey,
+    bindings: KeyBindings,
 }
 
 impl KeyboardInput {
+    pub fn new(bindings: KeyBindings) -> Self {
+        Self {
+            pending: PendingKey::None,
+            bindings,
+        }
+    }
+
     pub fn translate(&mut self, key: KeyEvent) -> AppAction {
         if key.kind == KeyEventKind::Release {
             return AppAction::Noop;
         }
 
-        match key.code {
-            KeyCode::Left => {
-                self.clear();
-                AppAction::MoveDays(-1)
-            }
-            KeyCode::Right => {
-                self.clear();
-                AppAction::MoveDays(1)
-            }
-            KeyCode::Up => {
-                self.clear();
-                AppAction::MoveDays(-7)
-            }
-            KeyCode::Down => {
-                self.clear();
-                AppAction::MoveDays(7)
-            }
-            KeyCode::Enter => {
-                self.clear();
-                AppAction::OpenDay
-            }
-            KeyCode::Esc => {
-                self.clear();
-                AppAction::CloseDay
-            }
-            KeyCode::Char(value) if ctrl_c(value, key.modifiers) => {
-                self.clear();
-                AppAction::Quit
-            }
-            KeyCode::Char(_) if key.modifiers.intersects(KeyModifiers::ALT) => {
-                self.clear();
-                AppAction::Noop
-            }
-            KeyCode::Char(value) => self.translate_char(value),
-            _ => {
-                self.clear();
-                AppAction::Noop
-            }
+        if let Some(value) = digit_from_key(key) {
+            return self.translate_digit(value);
         }
+
+        let Some(gesture) = KeyGesture::from_key_event(key) else {
+            self.clear();
+            return AppAction::Noop;
+        };
+
+        self.translate_gesture(gesture)
     }
 
     pub fn clear(&mut self) {
@@ -1978,55 +1961,36 @@ impl KeyboardInput {
         }
     }
 
-    fn translate_char(&mut self, value: char) -> AppAction {
-        if value == '+' {
-            self.clear();
-            return AppAction::OpenCreate;
-        }
-
-        if value == '?' {
-            self.clear();
-            return AppAction::OpenHelp;
-        }
-
-        if value.eq_ignore_ascii_case(&'d') {
-            self.clear();
-            return AppAction::OpenDelete;
-        }
-
-        if value.eq_ignore_ascii_case(&'c') {
-            self.clear();
-            return AppAction::OpenCopy;
-        }
-
-        if value.is_ascii_digit() {
-            return self.translate_digit(value);
-        }
-
-        let value = value.to_ascii_lowercase();
-
+    fn translate_gesture(&mut self, gesture: KeyGesture) -> AppAction {
         match self.pending {
             PendingKey::Digit(_) => {
                 self.clear();
-                self.translate_weekday_start(value)
+                self.translate_gesture(gesture)
             }
-            PendingKey::T => {
+            PendingKey::Sequence(first) => {
                 self.clear();
-                match value {
-                    'u' => AppAction::JumpToWeekday(Weekday::Tuesday),
-                    'h' => AppAction::JumpToWeekday(Weekday::Thursday),
-                    _ => self.translate_weekday_start(value),
+                if let Some(command) = self
+                    .bindings
+                    .command_for_sequence(&KeySequence::two(first, gesture))
+                {
+                    return command.app_action();
+                }
+
+                self.translate_gesture(gesture)
+            }
+            PendingKey::None => {
+                let sequence = KeySequence::one(gesture);
+                if self.bindings.is_prefix(&sequence) {
+                    self.pending = PendingKey::Sequence(gesture);
+                    AppAction::Noop
+                } else if let Some(command) = self.bindings.command_for_sequence(&sequence) {
+                    self.clear();
+                    command.app_action()
+                } else {
+                    self.clear();
+                    AppAction::Noop
                 }
             }
-            PendingKey::S => {
-                self.clear();
-                match value {
-                    'a' => AppAction::JumpToWeekday(Weekday::Saturday),
-                    'u' => AppAction::JumpToWeekday(Weekday::Sunday),
-                    _ => self.translate_weekday_start(value),
-                }
-            }
-            PendingKey::None => self.translate_weekday_start(value),
         }
     }
 
@@ -2054,23 +2018,572 @@ impl KeyboardInput {
             }
         }
     }
+}
 
-    fn translate_weekday_start(&mut self, value: char) -> AppAction {
-        match value {
-            'm' => AppAction::JumpToWeekday(Weekday::Monday),
-            'w' => AppAction::JumpToWeekday(Weekday::Wednesday),
-            'f' => AppAction::JumpToWeekday(Weekday::Friday),
-            't' => {
-                self.pending = PendingKey::T;
-                AppAction::Noop
-            }
-            's' => {
-                self.pending = PendingKey::S;
-                AppAction::Noop
-            }
-            'q' => AppAction::Quit,
-            _ => AppAction::Noop,
+impl Default for KeyboardInput {
+    fn default() -> Self {
+        Self::new(KeyBindings::default())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBindings {
+    entries: Vec<KeyBinding>,
+}
+
+impl KeyBindings {
+    pub fn from_lists(lists: KeyBindingLists) -> Result<Self, KeyBindingError> {
+        let entries = lists.into_entries()?;
+        validate_key_bindings(&entries)?;
+        Ok(Self { entries })
+    }
+
+    pub fn default_lists() -> KeyBindingLists {
+        KeyBindingLists::default()
+    }
+
+    pub fn with_overrides(overrides: KeyBindingOverrides) -> Result<Self, KeyBindingError> {
+        let mut lists = KeyBindingLists::default();
+        overrides.apply_to(&mut lists);
+        Self::from_lists(lists)
+    }
+
+    fn command_for_sequence(&self, sequence: &KeySequence) -> Option<KeyCommand> {
+        self.entries
+            .iter()
+            .find_map(|entry| (entry.sequence == *sequence).then_some(entry.command))
+    }
+
+    fn is_prefix(&self, sequence: &KeySequence) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.sequence.starts_with(sequence) && entry.sequence != *sequence)
+    }
+
+    pub fn display_for(&self, command: KeyCommand) -> String {
+        let labels = self
+            .entries
+            .iter()
+            .filter(|entry| entry.command == command)
+            .map(|entry| entry.sequence.label())
+            .collect::<Vec<_>>();
+
+        if labels.is_empty() {
+            command.default_label().to_string()
+        } else {
+            labels.join(" / ")
         }
+    }
+}
+
+impl Default for KeyBindings {
+    fn default() -> Self {
+        Self::from_lists(KeyBindingLists::default()).expect("default keybindings are valid")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBindingLists {
+    pub move_left: Vec<String>,
+    pub move_right: Vec<String>,
+    pub move_up: Vec<String>,
+    pub move_down: Vec<String>,
+    pub open_day_or_edit: Vec<String>,
+    pub close_day: Vec<String>,
+    pub create_event: Vec<String>,
+    pub delete_event: Vec<String>,
+    pub copy_event: Vec<String>,
+    pub help: Vec<String>,
+    pub quit: Vec<String>,
+    pub jump_monday: Vec<String>,
+    pub jump_tuesday: Vec<String>,
+    pub jump_wednesday: Vec<String>,
+    pub jump_thursday: Vec<String>,
+    pub jump_friday: Vec<String>,
+    pub jump_saturday: Vec<String>,
+    pub jump_sunday: Vec<String>,
+}
+
+impl Default for KeyBindingLists {
+    fn default() -> Self {
+        Self {
+            move_left: vec!["left".to_string()],
+            move_right: vec!["right".to_string()],
+            move_up: vec!["up".to_string()],
+            move_down: vec!["down".to_string()],
+            open_day_or_edit: vec!["enter".to_string()],
+            close_day: vec!["esc".to_string()],
+            create_event: vec!["+".to_string()],
+            delete_event: vec!["d".to_string()],
+            copy_event: vec!["c".to_string()],
+            help: vec!["?".to_string()],
+            quit: vec!["q".to_string(), "ctrl-c".to_string()],
+            jump_monday: vec!["m".to_string()],
+            jump_tuesday: vec!["tu".to_string()],
+            jump_wednesday: vec!["w".to_string()],
+            jump_thursday: vec!["th".to_string()],
+            jump_friday: vec!["f".to_string()],
+            jump_saturday: vec!["sa".to_string()],
+            jump_sunday: vec!["su".to_string()],
+        }
+    }
+}
+
+impl KeyBindingLists {
+    fn into_entries(self) -> Result<Vec<KeyBinding>, KeyBindingError> {
+        let mut entries = Vec::new();
+        push_entries(&mut entries, KeyCommand::MoveLeft, self.move_left)?;
+        push_entries(&mut entries, KeyCommand::MoveRight, self.move_right)?;
+        push_entries(&mut entries, KeyCommand::MoveUp, self.move_up)?;
+        push_entries(&mut entries, KeyCommand::MoveDown, self.move_down)?;
+        push_entries(
+            &mut entries,
+            KeyCommand::OpenDayOrEdit,
+            self.open_day_or_edit,
+        )?;
+        push_entries(&mut entries, KeyCommand::CloseDay, self.close_day)?;
+        push_entries(&mut entries, KeyCommand::CreateEvent, self.create_event)?;
+        push_entries(&mut entries, KeyCommand::DeleteEvent, self.delete_event)?;
+        push_entries(&mut entries, KeyCommand::CopyEvent, self.copy_event)?;
+        push_entries(&mut entries, KeyCommand::Help, self.help)?;
+        push_entries(&mut entries, KeyCommand::Quit, self.quit)?;
+        push_entries(&mut entries, KeyCommand::JumpMonday, self.jump_monday)?;
+        push_entries(&mut entries, KeyCommand::JumpTuesday, self.jump_tuesday)?;
+        push_entries(&mut entries, KeyCommand::JumpWednesday, self.jump_wednesday)?;
+        push_entries(&mut entries, KeyCommand::JumpThursday, self.jump_thursday)?;
+        push_entries(&mut entries, KeyCommand::JumpFriday, self.jump_friday)?;
+        push_entries(&mut entries, KeyCommand::JumpSaturday, self.jump_saturday)?;
+        push_entries(&mut entries, KeyCommand::JumpSunday, self.jump_sunday)?;
+        Ok(entries)
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct KeyBindingOverrides {
+    pub move_left: Option<Vec<String>>,
+    pub move_right: Option<Vec<String>>,
+    pub move_up: Option<Vec<String>>,
+    pub move_down: Option<Vec<String>>,
+    pub open_day_or_edit: Option<Vec<String>>,
+    pub close_day: Option<Vec<String>>,
+    pub create_event: Option<Vec<String>>,
+    pub delete_event: Option<Vec<String>>,
+    pub copy_event: Option<Vec<String>>,
+    pub help: Option<Vec<String>>,
+    pub quit: Option<Vec<String>>,
+    pub jump_monday: Option<Vec<String>>,
+    pub jump_tuesday: Option<Vec<String>>,
+    pub jump_wednesday: Option<Vec<String>>,
+    pub jump_thursday: Option<Vec<String>>,
+    pub jump_friday: Option<Vec<String>>,
+    pub jump_saturday: Option<Vec<String>>,
+    pub jump_sunday: Option<Vec<String>>,
+}
+
+impl KeyBindingOverrides {
+    fn apply_to(self, lists: &mut KeyBindingLists) {
+        if let Some(value) = self.move_left {
+            lists.move_left = value;
+        }
+        if let Some(value) = self.move_right {
+            lists.move_right = value;
+        }
+        if let Some(value) = self.move_up {
+            lists.move_up = value;
+        }
+        if let Some(value) = self.move_down {
+            lists.move_down = value;
+        }
+        if let Some(value) = self.open_day_or_edit {
+            lists.open_day_or_edit = value;
+        }
+        if let Some(value) = self.close_day {
+            lists.close_day = value;
+        }
+        if let Some(value) = self.create_event {
+            lists.create_event = value;
+        }
+        if let Some(value) = self.delete_event {
+            lists.delete_event = value;
+        }
+        if let Some(value) = self.copy_event {
+            lists.copy_event = value;
+        }
+        if let Some(value) = self.help {
+            lists.help = value;
+        }
+        if let Some(value) = self.quit {
+            lists.quit = value;
+        }
+        if let Some(value) = self.jump_monday {
+            lists.jump_monday = value;
+        }
+        if let Some(value) = self.jump_tuesday {
+            lists.jump_tuesday = value;
+        }
+        if let Some(value) = self.jump_wednesday {
+            lists.jump_wednesday = value;
+        }
+        if let Some(value) = self.jump_thursday {
+            lists.jump_thursday = value;
+        }
+        if let Some(value) = self.jump_friday {
+            lists.jump_friday = value;
+        }
+        if let Some(value) = self.jump_saturday {
+            lists.jump_saturday = value;
+        }
+        if let Some(value) = self.jump_sunday {
+            lists.jump_sunday = value;
+        }
+    }
+}
+
+fn push_entries(
+    entries: &mut Vec<KeyBinding>,
+    command: KeyCommand,
+    keys: Vec<String>,
+) -> Result<(), KeyBindingError> {
+    if keys.is_empty() {
+        return Err(KeyBindingError::new(format!(
+            "{} must define at least one key",
+            command.config_name()
+        )));
+    }
+
+    for key in keys {
+        entries.push(KeyBinding {
+            command,
+            sequence: KeySequence::parse(&key)?,
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_key_bindings(entries: &[KeyBinding]) -> Result<(), KeyBindingError> {
+    let mut seen = HashMap::new();
+    for entry in entries {
+        if let Some(existing) = seen.insert(entry.sequence.clone(), entry.command) {
+            return Err(KeyBindingError::new(format!(
+                "key '{}' is bound to both {} and {}",
+                entry.sequence.label(),
+                existing.config_name(),
+                entry.command.config_name()
+            )));
+        }
+    }
+
+    for left in entries {
+        for right in entries {
+            if left.sequence != right.sequence && right.sequence.starts_with(&left.sequence) {
+                return Err(KeyBindingError::new(format!(
+                    "key '{}' conflicts with longer key '{}'",
+                    left.sequence.label(),
+                    right.sequence.label()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyBinding {
+    command: KeyCommand,
+    sequence: KeySequence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct KeySequence(Vec<KeyGesture>);
+
+impl KeySequence {
+    fn one(gesture: KeyGesture) -> Self {
+        Self(vec![gesture])
+    }
+
+    fn two(first: KeyGesture, second: KeyGesture) -> Self {
+        Self(vec![first, second])
+    }
+
+    fn parse(value: &str) -> Result<Self, KeyBindingError> {
+        if value.is_empty() {
+            return Err(KeyBindingError::new("key binding may not be empty"));
+        }
+
+        let normalized = value.to_ascii_lowercase();
+        if let Some(gesture) = KeyGesture::parse_named(&normalized)? {
+            return Ok(Self::one(gesture));
+        }
+
+        let chars = normalized.chars().collect::<Vec<_>>();
+        match chars.as_slice() {
+            [single] => Ok(Self::one(KeyGesture::parse_printable(*single)?)),
+            [first, second] => Ok(Self::two(
+                KeyGesture::parse_printable(*first)?,
+                KeyGesture::parse_printable(*second)?,
+            )),
+            _ => Err(KeyBindingError::new(format!(
+                "unsupported key binding '{value}'"
+            ))),
+        }
+    }
+
+    fn starts_with(&self, prefix: &Self) -> bool {
+        self.0.starts_with(&prefix.0)
+    }
+
+    fn label(&self) -> String {
+        if self.0.len() == 2
+            && self
+                .0
+                .iter()
+                .all(|gesture| matches!(gesture, KeyGesture::Char(_)))
+        {
+            self.0
+                .iter()
+                .map(|gesture| gesture.label())
+                .collect::<String>()
+        } else {
+            self.0
+                .iter()
+                .map(|gesture| gesture.label())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum KeyGesture {
+    Named(NamedKey),
+    Char(char),
+    Ctrl(char),
+}
+
+impl KeyGesture {
+    fn parse_named(value: &str) -> Result<Option<Self>, KeyBindingError> {
+        let gesture = match value {
+            "left" => Self::Named(NamedKey::Left),
+            "right" => Self::Named(NamedKey::Right),
+            "up" => Self::Named(NamedKey::Up),
+            "down" => Self::Named(NamedKey::Down),
+            "enter" => Self::Named(NamedKey::Enter),
+            "esc" | "escape" => Self::Named(NamedKey::Esc),
+            value if value.starts_with("ctrl-") => {
+                let key = value.trim_start_matches("ctrl-");
+                let mut chars = key.chars();
+                let Some(value) = chars.next() else {
+                    return Err(KeyBindingError::new("ctrl binding requires a key"));
+                };
+                if chars.next().is_some() || !value.is_ascii_alphabetic() {
+                    return Err(KeyBindingError::new(format!(
+                        "unsupported control binding 'ctrl-{key}'"
+                    )));
+                }
+                Self::Ctrl(value.to_ascii_lowercase())
+            }
+            _ => return Ok(None),
+        };
+
+        Ok(Some(gesture))
+    }
+
+    fn parse_printable(value: char) -> Result<Self, KeyBindingError> {
+        if value.is_ascii_digit() {
+            return Err(KeyBindingError::new(format!(
+                "digit key '{value}' is reserved for day jumps"
+            )));
+        }
+        if value.is_control() {
+            return Err(KeyBindingError::new("control characters are unsupported"));
+        }
+
+        Ok(Self::Char(value.to_ascii_lowercase()))
+    }
+
+    fn from_key_event(key: KeyEvent) -> Option<Self> {
+        if key.modifiers.intersects(KeyModifiers::ALT) {
+            return None;
+        }
+
+        match key.code {
+            KeyCode::Left if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Left)),
+            KeyCode::Right if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Right)),
+            KeyCode::Up if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Up)),
+            KeyCode::Down if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Down)),
+            KeyCode::Enter if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Enter)),
+            KeyCode::Esc if key.modifiers.is_empty() => Some(Self::Named(NamedKey::Esc)),
+            KeyCode::Char(value) if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Some(Self::Ctrl(value.to_ascii_lowercase()))
+            }
+            KeyCode::Char(value)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                Some(Self::Char(value.to_ascii_lowercase()))
+            }
+            _ => None,
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Named(named) => named.label().to_string(),
+            Self::Char(value) => value.to_string(),
+            Self::Ctrl(value) => format!("Ctrl-{}", value.to_ascii_uppercase()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NamedKey {
+    Left,
+    Right,
+    Up,
+    Down,
+    Enter,
+    Esc,
+}
+
+impl NamedKey {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Up => "Up",
+            Self::Down => "Down",
+            Self::Enter => "Enter",
+            Self::Esc => "Esc",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyCommand {
+    MoveLeft,
+    MoveRight,
+    MoveUp,
+    MoveDown,
+    OpenDayOrEdit,
+    CloseDay,
+    CreateEvent,
+    DeleteEvent,
+    CopyEvent,
+    Help,
+    Quit,
+    JumpMonday,
+    JumpTuesday,
+    JumpWednesday,
+    JumpThursday,
+    JumpFriday,
+    JumpSaturday,
+    JumpSunday,
+}
+
+impl KeyCommand {
+    const fn app_action(self) -> AppAction {
+        match self {
+            Self::MoveLeft => AppAction::MoveDays(-1),
+            Self::MoveRight => AppAction::MoveDays(1),
+            Self::MoveUp => AppAction::MoveDays(-7),
+            Self::MoveDown => AppAction::MoveDays(7),
+            Self::OpenDayOrEdit => AppAction::OpenDay,
+            Self::CloseDay => AppAction::CloseDay,
+            Self::CreateEvent => AppAction::OpenCreate,
+            Self::DeleteEvent => AppAction::OpenDelete,
+            Self::CopyEvent => AppAction::OpenCopy,
+            Self::Help => AppAction::OpenHelp,
+            Self::Quit => AppAction::Quit,
+            Self::JumpMonday => AppAction::JumpToWeekday(Weekday::Monday),
+            Self::JumpTuesday => AppAction::JumpToWeekday(Weekday::Tuesday),
+            Self::JumpWednesday => AppAction::JumpToWeekday(Weekday::Wednesday),
+            Self::JumpThursday => AppAction::JumpToWeekday(Weekday::Thursday),
+            Self::JumpFriday => AppAction::JumpToWeekday(Weekday::Friday),
+            Self::JumpSaturday => AppAction::JumpToWeekday(Weekday::Saturday),
+            Self::JumpSunday => AppAction::JumpToWeekday(Weekday::Sunday),
+        }
+    }
+
+    const fn config_name(self) -> &'static str {
+        match self {
+            Self::MoveLeft => "move_left",
+            Self::MoveRight => "move_right",
+            Self::MoveUp => "move_up",
+            Self::MoveDown => "move_down",
+            Self::OpenDayOrEdit => "open_day_or_edit",
+            Self::CloseDay => "close_day",
+            Self::CreateEvent => "create_event",
+            Self::DeleteEvent => "delete_event",
+            Self::CopyEvent => "copy_event",
+            Self::Help => "help",
+            Self::Quit => "quit",
+            Self::JumpMonday => "jump_monday",
+            Self::JumpTuesday => "jump_tuesday",
+            Self::JumpWednesday => "jump_wednesday",
+            Self::JumpThursday => "jump_thursday",
+            Self::JumpFriday => "jump_friday",
+            Self::JumpSaturday => "jump_saturday",
+            Self::JumpSunday => "jump_sunday",
+        }
+    }
+
+    const fn default_label(self) -> &'static str {
+        match self {
+            Self::MoveLeft => "Left",
+            Self::MoveRight => "Right",
+            Self::MoveUp => "Up",
+            Self::MoveDown => "Down",
+            Self::OpenDayOrEdit => "Enter",
+            Self::CloseDay => "Esc",
+            Self::CreateEvent => "+",
+            Self::DeleteEvent => "d",
+            Self::CopyEvent => "c",
+            Self::Help => "?",
+            Self::Quit => "q / Ctrl-C",
+            Self::JumpMonday => "m",
+            Self::JumpTuesday => "tu",
+            Self::JumpWednesday => "w",
+            Self::JumpThursday => "th",
+            Self::JumpFriday => "f",
+            Self::JumpSaturday => "sa",
+            Self::JumpSunday => "su",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyBindingError {
+    reason: String,
+}
+
+impl KeyBindingError {
+    fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for KeyBindingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.reason)
+    }
+}
+
+impl std::error::Error for KeyBindingError {}
+
+fn digit_from_key(key: KeyEvent) -> Option<char> {
+    match key.code {
+        KeyCode::Char(value)
+            if value.is_ascii_digit()
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            Some(value)
+        }
+        _ => None,
     }
 }
 
@@ -2147,8 +2660,7 @@ enum PendingKey {
     #[default]
     None,
     Digit(u8),
-    T,
-    S,
+    Sequence(KeyGesture),
 }
 
 fn ctrl_c(value: char, modifiers: KeyModifiers) -> bool {
@@ -2244,6 +2756,66 @@ mod tests {
             let action = input.translate(key);
             app.apply_with_agenda_source(action, source);
         }
+    }
+
+    #[test]
+    fn configured_keybindings_replace_default_normal_mode_commands() {
+        let bindings = KeyBindings::with_overrides(KeyBindingOverrides {
+            create_event: Some(vec!["n".to_string()]),
+            help: Some(vec!["h".to_string()]),
+            quit: Some(vec!["x".to_string()]),
+            ..KeyBindingOverrides::default()
+        })
+        .expect("custom bindings are valid");
+        let mut input = KeyboardInput::new(bindings);
+
+        assert_eq!(input.translate(char_key('+')), AppAction::Noop);
+        assert_eq!(input.translate(char_key('n')), AppAction::OpenCreate);
+        assert_eq!(input.translate(char_key('?')), AppAction::Noop);
+        assert_eq!(input.translate(char_key('h')), AppAction::OpenHelp);
+        assert_eq!(input.translate(char_key('q')), AppAction::Noop);
+        assert_eq!(input.translate(char_key('x')), AppAction::Quit);
+    }
+
+    #[test]
+    fn configured_two_key_weekday_sequence_waits_for_second_key() {
+        let bindings = KeyBindings::with_overrides(KeyBindingOverrides {
+            jump_tuesday: Some(vec!["xy".to_string()]),
+            ..KeyBindingOverrides::default()
+        })
+        .expect("custom bindings are valid");
+        let mut input = KeyboardInput::new(bindings);
+
+        assert_eq!(input.translate(char_key('x')), AppAction::Noop);
+        assert_eq!(
+            input.translate(char_key('y')),
+            AppAction::JumpToWeekday(Weekday::Tuesday)
+        );
+    }
+
+    #[test]
+    fn keybinding_validation_rejects_digits_duplicates_and_prefixes() {
+        let digit_err = KeyBindings::with_overrides(KeyBindingOverrides {
+            create_event: Some(vec!["1".to_string()]),
+            ..KeyBindingOverrides::default()
+        })
+        .expect_err("digits are reserved");
+        assert!(digit_err.to_string().contains("reserved for day jumps"));
+
+        let duplicate_err = KeyBindings::with_overrides(KeyBindingOverrides {
+            create_event: Some(vec!["x".to_string()]),
+            quit: Some(vec!["x".to_string()]),
+            ..KeyBindingOverrides::default()
+        })
+        .expect_err("duplicate binding fails");
+        assert!(duplicate_err.to_string().contains("bound to both"));
+
+        let prefix_err = KeyBindings::with_overrides(KeyBindingOverrides {
+            create_event: Some(vec!["t".to_string()]),
+            ..KeyBindingOverrides::default()
+        })
+        .expect_err("prefix binding fails");
+        assert!(prefix_err.to_string().contains("conflicts with longer key"));
     }
 
     #[test]

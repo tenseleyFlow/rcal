@@ -33,7 +33,7 @@ fn invalid_date_flag_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("invalid --date value '2026-02-30'"));
     assert!(stderr.contains("Usage:"));
-    assert!(stderr.contains("rcal [--date YYYY-MM-DD]"));
+    assert!(stderr.contains("rcal [--config PATH|--no-config]"));
 }
 
 #[test]

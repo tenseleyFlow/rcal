@@ -18,10 +18,14 @@ use crate::{
     agenda::{ConfiguredAgendaSource, HolidayProvider, LocalEventStoreError, default_events_file},
     app::{
         AppState, CreateEventInputResult, EventCopyInputResult, EventCopySubmission,
-        EventDeleteInputResult, EventDeleteSubmission, EventFormMode, HelpInputResult,
+        EventDeleteInputResult, EventDeleteSubmission, EventFormMode, HelpInputResult, KeyBindings,
         KeyboardInput, MouseInput, RecurrenceChoiceInputResult,
     },
     calendar::CalendarDate,
+    config::{
+        ConfigError, ConfigHolidaySource, UserConfig, init_config_file, load_discovered_config,
+        load_explicit_config,
+    },
     reminders::{
         ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file,
         notification_backend_name, run_daemon, run_once, test_notification,
@@ -32,7 +36,7 @@ use crate::{
     },
     tui::{
         AppView, DEFAULT_RENDER_HEIGHT, DEFAULT_RENDER_WIDTH, hit_test_app_date,
-        render_app_to_string_with_agenda_source,
+        render_app_to_string_with_agenda_source_and_keybindings,
     },
 };
 
@@ -41,13 +45,16 @@ const HELP: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\n\n",
     "Usage:\n",
-    "  rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n\n",
+    "  rcal [--config PATH|--no-config] [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]\n",
+    "  rcal config init [--path PATH] [--force]\n\n",
     "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
-    "  rcal reminders install [--events-file PATH]\n",
+    "  rcal reminders install [--events-file PATH] [--state-file PATH]\n",
     "  rcal reminders uninstall\n",
     "  rcal reminders status\n",
     "  rcal reminders test [--verbose]\n\n",
     "Options:\n",
+    "  --config PATH                       Load a specific config file.\n",
+    "  --no-config                         Ignore any discovered config file.\n",
     "  --date YYYY-MM-DD                   Open with the given date selected.\n",
     "  --events-file PATH                  Read and write local user events at PATH.\n",
     "  --holiday-source off|us-federal|nager\n",
@@ -55,6 +62,10 @@ const HELP: &str = concat!(
     "  --holiday-country CC                Country code for --holiday-source nager. Default: US.\n",
     "  -h, --help                          Show this help.\n",
     "  -V, --version                       Show version.\n\n",
+    "Config:\n",
+    "  rcal config init                     Write a commented starter TOML config.\n",
+    "  Config is discovered at $XDG_CONFIG_HOME/rcal/config.toml, else ~/.config/rcal/config.toml.\n",
+    "  CLI flags override config values. Reminder services snapshot resolved paths at install time.\n\n",
     "Keys:\n",
     "  Arrow keys move selection; Enter opens day view; Esc returns to month; q exits.\n",
     "  ? opens contextual help.\n",
@@ -79,6 +90,7 @@ pub struct AppConfig {
     pub events_file: PathBuf,
     pub holiday_source: HolidaySourceConfig,
     pub holiday_country: String,
+    pub keybindings: KeyBindings,
 }
 
 impl AppConfig {
@@ -88,6 +100,7 @@ impl AppConfig {
             events_file: default_events_file(),
             holiday_source: HolidaySourceConfig::UsFederal,
             holiday_country: "US".to_string(),
+            keybindings: KeyBindings::default(),
         }
     }
 }
@@ -103,17 +116,28 @@ pub enum HolidaySourceConfig {
 pub enum CliAction {
     Run(AppConfig),
     Reminders(ReminderCliAction),
+    Config(ConfigCliAction),
     Help,
     Version,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigCliAction {
+    Init { path: Option<PathBuf>, force: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReminderCliAction {
     Run(ReminderRunConfig),
-    Install { events_file: PathBuf },
+    Install {
+        events_file: PathBuf,
+        state_file: PathBuf,
+    },
     Uninstall,
     Status,
-    Test { verbose: bool },
+    Test {
+        verbose: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +160,14 @@ pub enum CliError {
     MissingHolidayCountryValue,
     InvalidHolidayCountry(String),
     HolidayCountryRequiresNager,
+    DuplicateConfig,
+    MissingConfigValue,
+    ConfigAndNoConfig,
+    MissingConfigCommand,
+    UnknownConfigCommand(String),
+    DuplicateConfigInitPath,
+    MissingConfigInitPathValue,
+    Config(ConfigError),
     MissingReminderCommand,
     UnknownReminderCommand(String),
     DuplicateStateFile,
@@ -178,6 +210,16 @@ impl fmt::Display for CliError {
                     "--holiday-country may only be used with --holiday-source nager"
                 )
             }
+            Self::DuplicateConfig => write!(f, "--config may only be provided once"),
+            Self::MissingConfigValue => write!(f, "--config requires a path"),
+            Self::ConfigAndNoConfig => write!(f, "--config and --no-config cannot be combined"),
+            Self::MissingConfigCommand => write!(f, "config requires a command: init"),
+            Self::UnknownConfigCommand(command) => write!(f, "unknown config command: {command}"),
+            Self::DuplicateConfigInitPath => {
+                write!(f, "config init --path may only be provided once")
+            }
+            Self::MissingConfigInitPathValue => write!(f, "config init --path requires a path"),
+            Self::Config(err) => write!(f, "{err}"),
             Self::MissingReminderCommand => write!(
                 f,
                 "reminders requires one of: run, install, uninstall, status, test"
@@ -196,6 +238,12 @@ impl fmt::Display for CliError {
 }
 
 impl std::error::Error for CliError {}
+
+impl From<ConfigError> for CliError {
+    fn from(err: ConfigError) -> Self {
+        Self::Config(err)
+    }
+}
 
 pub fn run_terminal<I>(args: I) -> std::process::ExitCode
 where
@@ -217,7 +265,7 @@ where
     W: Write,
     E: Write,
 {
-    match parse_args(args, default_start_date()) {
+    match parse_runtime_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
             let agenda_source = match agenda_source(&config) {
@@ -225,14 +273,20 @@ where
                 Err(err) => return local_event_error_exit(&mut stderr, err),
             };
             let (width, height) = terminal_size();
-            let rendered =
-                render_app_to_string_with_agenda_source(&app, width, height, &agenda_source);
+            let rendered = render_app_to_string_with_agenda_source_and_keybindings(
+                &app,
+                width,
+                height,
+                &agenda_source,
+                &config.keybindings,
+            );
             match write!(stdout, "{rendered}") {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
         Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
+        Ok(CliAction::Config(action)) => run_config_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -254,19 +308,20 @@ where
     W: Write,
     E: Write,
 {
-    match parse_args(args, default_start_date()) {
+    match parse_runtime_args(args, default_start_date()) {
         Ok(CliAction::Run(config)) => {
             let app = AppState::new(config.start_date);
             let agenda_source = match agenda_source(&config) {
                 Ok(source) => source,
                 Err(err) => return local_event_error_exit(&mut stderr, err),
             };
-            match run_interactive_terminal(stdout, app, agenda_source) {
+            match run_interactive_terminal(stdout, app, agenda_source, config.keybindings) {
                 Ok(()) => std::process::ExitCode::SUCCESS,
                 Err(err) => io_error_exit(&mut stderr, err),
             }
         }
         Ok(CliAction::Reminders(action)) => run_reminder_action(action, &mut stdout, &mut stderr),
+        Ok(CliAction::Config(action)) => run_config_action(action, &mut stdout, &mut stderr),
         Ok(CliAction::Help) => match write!(stdout, "{HELP}") {
             Ok(()) => std::process::ExitCode::SUCCESS,
             Err(err) => io_error_exit(&mut stderr, err),
@@ -286,17 +341,148 @@ pub fn parse_args<I>(args: I, today: Date) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
+    parse_args_with_config(args, today, UserConfig::empty(), None)
+}
+
+fn parse_runtime_args<I>(args: I, today: Date) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
     let args = args.into_iter().collect::<Vec<_>>();
+    let (args, config_selection) = strip_config_flags(args)?;
+
+    if let Some(action) = early_static_action(&args) {
+        return Ok(action);
+    }
+
+    if let Some(first) = args.first()
+        && first == "config"
+    {
+        return parse_config_args(args.into_iter().skip(1), config_selection.path);
+    }
+
+    let config = match &config_selection {
+        ConfigSelection {
+            no_config: true, ..
+        } => UserConfig::empty(),
+        ConfigSelection {
+            path: Some(path), ..
+        } => load_explicit_config(path.clone())?,
+        ConfigSelection { .. } => load_discovered_config()?,
+    };
+
+    parse_args_with_config(args, today, config, config_selection.path)
+}
+
+fn parse_args_with_config<I>(
+    args: I,
+    today: Date,
+    user_config: UserConfig,
+    explicit_config_path: Option<PathBuf>,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let args = args.into_iter().collect::<Vec<_>>();
+    if let Some(first) = args.first()
+        && first == "config"
+    {
+        return parse_config_args(args.into_iter().skip(1), explicit_config_path);
+    }
+
     if let Some(first) = args.first()
         && first == "reminders"
     {
-        return parse_reminder_args(args.into_iter().skip(1));
+        return parse_reminder_args(args.into_iter().skip(1), &user_config);
     }
 
-    parse_calendar_args(args, today)
+    parse_calendar_args(args, today, user_config)
 }
 
-fn parse_calendar_args<I>(args: I, today: Date) -> Result<CliAction, CliError>
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigSelection {
+    path: Option<PathBuf>,
+    no_config: bool,
+}
+
+fn strip_config_flags(args: Vec<OsString>) -> Result<(Vec<OsString>, ConfigSelection), CliError> {
+    let mut stripped = Vec::new();
+    let mut config_path = None;
+    let mut no_config = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--config" {
+            if config_path.is_some() {
+                return Err(CliError::DuplicateConfig);
+            }
+            config_path = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingConfigValue)?,
+            ));
+            continue;
+        }
+
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--config="))
+        {
+            if config_path.is_some() {
+                return Err(CliError::DuplicateConfig);
+            }
+            config_path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if arg == "--no-config" {
+            no_config = true;
+            continue;
+        }
+
+        stripped.push(arg);
+    }
+
+    if config_path.is_some() && no_config {
+        return Err(CliError::ConfigAndNoConfig);
+    }
+
+    Ok((
+        stripped,
+        ConfigSelection {
+            path: config_path,
+            no_config,
+        },
+    ))
+}
+
+fn early_static_action(args: &[OsString]) -> Option<CliAction> {
+    let first = args.first()?;
+    if first == "--help" || first == "-h" {
+        return Some(CliAction::Help);
+    }
+    if first == "--version" || first == "-V" {
+        return Some(CliAction::Version);
+    }
+    if first == "reminders"
+        && let Some(second) = args.get(1)
+        && (second == "--help" || second == "-h")
+    {
+        return Some(CliAction::Help);
+    }
+    if first == "config"
+        && let Some(second) = args.get(1)
+        && (second == "--help" || second == "-h")
+    {
+        return Some(CliAction::Help);
+    }
+
+    None
+}
+
+fn parse_calendar_args<I>(
+    args: I,
+    today: Date,
+    user_config: UserConfig,
+) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -403,8 +589,19 @@ where
         return Err(CliError::UnknownArgument(display_arg(&arg)));
     }
 
-    let holiday_country_was_provided = holiday_country.is_some();
+    let cli_holiday_country_was_provided = holiday_country.is_some();
     let mut config = AppConfig::new(CalendarDate::from(start_date.unwrap_or(today)));
+    if let Some(events_file) = user_config.events_file {
+        config.events_file = events_file;
+    }
+    if let Some(holiday_source) = user_config.holiday_source {
+        config.holiday_source = holiday_source.into();
+    }
+    if let Some(holiday_country) = user_config.holiday_country {
+        config.holiday_country = holiday_country;
+    }
+    config.keybindings = user_config.keybindings;
+
     if let Some(events_file) = events_file {
         config.events_file = events_file;
     }
@@ -414,14 +611,85 @@ where
     if let Some(holiday_country) = holiday_country {
         config.holiday_country = holiday_country;
     }
-    if holiday_country_was_provided && config.holiday_source != HolidaySourceConfig::Nager {
+    if cli_holiday_country_was_provided && config.holiday_source != HolidaySourceConfig::Nager {
         return Err(CliError::HolidayCountryRequiresNager);
     }
 
     Ok(CliAction::Run(config))
 }
 
-fn parse_reminder_args<I>(args: I) -> Result<CliAction, CliError>
+impl From<ConfigHolidaySource> for HolidaySourceConfig {
+    fn from(value: ConfigHolidaySource) -> Self {
+        match value {
+            ConfigHolidaySource::Off => Self::Off,
+            ConfigHolidaySource::UsFederal => Self::UsFederal,
+            ConfigHolidaySource::Nager => Self::Nager,
+        }
+    }
+}
+
+fn parse_config_args<I>(
+    args: I,
+    explicit_config_path: Option<PathBuf>,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingConfigCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownConfigCommand(display_arg(&command)));
+    };
+
+    match command {
+        "init" => parse_config_init_args(args, explicit_config_path),
+        "--help" | "-h" => Ok(CliAction::Help),
+        _ => Err(CliError::UnknownConfigCommand(command.to_string())),
+    }
+}
+
+fn parse_config_init_args<I>(
+    args: I,
+    explicit_config_path: Option<PathBuf>,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut path = explicit_config_path;
+    let mut force = false;
+    let mut args = args.into_iter();
+
+    while let Some(arg) = args.next() {
+        if arg == "--path" {
+            if path.is_some() {
+                return Err(CliError::DuplicateConfigInitPath);
+            }
+            path = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingConfigInitPathValue)?,
+            ));
+            continue;
+        }
+
+        if let Some(value) = arg.to_str().and_then(|value| value.strip_prefix("--path=")) {
+            if path.is_some() {
+                return Err(CliError::DuplicateConfigInitPath);
+            }
+            path = Some(PathBuf::from(value));
+            continue;
+        }
+
+        if arg == "--force" {
+            force = true;
+            continue;
+        }
+
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+
+    Ok(CliAction::Config(ConfigCliAction::Init { path, force }))
+}
+
+fn parse_reminder_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -432,8 +700,8 @@ where
     };
 
     match command {
-        "run" => parse_reminder_run_args(args),
-        "install" => parse_reminder_install_args(args),
+        "run" => parse_reminder_run_args(args, user_config),
+        "install" => parse_reminder_install_args(args, user_config),
         "uninstall" => no_extra_reminder_args(args, ReminderCliAction::Uninstall),
         "status" => no_extra_reminder_args(args, ReminderCliAction::Status),
         "test" => parse_reminder_test_args(args),
@@ -442,7 +710,7 @@ where
     }
 }
 
-fn parse_reminder_run_args<I>(args: I) -> Result<CliAction, CliError>
+fn parse_reminder_run_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
@@ -500,18 +768,29 @@ where
 
     Ok(CliAction::Reminders(ReminderCliAction::Run(
         ReminderRunConfig {
-            events_file: events_file.unwrap_or_else(default_events_file),
-            state_file: state_file.unwrap_or_else(default_state_file),
+            events_file: events_file.unwrap_or_else(|| {
+                user_config
+                    .events_file
+                    .clone()
+                    .unwrap_or_else(default_events_file)
+            }),
+            state_file: state_file.unwrap_or_else(|| {
+                user_config
+                    .reminder_state_file
+                    .clone()
+                    .unwrap_or_else(default_state_file)
+            }),
             once,
         },
     )))
 }
 
-fn parse_reminder_install_args<I>(args: I) -> Result<CliAction, CliError>
+fn parse_reminder_install_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
 where
     I: IntoIterator<Item = OsString>,
 {
     let mut events_file = None;
+    let mut state_file = None;
     let mut args = args.into_iter();
 
     while let Some(arg) = args.next() {
@@ -534,12 +813,42 @@ where
             events_file = Some(PathBuf::from(value));
             continue;
         }
+        if arg == "--state-file" {
+            if state_file.is_some() {
+                return Err(CliError::DuplicateStateFile);
+            }
+            state_file = Some(PathBuf::from(
+                args.next().ok_or(CliError::MissingStateFileValue)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--state-file="))
+        {
+            if state_file.is_some() {
+                return Err(CliError::DuplicateStateFile);
+            }
+            state_file = Some(PathBuf::from(value));
+            continue;
+        }
 
         return Err(CliError::UnknownArgument(display_arg(&arg)));
     }
 
     Ok(CliAction::Reminders(ReminderCliAction::Install {
-        events_file: events_file.unwrap_or_else(default_events_file),
+        events_file: events_file.unwrap_or_else(|| {
+            user_config
+                .events_file
+                .clone()
+                .unwrap_or_else(default_events_file)
+        }),
+        state_file: state_file.unwrap_or_else(|| {
+            user_config
+                .reminder_state_file
+                .clone()
+                .unwrap_or_else(default_state_file)
+        }),
     }))
 }
 
@@ -596,6 +905,22 @@ fn agenda_source(config: &AppConfig) -> Result<ConfiguredAgendaSource, LocalEven
     ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays)
 }
 
+fn run_config_action(
+    action: ConfigCliAction,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::process::ExitCode {
+    match action {
+        ConfigCliAction::Init { path, force } => match init_config_file(path, force) {
+            Ok(path) => {
+                let _ = writeln!(stdout, "wrote config {}", path.display());
+                std::process::ExitCode::SUCCESS
+            }
+            Err(err) => config_error_exit(stderr, err),
+        },
+    }
+}
+
 fn run_reminder_action(
     action: ReminderCliAction,
     stdout: &mut impl Write,
@@ -628,8 +953,11 @@ fn run_reminder_action(
                 }
             }
         }
-        ReminderCliAction::Install { events_file } => {
-            let config = match ServiceConfig::new(events_file) {
+        ReminderCliAction::Install {
+            events_file,
+            state_file,
+        } => {
+            let config = match ServiceConfig::new(events_file, state_file) {
                 Ok(config) => config,
                 Err(err) => return service_error_exit(stderr, err),
             };
@@ -686,6 +1014,7 @@ fn run_interactive_terminal<W>(
     stdout: W,
     app: AppState,
     agenda_source: ConfiguredAgendaSource,
+    keybindings: KeyBindings,
 ) -> io::Result<()>
 where
     W: Write,
@@ -714,7 +1043,7 @@ where
         return Err(err);
     }
 
-    let result = run_event_loop(&mut terminal, app, agenda_source);
+    let result = run_event_loop(&mut terminal, app, agenda_source, keybindings);
     let cleanup_result = restore_terminal(&mut terminal);
 
     result.and(cleanup_result)
@@ -724,17 +1053,18 @@ fn run_event_loop<W>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     mut app: AppState,
     mut agenda_source: ConfiguredAgendaSource,
+    keybindings: KeyBindings,
 ) -> io::Result<()>
 where
     W: Write,
 {
-    let mut keyboard = KeyboardInput::default();
+    let mut keyboard = KeyboardInput::new(keybindings.clone());
     let mut mouse = MouseInput::default();
 
     loop {
         terminal.draw(|frame| {
             frame.render_widget(
-                AppView::with_agenda_source(&app, &agenda_source),
+                AppView::with_agenda_source_and_keybindings(&app, &agenda_source, &keybindings),
                 frame.area(),
             );
         })?;
@@ -989,6 +1319,11 @@ fn reminder_error_exit(stderr: &mut impl Write, err: ReminderError) -> std::proc
     std::process::ExitCode::FAILURE
 }
 
+fn config_error_exit(stderr: &mut impl Write, err: ConfigError) -> std::process::ExitCode {
+    let _ = writeln!(stderr, "error: {err}");
+    std::process::ExitCode::from(2)
+}
+
 fn service_error_exit(stderr: &mut impl Write, err: ServiceError) -> std::process::ExitCode {
     let _ = writeln!(stderr, "error: {err}");
     std::process::ExitCode::FAILURE
@@ -997,6 +1332,9 @@ fn service_error_exit(stderr: &mut impl Write, err: ServiceError) -> std::proces
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{env, fs};
+
+    use crate::app::{KeyBindingOverrides, KeyCommand};
     use crate::calendar::CalendarMonth;
     use time::Month;
 
@@ -1006,6 +1344,28 @@ mod tests {
 
     fn arg(value: &str) -> OsString {
         OsString::from(value)
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        env::temp_dir()
+            .join(format!("rcal-cli-test-{}", std::process::id()))
+            .join(name)
+    }
+
+    fn config_with_paths_and_keys() -> UserConfig {
+        UserConfig {
+            path: Some(PathBuf::from("/tmp/rcal/config.toml")),
+            events_file: Some(PathBuf::from("/tmp/config-events.json")),
+            holiday_source: Some(ConfigHolidaySource::Nager),
+            holiday_country: Some("GB".to_string()),
+            reminder_state_file: Some(PathBuf::from("/tmp/config-state.json")),
+            keybindings: KeyBindings::with_overrides(KeyBindingOverrides {
+                create_event: Some(vec!["n".to_string()]),
+                help: Some(vec!["h".to_string()]),
+                ..KeyBindingOverrides::default()
+            })
+            .expect("test bindings are valid"),
+        }
     }
 
     #[test]
@@ -1154,6 +1514,142 @@ mod tests {
     }
 
     #[test]
+    fn config_values_merge_under_cli_overrides() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args_with_config(
+            [
+                arg("--events-file"),
+                arg("/tmp/cli-events.json"),
+                arg("--holiday-country"),
+                arg("ca"),
+            ],
+            today.into(),
+            config_with_paths_and_keys(),
+            None,
+        )
+        .expect("parse succeeds");
+
+        let CliAction::Run(config) = action else {
+            panic!("calendar args should run the app");
+        };
+
+        assert_eq!(config.events_file, PathBuf::from("/tmp/cli-events.json"));
+        assert_eq!(config.holiday_source, HolidaySourceConfig::Nager);
+        assert_eq!(config.holiday_country, "CA");
+        assert_eq!(config.keybindings.display_for(KeyCommand::CreateEvent), "n");
+    }
+
+    #[test]
+    fn explicit_runtime_config_file_is_loaded() {
+        let today = date(2026, Month::April, 23);
+        let path = temp_path("explicit/config.toml");
+        let root = path
+            .parent()
+            .expect("config dir")
+            .parent()
+            .expect("test root")
+            .to_path_buf();
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[paths]
+events_file = "events.json"
+
+[keybindings]
+create_event = ["n"]
+"#,
+        )
+        .expect("config writes");
+
+        let action = parse_runtime_args(
+            [
+                arg("--config"),
+                path.as_os_str().to_os_string(),
+                arg("--date"),
+                arg("2026-04-23"),
+            ],
+            today.into(),
+        )
+        .expect("runtime parse succeeds");
+
+        let _ = fs::remove_dir_all(&root);
+        let CliAction::Run(config) = action else {
+            panic!("calendar args should run the app");
+        };
+        assert_eq!(
+            config.events_file,
+            path.parent().expect("config dir").join("events.json")
+        );
+        assert_eq!(config.keybindings.display_for(KeyCommand::CreateEvent), "n");
+    }
+
+    #[test]
+    fn global_config_flags_reject_conflicts() {
+        let today = date(2026, Month::April, 23);
+
+        assert_eq!(
+            parse_runtime_args(
+                [arg("--config"), arg("/tmp/config.toml"), arg("--no-config")],
+                today.into(),
+            )
+            .expect_err("conflicting config flags fail"),
+            CliError::ConfigAndNoConfig
+        );
+    }
+
+    #[test]
+    fn config_init_args_parse_path_and_force() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_args(
+            [
+                arg("config"),
+                arg("init"),
+                arg("--path=/tmp/rcal/config.toml"),
+                arg("--force"),
+            ],
+            today.into(),
+        )
+        .expect("parse succeeds");
+
+        assert_eq!(
+            action,
+            CliAction::Config(ConfigCliAction::Init {
+                path: Some(PathBuf::from("/tmp/rcal/config.toml")),
+                force: true,
+            })
+        );
+    }
+
+    #[test]
+    fn config_init_can_use_global_config_path_without_loading_it() {
+        let today = date(2026, Month::April, 23);
+
+        let action = parse_runtime_args(
+            [
+                arg("--config"),
+                arg("/tmp/nonexistent-rcal-config.toml"),
+                arg("config"),
+                arg("init"),
+                arg("--force"),
+            ],
+            today.into(),
+        )
+        .expect("config init parses without loading missing config");
+
+        assert_eq!(
+            action,
+            CliAction::Config(ConfigCliAction::Init {
+                path: Some(PathBuf::from("/tmp/nonexistent-rcal-config.toml")),
+                force: true,
+            })
+        );
+    }
+
+    #[test]
     fn reminder_run_args_set_events_and_state_paths() {
         let today = date(2026, Month::April, 23);
 
@@ -1181,6 +1677,46 @@ mod tests {
     }
 
     #[test]
+    fn reminder_commands_use_config_default_paths() {
+        let today = date(2026, Month::April, 23);
+
+        let run_action = parse_args_with_config(
+            [arg("reminders"), arg("run"), arg("--once")],
+            today.into(),
+            config_with_paths_and_keys(),
+            None,
+        )
+        .expect("run parses");
+        assert_eq!(
+            run_action,
+            CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
+                events_file: PathBuf::from("/tmp/config-events.json"),
+                state_file: PathBuf::from("/tmp/config-state.json"),
+                once: true,
+            }))
+        );
+
+        let install_action = parse_args_with_config(
+            [
+                arg("reminders"),
+                arg("install"),
+                arg("--state-file=/tmp/override-state.json"),
+            ],
+            today.into(),
+            config_with_paths_and_keys(),
+            None,
+        )
+        .expect("install parses");
+        assert_eq!(
+            install_action,
+            CliAction::Reminders(ReminderCliAction::Install {
+                events_file: PathBuf::from("/tmp/config-events.json"),
+                state_file: PathBuf::from("/tmp/override-state.json"),
+            })
+        );
+    }
+
+    #[test]
     fn reminder_install_args_set_events_path() {
         let today = date(2026, Month::April, 23);
 
@@ -1198,6 +1734,7 @@ mod tests {
             action,
             CliAction::Reminders(ReminderCliAction::Install {
                 events_file: PathBuf::from("/tmp/events.json"),
+                state_file: default_state_file(),
             })
         );
     }

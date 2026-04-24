@@ -25,9 +25,10 @@ cargo run -- --date 2026-04-23
 ## Usage
 
 ```sh
-rcal [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]
+rcal [--config PATH|--no-config] [--date YYYY-MM-DD] [--events-file PATH] [--holiday-source off|us-federal|nager] [--holiday-country CC]
+rcal config init [--path PATH] [--force]
 rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
-rcal reminders install [--events-file PATH]
+rcal reminders install [--events-file PATH] [--state-file PATH]
 rcal reminders uninstall
 rcal reminders status
 rcal reminders test [--verbose]
@@ -35,6 +36,8 @@ rcal reminders test [--verbose]
 
 Options:
 
+- `--config PATH`: load a specific TOML config file.
+- `--no-config`: ignore any discovered config file.
 - `--date YYYY-MM-DD`: open with a deterministic selected date.
 - `--events-file PATH`: read and write local user-created events at `PATH`.
   By default, rcal uses `$XDG_DATA_HOME/rcal/events.json`,
@@ -47,6 +50,13 @@ Options:
   requires `--holiday-source nager`; default is `US`.
 - `--help`: show CLI help.
 - `--version`: show the installed version.
+
+Config is discovered at `$XDG_CONFIG_HOME/rcal/config.toml`, else
+`~/.config/rcal/config.toml`. It is never created automatically; run
+`rcal config init` to write a commented starter file. Omitted settings keep
+built-in defaults, and CLI flags override config values. Config can set the
+events file, holiday source and country, reminder state file, and normal-mode
+keybindings. Modal/form keys stay fixed for now.
 
 Nager.Date is cache-first and opt-in. Default startup does not need network
 access.
@@ -78,7 +88,9 @@ Reminder notifications are delivered by a user-level background service. Use
 `rcal reminders install` to install it, `rcal reminders status` to inspect it,
 and `rcal reminders test` to send a test notification. On macOS, notification
 delivery uses `osascript` because it is more reliable for CLI-launched
-notifications than the generic notification backend.
+notifications than the generic notification backend. Reminder install snapshots
+the resolved events and state file paths, so reinstall the service after config
+changes that affect reminders.
 
 ## Layout
 

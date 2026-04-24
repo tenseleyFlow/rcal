@@ -14,7 +14,7 @@ use crate::{
     },
     app::{
         AppState, CreateEventForm, CreateEventFormRowKind, EventCopyChoice, EventDeleteChoice,
-        RecurrenceEditChoice, ViewMode,
+        KeyBindings, KeyCommand, RecurrenceEditChoice, ViewMode,
     },
     calendar::{
         CalendarCell, CalendarDate, CalendarMonth, CalendarWeek, DAYS_PER_WEEK, MONTH_GRID_WEEKS,
@@ -28,7 +28,6 @@ pub const DEFAULT_RENDER_HEIGHT: u16 = 26;
 const HEADER_HEIGHT: u16 = 2;
 const VERTICAL_GRID_LINES: u16 = DAYS_PER_WEEK as u16 + 1;
 const HORIZONTAL_GRID_LINES: u16 = MONTH_GRID_WEEKS as u16 + 1;
-const HELP_HINT: &str = "?: Help";
 static EMPTY_AGENDA_SOURCE: EmptyAgendaSource = EmptyAgendaSource;
 
 #[derive(Clone, Copy)]
@@ -57,14 +56,22 @@ impl<'a> MonthGrid<'a> {
 
 impl Widget for MonthGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_month_grid(self.month, self.agenda_source, area, buf, self.styles);
+        render_month_grid(
+            self.month,
+            self.agenda_source,
+            area,
+            buf,
+            self.styles,
+            &KeyBindings::default(),
+        );
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct AppView<'a> {
     app: &'a AppState,
     agenda_source: &'a dyn AgendaSource,
+    keybindings: KeyBindings,
 }
 
 impl<'a> AppView<'a> {
@@ -73,7 +80,19 @@ impl<'a> AppView<'a> {
     }
 
     pub fn with_agenda_source(app: &'a AppState, agenda_source: &'a dyn AgendaSource) -> Self {
-        Self { app, agenda_source }
+        Self::with_agenda_source_and_keybindings(app, agenda_source, &KeyBindings::default())
+    }
+
+    pub fn with_agenda_source_and_keybindings(
+        app: &'a AppState,
+        agenda_source: &'a dyn AgendaSource,
+        keybindings: &KeyBindings,
+    ) -> Self {
+        Self {
+            app,
+            agenda_source,
+            keybindings: keybindings.clone(),
+        }
     }
 }
 
@@ -82,16 +101,38 @@ impl Widget for AppView<'_> {
         match (self.app.view_mode(), ResponsiveLayout::for_area(area)) {
             (ViewMode::Month, layout) if layout.should_render_month_grid() => {
                 let month = self.app.calendar_month();
-                MonthGrid::with_agenda_source(&month, self.agenda_source).render(area, buf);
+                render_month_grid(
+                    &month,
+                    self.agenda_source,
+                    area,
+                    buf,
+                    MonthGridStyles::new(),
+                    &self.keybindings,
+                );
             }
             (ViewMode::Month, layout) if layout.should_render_week_view() => {
                 let month = self.app.calendar_month();
-                WeekGrid::with_agenda_source(&month, self.agenda_source).render(area, buf);
+                render_week_grid(
+                    &month,
+                    self.agenda_source,
+                    area,
+                    buf,
+                    MonthGridStyles::new(),
+                    &self.keybindings,
+                );
             }
-            (ViewMode::Month, _) => {
-                DayView::responsive_fallback(self.app, self.agenda_source).render(area, buf)
-            }
-            (ViewMode::Day, _) => DayView::focused(self.app, self.agenda_source).render(area, buf),
+            (ViewMode::Month, _) => DayView::responsive_fallback_with_keybindings(
+                self.app,
+                self.agenda_source,
+                self.keybindings.clone(),
+            )
+            .render(area, buf),
+            (ViewMode::Day, _) => DayView::focused_with_keybindings(
+                self.app,
+                self.agenda_source,
+                self.keybindings.clone(),
+            )
+            .render(area, buf),
         }
 
         if let Some(form) = self.app.create_form() {
@@ -107,17 +148,24 @@ impl Widget for AppView<'_> {
             render_copy_choice_modal(choice, area, buf, CreateModalStyles::new());
         }
         if self.app.is_showing_help() {
-            render_help_modal(self.app.view_mode(), area, buf, CreateModalStyles::new());
+            render_help_modal(
+                self.app.view_mode(),
+                area,
+                buf,
+                CreateModalStyles::new(),
+                &self.keybindings,
+            );
         }
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DayView<'a> {
     app: &'a AppState,
     agenda_source: &'a dyn AgendaSource,
     context: DayViewContext,
     styles: DayViewStyles,
+    keybindings: KeyBindings,
 }
 
 impl<'a> DayView<'a> {
@@ -127,6 +175,7 @@ impl<'a> DayView<'a> {
             agenda_source,
             context: DayViewContext::Focused,
             styles: DayViewStyles::new(),
+            keybindings: KeyBindings::default(),
         }
     }
 
@@ -136,6 +185,35 @@ impl<'a> DayView<'a> {
             agenda_source,
             context: DayViewContext::ResponsiveFallback,
             styles: DayViewStyles::new(),
+            keybindings: KeyBindings::default(),
+        }
+    }
+
+    fn focused_with_keybindings(
+        app: &'a AppState,
+        agenda_source: &'a dyn AgendaSource,
+        keybindings: KeyBindings,
+    ) -> Self {
+        Self {
+            app,
+            agenda_source,
+            context: DayViewContext::Focused,
+            styles: DayViewStyles::new(),
+            keybindings,
+        }
+    }
+
+    fn responsive_fallback_with_keybindings(
+        app: &'a AppState,
+        agenda_source: &'a dyn AgendaSource,
+        keybindings: KeyBindings,
+    ) -> Self {
+        Self {
+            app,
+            agenda_source,
+            context: DayViewContext::ResponsiveFallback,
+            styles: DayViewStyles::new(),
+            keybindings,
         }
     }
 }
@@ -149,6 +227,7 @@ impl Widget for DayView<'_> {
             area,
             buf,
             self.styles,
+            &self.keybindings,
         );
     }
 }
@@ -185,7 +264,14 @@ impl<'a> WeekGrid<'a> {
 
 impl Widget for WeekGrid<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        render_week_grid(self.month, self.agenda_source, area, buf, self.styles);
+        render_week_grid(
+            self.month,
+            self.agenda_source,
+            area,
+            buf,
+            self.styles,
+            &KeyBindings::default(),
+        );
     }
 }
 
@@ -551,9 +637,29 @@ pub fn render_app_to_string_with_agenda_source<S>(
 where
     S: AgendaSource,
 {
+    render_app_to_string_with_agenda_source_and_keybindings(
+        app,
+        width,
+        height,
+        agenda_source,
+        &KeyBindings::default(),
+    )
+}
+
+pub fn render_app_to_string_with_agenda_source_and_keybindings<S>(
+    app: &AppState,
+    width: u16,
+    height: u16,
+    agenda_source: &S,
+    keybindings: &KeyBindings,
+) -> String
+where
+    S: AgendaSource,
+{
     let area = Rect::new(0, 0, width, height);
     let mut buffer = Buffer::empty(area);
-    AppView::with_agenda_source(app, agenda_source).render(area, &mut buffer);
+    AppView::with_agenda_source_and_keybindings(app, agenda_source, keybindings)
+        .render(area, &mut buffer);
     buffer_to_string(&buffer)
 }
 
@@ -653,6 +759,7 @@ fn render_month_grid(
     area: Rect,
     buf: &mut Buffer,
     styles: MonthGridStyles,
+    keybindings: &KeyBindings,
 ) {
     let Some(layout) = MonthGridLayout::new(area) else {
         render_too_small_message(area, buf, styles);
@@ -660,7 +767,7 @@ fn render_month_grid(
     };
 
     buf.set_style(area, Style::default());
-    render_title(month, &layout, buf, styles);
+    render_title(month, &layout, buf, styles, keybindings);
     render_weekdays(&layout, buf, styles);
 
     for cell in month
@@ -688,6 +795,7 @@ fn render_week_grid(
     area: Rect,
     buf: &mut Buffer,
     styles: MonthGridStyles,
+    keybindings: &KeyBindings,
 ) {
     let Some(layout) = WeekGridLayout::new(area) else {
         render_too_small_message(area, buf, styles);
@@ -700,7 +808,7 @@ fn render_week_grid(
     };
 
     buf.set_style(area, Style::default());
-    render_week_title(selected_week, &layout, buf, styles);
+    render_week_title(selected_week, &layout, buf, styles, keybindings);
     render_weekdays_for_week(&layout, buf, styles);
 
     for cell in selected_week
@@ -755,6 +863,7 @@ fn render_day_view(
     area: Rect,
     buf: &mut Buffer,
     styles: DayViewStyles,
+    keybindings: &KeyBindings,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -763,7 +872,7 @@ fn render_day_view(
     let layout = DayViewLayout::new(area);
     let agenda = app.day_agenda(agenda_source);
     buf.set_style(area, Style::default());
-    render_day_header(&agenda, context, &layout, buf, styles);
+    render_day_header(&agenda, context, &layout, buf, styles, keybindings);
 
     match layout.mode {
         DayViewLayoutMode::Split | DayViewLayoutMode::Stacked => {
@@ -800,6 +909,7 @@ fn render_day_header(
     layout: &DayViewLayout,
     buf: &mut Buffer,
     styles: DayViewStyles,
+    keybindings: &KeyBindings,
 ) {
     let title = day_title(agenda.date);
     write_centered(
@@ -817,6 +927,7 @@ fn render_day_header(
         layout.area.width,
         &title,
         styles.help_hint,
+        keybindings,
     );
 
     let Some(summary_y) = layout.summary_y else {
@@ -824,7 +935,11 @@ fn render_day_header(
     };
 
     let summary = match context {
-        DayViewContext::Focused => format!("{} | Esc returns to month", agenda_summary(agenda)),
+        DayViewContext::Focused => format!(
+            "{} | {} returns to month",
+            agenda_summary(agenda),
+            keybindings.display_for(KeyCommand::CloseDay)
+        ),
         DayViewContext::ResponsiveFallback => agenda_summary(agenda),
     };
     write_centered(
@@ -1137,12 +1252,18 @@ fn render_copy_choice_modal(
     );
 }
 
-fn render_help_modal(view_mode: ViewMode, area: Rect, buf: &mut Buffer, styles: CreateModalStyles) {
+fn render_help_modal(
+    view_mode: ViewMode,
+    area: Rect,
+    buf: &mut Buffer,
+    styles: CreateModalStyles,
+    keybindings: &KeyBindings,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    let rows = help_rows(view_mode);
+    let rows = help_rows(view_mode, keybindings);
     let modal = help_modal_area(area, rows.len());
     fill_rect(buf, modal, styles.panel);
     draw_border(buf, modal, styles.border, BorderCharacters::normal());
@@ -1165,7 +1286,7 @@ fn render_help_modal(view_mode: ViewMode, area: Rect, buf: &mut Buffer, styles: 
     let description_x = content.x.saturating_add(key_width).saturating_add(2);
     let description_width = content.right().saturating_sub(description_x);
     let mut y = content.y.saturating_add(2);
-    for (key, description) in rows {
+    for (key, description) in &rows {
         if y >= content.bottom().saturating_sub(2) {
             break;
         }
@@ -1186,7 +1307,7 @@ fn render_help_modal(view_mode: ViewMode, area: Rect, buf: &mut Buffer, styles: 
         content.bottom().saturating_sub(1),
         content.x,
         content.width,
-        "Esc / ? close",
+        "Esc / Enter close",
         styles.footer,
     );
 }
@@ -1232,28 +1353,87 @@ fn help_heading(view_mode: ViewMode) -> &'static str {
     }
 }
 
-fn help_rows(view_mode: ViewMode) -> &'static [(&'static str, &'static str)] {
+fn help_rows(view_mode: ViewMode, keybindings: &KeyBindings) -> Vec<(String, &'static str)> {
     match view_mode {
-        ViewMode::Month => &[
-            ("Arrows", "Move the selected date"),
-            ("Digits", "Jump to a day, with quick two-digit refinement"),
-            ("Weekdays", "Jump within the selected week"),
-            ("Enter", "Open the focused day view"),
-            ("+", "Create an event on the selected date"),
-            ("Mouse", "Select a date; double-click to open"),
-            ("?", "Close this help"),
-            ("q", "Quit"),
+        ViewMode::Month => vec![
+            (
+                format!(
+                    "{} / {} / {} / {}",
+                    keybindings.display_for(KeyCommand::MoveLeft),
+                    keybindings.display_for(KeyCommand::MoveRight),
+                    keybindings.display_for(KeyCommand::MoveUp),
+                    keybindings.display_for(KeyCommand::MoveDown)
+                ),
+                "Move the selected date",
+            ),
+            (
+                "Digits".to_string(),
+                "Jump to a day, with quick two-digit refinement",
+            ),
+            (
+                format!(
+                    "{} {} {} {} {} {} {}",
+                    keybindings.display_for(KeyCommand::JumpMonday),
+                    keybindings.display_for(KeyCommand::JumpTuesday),
+                    keybindings.display_for(KeyCommand::JumpWednesday),
+                    keybindings.display_for(KeyCommand::JumpThursday),
+                    keybindings.display_for(KeyCommand::JumpFriday),
+                    keybindings.display_for(KeyCommand::JumpSaturday),
+                    keybindings.display_for(KeyCommand::JumpSunday)
+                ),
+                "Jump within the selected week",
+            ),
+            (
+                keybindings.display_for(KeyCommand::OpenDayOrEdit),
+                "Open the focused day view",
+            ),
+            (
+                keybindings.display_for(KeyCommand::CreateEvent),
+                "Create an event on the selected date",
+            ),
+            ("Mouse".to_string(), "Select a date; double-click to open"),
+            ("Esc / Enter".to_string(), "Close this help"),
+            (keybindings.display_for(KeyCommand::Quit), "Quit"),
         ],
-        ViewMode::Day => &[
-            ("Left/Right", "Move to the previous or next day"),
-            ("Up/Down", "Select a local event"),
-            ("Enter", "Edit the selected local event"),
-            ("c", "Copy the selected local event"),
-            ("d", "Delete the selected local event"),
-            ("+", "Create an event on this day"),
-            ("Esc", "Return to month view"),
-            ("?", "Close this help"),
-            ("q", "Quit"),
+        ViewMode::Day => vec![
+            (
+                format!(
+                    "{} / {}",
+                    keybindings.display_for(KeyCommand::MoveLeft),
+                    keybindings.display_for(KeyCommand::MoveRight)
+                ),
+                "Move to the previous or next day",
+            ),
+            (
+                format!(
+                    "{} / {}",
+                    keybindings.display_for(KeyCommand::MoveUp),
+                    keybindings.display_for(KeyCommand::MoveDown)
+                ),
+                "Select a local event",
+            ),
+            (
+                keybindings.display_for(KeyCommand::OpenDayOrEdit),
+                "Edit the selected local event",
+            ),
+            (
+                keybindings.display_for(KeyCommand::CopyEvent),
+                "Copy the selected local event",
+            ),
+            (
+                keybindings.display_for(KeyCommand::DeleteEvent),
+                "Delete the selected local event",
+            ),
+            (
+                keybindings.display_for(KeyCommand::CreateEvent),
+                "Create an event on this day",
+            ),
+            (
+                keybindings.display_for(KeyCommand::CloseDay),
+                "Return to month view",
+            ),
+            ("Esc / Enter".to_string(), "Close this help"),
+            (keybindings.display_for(KeyCommand::Quit), "Quit"),
         ],
     }
 }
@@ -1707,6 +1887,7 @@ fn render_title(
     layout: &MonthGridLayout,
     buf: &mut Buffer,
     styles: MonthGridStyles,
+    keybindings: &KeyBindings,
 ) {
     let title = format!("{} {}", month.current.month, month.current.year);
     write_centered(
@@ -1724,6 +1905,7 @@ fn render_title(
         layout.area.width,
         &title,
         styles.help_hint,
+        keybindings,
     );
 }
 
@@ -1760,6 +1942,7 @@ fn render_week_title(
     layout: &WeekGridLayout,
     buf: &mut Buffer,
     styles: MonthGridStyles,
+    keybindings: &KeyBindings,
 ) {
     let title = week_title(week);
     write_centered(
@@ -1777,6 +1960,7 @@ fn render_week_title(
         layout.area.width,
         &title,
         styles.help_hint,
+        keybindings,
     );
 }
 
@@ -2062,8 +2246,17 @@ fn write_centered(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, styl
     buf.set_stringn(start, y, text, usize::from(width), style);
 }
 
-fn render_title_hint(buf: &mut Buffer, y: u16, x: u16, width: u16, title: &str, style: Style) {
-    let hint_width = u16::try_from(HELP_HINT.len()).unwrap_or(u16::MAX);
+fn render_title_hint(
+    buf: &mut Buffer,
+    y: u16,
+    x: u16,
+    width: u16,
+    title: &str,
+    style: Style,
+    keybindings: &KeyBindings,
+) {
+    let hint = format!("{}: Help", keybindings.display_for(KeyCommand::Help));
+    let hint_width = u16::try_from(hint.len()).unwrap_or(u16::MAX);
     let title_width = u16::try_from(title.len()).unwrap_or(u16::MAX);
     if width <= hint_width.saturating_add(1) || title_width >= width {
         return;
@@ -2076,7 +2269,7 @@ fn render_title_hint(buf: &mut Buffer, y: u16, x: u16, width: u16, title: &str, 
         return;
     }
 
-    write_left(buf, y, hint_x, hint_width, HELP_HINT, style);
+    write_left(buf, y, hint_x, hint_width, &hint, style);
 }
 
 fn write_left(buf: &mut Buffer, y: u16, x: u16, width: u16, text: &str, style: Style) {
@@ -2628,7 +2821,7 @@ mod tests {
 
         assert!(rendered.contains("Month / Week keys"));
         assert!(rendered.contains("Open the focused day view"));
-        assert!(rendered.contains("Esc / ? close"));
+        assert!(rendered.contains("Esc / Enter close"));
         assert!(!rendered.contains("Delete the selected local event"));
     }
 
