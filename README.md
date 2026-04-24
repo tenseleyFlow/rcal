@@ -78,12 +78,77 @@ rcal providers microsoft calendars list --account work
 rcal providers microsoft sync --account work
 ```
 
-Users provide their own Azure app `client_id` and tenant in `config.toml`.
-Tokens are stored in the OS keychain. The provider syncs configured calendars
-through Graph `calendarView`, caches selected events separately from the local
-events JSON, and routes create/edit/delete/copy operations for Microsoft events
-back through Graph. Provider reminders fire from cached provider events after a
-sync; the reminder daemon does not sync remote calendars itself.
+For the current development release, users provide their own Microsoft Entra
+app registration `client_id` in `config.toml`. A future production release can
+ship an rcal-owned public/native client ID so end users do not need to create an
+Azure app. No client secret is used or stored; rcal stores user tokens in the OS
+keychain.
+
+### Microsoft Account Setup
+
+Create a config file:
+
+```sh
+rcal config init
+```
+
+Register a temporary local test app in the Microsoft Entra admin center:
+
+- Name: `rcal local test` or similar.
+- Supported account type:
+  - Personal Outlook/Hotmail/Live accounts: **Personal Microsoft accounts
+    only**.
+  - Work or school Microsoft 365 accounts: **Accounts in any organizational
+    directory**.
+- Redirect URI: platform **Mobile and desktop applications**, value
+  `http://localhost:8765/callback`.
+- API permissions: Microsoft Graph delegated `User.Read` and
+  `Calendars.ReadWrite`.
+- If Azure refuses the account type change with
+  `api.requestedAccessTokenVersion`, set the app manifest's
+  `requestedAccessTokenVersion` or `accessTokenAcceptedVersion` to `2`.
+
+Then edit `~/.config/rcal/config.toml`:
+
+```toml
+[providers]
+create_target = "microsoft" # or "local" to keep new events local-only
+
+[providers.microsoft]
+enabled = true
+default_account = "work"
+default_calendar = "CALENDAR_ID"
+sync_past_days = 30
+sync_future_days = 365
+
+[[providers.microsoft.accounts]]
+id = "work"
+client_id = "AZURE_APP_CLIENT_ID"
+tenant = "consumers"      # personal accounts
+# tenant = "organizations" # work/school accounts
+redirect_port = 8765
+calendars = ["CALENDAR_ID"]
+```
+
+Authenticate, list calendars, then copy the editable calendar ID into both
+`default_calendar` and `calendars`:
+
+```sh
+rcal providers microsoft auth login --account work --browser
+rcal providers microsoft calendars list --account work
+rcal providers microsoft sync --account work
+rcal
+```
+
+Use `rcal providers microsoft auth inspect --account work` to inspect safe
+token claims such as audience, scopes, tenant, and expiry. The command does not
+print the token body.
+
+The provider syncs configured calendars through Graph `calendarView`, caches
+selected events separately from the local events JSON, and routes
+create/edit/delete/copy operations for Microsoft events back through Graph.
+Provider reminders fire from cached provider events after a sync; the reminder
+daemon does not sync remote calendars itself.
 
 ## Controls
 

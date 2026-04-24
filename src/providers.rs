@@ -1410,6 +1410,7 @@ pub fn logout(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftTokenInspection {
     pub account_id: String,
+    pub token_format: String,
     pub stored_expires_at_epoch_seconds: u64,
     pub jwt_expires_at_epoch_seconds: Option<i64>,
     pub audience: Option<String>,
@@ -1432,14 +1433,21 @@ pub fn inspect_token(
         ))
     })?;
     let claims = access_token_claims(&token.access_token)?;
+    let claims_ref = claims.as_ref();
     Ok(MicrosoftTokenInspection {
         account_id: account_id.to_string(),
+        token_format: if claims_ref.is_some() {
+            "jwt"
+        } else {
+            "opaque"
+        }
+        .to_string(),
         stored_expires_at_epoch_seconds: token.expires_at_epoch_seconds,
-        jwt_expires_at_epoch_seconds: graph_i64(&claims, "exp"),
-        audience: graph_string(&claims, "aud"),
-        scopes: graph_string(&claims, "scp"),
-        roles: claims
-            .get("roles")
+        jwt_expires_at_epoch_seconds: claims_ref.and_then(|claims| graph_i64(claims, "exp")),
+        audience: claims_ref.and_then(|claims| graph_string(claims, "aud")),
+        scopes: claims_ref.and_then(|claims| graph_string(claims, "scp")),
+        roles: claims_ref
+            .and_then(|claims| claims.get("roles"))
             .and_then(Value::as_array)
             .map(|roles| {
                 roles
@@ -1449,10 +1457,10 @@ pub fn inspect_token(
                     .collect()
             })
             .unwrap_or_default(),
-        tenant_id: graph_string(&claims, "tid"),
-        issuer: graph_string(&claims, "iss"),
-        app_id: graph_string(&claims, "appid"),
-        authorized_party: graph_string(&claims, "azp"),
+        tenant_id: claims_ref.and_then(|claims| graph_string(claims, "tid")),
+        issuer: claims_ref.and_then(|claims| graph_string(claims, "iss")),
+        app_id: claims_ref.and_then(|claims| graph_string(claims, "appid")),
+        authorized_party: claims_ref.and_then(|claims| graph_string(claims, "azp")),
         has_refresh_token: !token.refresh_token.is_empty(),
     })
 }
@@ -1585,16 +1593,30 @@ fn login_browser(
         .and_then(|path| path.split_once('?').map(|(_, query)| query))
         .ok_or_else(|| ProviderError::Auth("OAuth callback did not include a query".to_string()))?;
     let params = parse_query(query);
-    let code = params
-        .get("code")
-        .ok_or_else(|| ProviderError::Auth("OAuth callback did not include code".to_string()))?;
-    if params.get("state") != Some(&state) {
-        return Err(ProviderError::Auth(
-            "OAuth callback state mismatch".to_string(),
-        ));
+    if let Some(error) = params.get("error") {
+        let description = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or("Microsoft did not provide an error description");
+        let message = format!("{error}: {description}");
+        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        return Err(ProviderError::Auth(message));
     }
-    let response_body = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nrcal Microsoft login complete. You can close this tab.\n";
-    let _ = stream.write_all(response_body.as_bytes());
+    let code = params.get("code").ok_or_else(|| {
+        let message = "OAuth callback did not include code".to_string();
+        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        ProviderError::Auth(message)
+    })?;
+    if params.get("state") != Some(&state) {
+        let message = "OAuth callback state mismatch".to_string();
+        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        return Err(ProviderError::Auth(message));
+    }
+    let _ = write_oauth_callback_response(
+        &mut stream,
+        true,
+        "rcal Microsoft login complete. You can close this tab.",
+    );
     let body = form_body(&[
         ("grant_type", "authorization_code"),
         ("client_id", account.client_id.as_str()),
@@ -1860,16 +1882,18 @@ fn token_from_response(response: MicrosoftHttpResponse) -> Result<MicrosoftToken
     })
 }
 
-fn access_token_claims(access_token: &str) -> Result<Value, ProviderError> {
-    let payload = access_token.split('.').nth(1).ok_or_else(|| {
-        ProviderError::Auth("stored Microsoft access token is not a JWT".to_string())
-    })?;
+fn access_token_claims(access_token: &str) -> Result<Option<Value>, ProviderError> {
+    let Some(payload) = access_token.split('.').nth(1) else {
+        return Ok(None);
+    };
     let bytes = base64_url_decode_no_pad(payload).ok_or_else(|| {
         ProviderError::Auth("stored Microsoft access token has invalid JWT encoding".to_string())
     })?;
-    serde_json::from_slice(&bytes).map_err(|err| {
-        ProviderError::Auth(format!("stored Microsoft access token is invalid: {err}"))
-    })
+    serde_json::from_slice(&bytes)
+        .map_err(|err| {
+            ProviderError::Auth(format!("stored Microsoft access token is invalid: {err}"))
+        })
+        .map(Some)
 }
 
 fn required_json_string(value: &Value, key: &str) -> Result<String, ProviderError> {
@@ -2381,6 +2405,26 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn write_oauth_callback_response(
+    stream: &mut impl Write,
+    success: bool,
+    message: &str,
+) -> io::Result<()> {
+    let status = if success { "200 OK" } else { "400 Bad Request" };
+    let heading = if success {
+        "rcal Microsoft login complete"
+    } else {
+        "rcal Microsoft login failed"
+    };
+    let body = format!("{heading}\n\n{message}\n");
+    write!(
+        stream,
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    )
+}
+
 fn pkce_verifier() -> String {
     let mut bytes = [0_u8; 32];
     if let Ok(mut file) = fs::File::open("/dev/urandom") {
@@ -2879,6 +2923,7 @@ mod tests {
         let inspection = inspect_token("work", &store).expect("token inspects");
 
         assert_eq!(inspection.account_id, "work");
+        assert_eq!(inspection.token_format, "jwt");
         assert_eq!(
             inspection.audience.as_deref(),
             Some("https://graph.microsoft.com")
@@ -2890,6 +2935,44 @@ mod tests {
         assert_eq!(inspection.tenant_id.as_deref(), Some("tenant-id"));
         assert_eq!(inspection.jwt_expires_at_epoch_seconds, Some(1_777_000_000));
         assert!(inspection.has_refresh_token);
+    }
+
+    #[test]
+    fn inspect_token_tolerates_opaque_access_tokens() {
+        let store = MemoryTokenStore::default();
+        store.tokens.borrow_mut().insert(
+            "work".to_string(),
+            MicrosoftToken {
+                access_token: "opaque-consumer-token".to_string(),
+                refresh_token: "refresh".to_string(),
+                expires_at_epoch_seconds: 1_777_000_100,
+            },
+        );
+
+        let inspection = inspect_token("work", &store).expect("opaque token inspects");
+
+        assert_eq!(inspection.token_format, "opaque");
+        assert_eq!(inspection.audience, None);
+        assert_eq!(inspection.scopes, None);
+        assert_eq!(inspection.jwt_expires_at_epoch_seconds, None);
+        assert!(inspection.has_refresh_token);
+    }
+
+    #[test]
+    fn oauth_callback_response_surfaces_browser_errors() {
+        let mut response = Vec::new();
+
+        write_oauth_callback_response(
+            &mut response,
+            false,
+            "invalid_request: the application must use consumers",
+        )
+        .expect("response writes");
+
+        let response = String::from_utf8(response).expect("utf8 response");
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("rcal Microsoft login failed"));
+        assert!(response.contains("invalid_request"));
     }
 
     #[test]

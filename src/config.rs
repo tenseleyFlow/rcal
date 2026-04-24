@@ -37,6 +37,9 @@ create_target = "local"
 
 [providers.microsoft]
 # Microsoft Graph provider for Outlook / Microsoft 365 calendars.
+# Current development builds require your own Microsoft Entra app client_id.
+# Use tenant = "consumers" for personal Outlook/Hotmail accounts and
+# tenant = "organizations" for work or school Microsoft 365 accounts.
 enabled = false
 default_account = "work"
 default_calendar = "CALENDAR_ID"

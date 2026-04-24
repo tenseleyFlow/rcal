@@ -1261,6 +1261,7 @@ fn run_microsoft_action(
                     "account={} authenticated=true",
                     inspection.account_id
                 );
+                let _ = writeln!(stdout, "token_format={}", inspection.token_format);
                 let _ = writeln!(
                     stdout,
                     "aud={}",
