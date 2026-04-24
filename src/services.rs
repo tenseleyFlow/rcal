@@ -2,7 +2,7 @@ use std::{
     error::Error,
     fmt, fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
 };
 
 use directories::BaseDirs;
@@ -79,14 +79,15 @@ impl CommandRunner for SystemCommandRunner {
     }
 
     fn status(&mut self, program: &str, args: &[String]) -> Result<bool, ServiceError> {
-        let status =
-            Command::new(program)
-                .args(args)
-                .status()
-                .map_err(|err| ServiceError::Command {
-                    program: program.to_string(),
-                    reason: err.to_string(),
-                })?;
+        let status = Command::new(program)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|err| ServiceError::Command {
+                program: program.to_string(),
+                reason: err.to_string(),
+            })?;
         Ok(status.success())
     }
 }
@@ -179,17 +180,33 @@ impl ServiceInstaller for MacLaunchAgent {
             })?;
         }
         write_file(&path, &mac_launch_agent_plist(config))?;
-        let _ = runner.run("launchctl", &["unload".to_string(), path_string(&path)]);
+        let domain = mac_launchctl_gui_domain()?;
+        let service_target = mac_launchctl_service_target(&domain);
+        if mac_launch_agent_loaded(runner, &service_target)? {
+            runner.run(
+                "launchctl",
+                &["bootout".to_string(), service_target.clone()],
+            )?;
+        }
         runner.run(
             "launchctl",
-            &["load".to_string(), "-w".to_string(), path_string(&path)],
+            &["bootstrap".to_string(), domain.clone(), path_string(&path)],
+        )?;
+        runner.run("launchctl", &["enable".to_string(), service_target.clone()])?;
+        runner.run(
+            "launchctl",
+            &["kickstart".to_string(), "-k".to_string(), service_target],
         )
     }
 
     fn uninstall(&self, runner: &mut dyn CommandRunner) -> Result<(), ServiceError> {
         let path = Self::plist_path()?;
+        let domain = mac_launchctl_gui_domain()?;
+        let service_target = mac_launchctl_service_target(&domain);
+        if mac_launch_agent_loaded(runner, &service_target)? {
+            runner.run("launchctl", &["bootout".to_string(), service_target])?;
+        }
         if path.exists() {
-            let _ = runner.run("launchctl", &["unload".to_string(), path_string(&path)]);
             fs::remove_file(&path).map_err(|err| ServiceError::Write {
                 path: path.clone(),
                 reason: err.to_string(),
@@ -203,15 +220,50 @@ impl ServiceInstaller for MacLaunchAgent {
         if !path.exists() {
             return Ok(ServiceStatus::NotInstalled);
         }
-        if runner.status(
-            "launchctl",
-            &["list".to_string(), SERVICE_LABEL.to_string()],
-        )? {
+        let domain = mac_launchctl_gui_domain()?;
+        let service_target = mac_launchctl_service_target(&domain);
+        if mac_launch_agent_loaded(runner, &service_target)? {
             Ok(ServiceStatus::Installed)
         } else {
             Ok(ServiceStatus::NotInstalled)
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launchctl_gui_domain() -> Result<String, ServiceError> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|err| ServiceError::Command {
+            program: "id".to_string(),
+            reason: err.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ServiceError::Command {
+            program: "id".to_string(),
+            reason: format!("exited with status {}", output.status),
+        });
+    }
+
+    let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(format!("gui/{uid}"))
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launchctl_service_target(domain: &str) -> String {
+    format!("{domain}/{SERVICE_LABEL}")
+}
+
+#[cfg(target_os = "macos")]
+fn mac_launch_agent_loaded(
+    runner: &mut dyn CommandRunner,
+    service_target: &str,
+) -> Result<bool, ServiceError> {
+    runner.status(
+        "launchctl",
+        &["print".to_string(), service_target.to_string()],
+    )
 }
 
 #[cfg(target_os = "linux")]
