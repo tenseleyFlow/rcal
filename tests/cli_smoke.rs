@@ -4,6 +4,10 @@ fn rcal() -> Command {
     Command::new(env!("CARGO_BIN_EXE_rcal"))
 }
 
+fn version_output() -> String {
+    format!("rcal {}\n", env!("CARGO_PKG_VERSION"))
+}
+
 #[test]
 fn deterministic_date_flag_succeeds() {
     let output = rcal()
@@ -43,7 +47,7 @@ fn help_flag_succeeds() {
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("rcal 0.1.0"));
+    assert!(stdout.contains(version_output().trim_end()));
     assert!(stdout.contains("Usage:"));
     assert!(stdout.contains("--holiday-source off|us-federal|nager"));
     assert!(stdout.contains("Left click selects a visible date"));
@@ -55,7 +59,7 @@ fn version_flag_succeeds() {
 
     assert!(output.status.success());
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "rcal 0.1.0\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), version_output());
 }
 
 #[test]
