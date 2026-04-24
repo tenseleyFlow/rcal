@@ -1326,6 +1326,7 @@ pub struct MicrosoftHttpRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftHttpResponse {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: String,
 }
 
@@ -1355,10 +1356,24 @@ impl MicrosoftHttpClient for ReqwestMicrosoftHttpClient {
             .send()
             .map_err(|err| ProviderError::Http(err.to_string()))?;
         let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
         let body = response
             .text()
             .map_err(|err| ProviderError::Http(err.to_string()))?;
-        Ok(MicrosoftHttpResponse { status, body })
+        Ok(MicrosoftHttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }
 
@@ -1390,6 +1405,56 @@ pub fn logout(
     token_store: &dyn MicrosoftTokenStore,
 ) -> Result<(), ProviderError> {
     token_store.delete(account_id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicrosoftTokenInspection {
+    pub account_id: String,
+    pub stored_expires_at_epoch_seconds: u64,
+    pub jwt_expires_at_epoch_seconds: Option<i64>,
+    pub audience: Option<String>,
+    pub scopes: Option<String>,
+    pub roles: Vec<String>,
+    pub tenant_id: Option<String>,
+    pub issuer: Option<String>,
+    pub app_id: Option<String>,
+    pub authorized_party: Option<String>,
+    pub has_refresh_token: bool,
+}
+
+pub fn inspect_token(
+    account_id: &str,
+    token_store: &dyn MicrosoftTokenStore,
+) -> Result<MicrosoftTokenInspection, ProviderError> {
+    let token = token_store.load(account_id)?.ok_or_else(|| {
+        ProviderError::Auth(format!(
+            "Microsoft account '{account_id}' is not authenticated"
+        ))
+    })?;
+    let claims = access_token_claims(&token.access_token)?;
+    Ok(MicrosoftTokenInspection {
+        account_id: account_id.to_string(),
+        stored_expires_at_epoch_seconds: token.expires_at_epoch_seconds,
+        jwt_expires_at_epoch_seconds: graph_i64(&claims, "exp"),
+        audience: graph_string(&claims, "aud"),
+        scopes: graph_string(&claims, "scp"),
+        roles: claims
+            .get("roles")
+            .and_then(Value::as_array)
+            .map(|roles| {
+                roles
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToString::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tenant_id: graph_string(&claims, "tid"),
+        issuer: graph_string(&claims, "iss"),
+        app_id: graph_string(&claims, "appid"),
+        authorized_party: graph_string(&claims, "azp"),
+        has_refresh_token: !token.refresh_token.is_empty(),
+    })
 }
 
 fn login_device_code(
@@ -1751,14 +1816,28 @@ fn parse_graph_empty_success(response: MicrosoftHttpResponse) -> Result<(), Prov
 }
 
 fn graph_error_message(response: MicrosoftHttpResponse) -> String {
+    let www_authenticate = response
+        .headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|(_, value)| value.as_str());
     if let Ok(value) = serde_json::from_str::<Value>(&response.body)
         && let Some(error) = value.get("error")
     {
         let code = graph_string(error, "code").unwrap_or_else(|| response.status.to_string());
         let message = graph_string(error, "message").unwrap_or_else(|| response.body.clone());
-        return format!("{code}: {message}");
+        return match www_authenticate {
+            Some(header) if !header.is_empty() => format!("{code}: {message} ({header})"),
+            _ => format!("{code}: {message}"),
+        };
     }
-    format!("HTTP {}: {}", response.status, response.body)
+    match (response.body.trim(), www_authenticate) {
+        ("", Some(header)) if !header.is_empty() => format!("HTTP {}: {header}", response.status),
+        (body, Some(header)) if !header.is_empty() => {
+            format!("HTTP {}: {body} ({header})", response.status)
+        }
+        (body, _) => format!("HTTP {}: {body}", response.status),
+    }
 }
 
 fn parse_oauth_json(response: MicrosoftHttpResponse) -> Result<Value, ProviderError> {
@@ -1778,6 +1857,18 @@ fn token_from_response(response: MicrosoftHttpResponse) -> Result<MicrosoftToken
         access_token,
         refresh_token,
         expires_at_epoch_seconds: current_epoch_seconds().saturating_add(expires_in),
+    })
+}
+
+fn access_token_claims(access_token: &str) -> Result<Value, ProviderError> {
+    let payload = access_token.split('.').nth(1).ok_or_else(|| {
+        ProviderError::Auth("stored Microsoft access token is not a JWT".to_string())
+    })?;
+    let bytes = base64_url_decode_no_pad(payload).ok_or_else(|| {
+        ProviderError::Auth("stored Microsoft access token has invalid JWT encoding".to_string())
+    })?;
+    serde_json::from_slice(&bytes).map_err(|err| {
+        ProviderError::Auth(format!("stored Microsoft access token is invalid: {err}"))
     })
 }
 
@@ -2335,6 +2426,33 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
     output
 }
 
+fn base64_url_decode_no_pad(input: &str) -> Option<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = 0_u32;
+    let mut bits = 0_u8;
+    for byte in input.bytes() {
+        if byte == b'=' {
+            break;
+        }
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        } as u32;
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push(((buffer >> bits) & 0xff) as u8);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    Some(output)
+}
+
 fn open_browser(url: &str) -> Result<(), ProviderError> {
     #[cfg(target_os = "macos")]
     let result = Command::new("open").arg(url).status();
@@ -2524,7 +2642,21 @@ mod tests {
         fn json(status: u16, value: Value) -> MicrosoftHttpResponse {
             MicrosoftHttpResponse {
                 status,
+                headers: Vec::new(),
                 body: value.to_string(),
+            }
+        }
+
+        fn text_with_header(
+            status: u16,
+            body: &str,
+            name: &str,
+            value: &str,
+        ) -> MicrosoftHttpResponse {
+            MicrosoftHttpResponse {
+                status,
+                headers: vec![(name.to_string(), value.to_string())],
+                body: body.to_string(),
             }
         }
     }
@@ -2699,6 +2831,65 @@ mod tests {
                 .iter()
                 .any(|(name, value)| name == "Authorization" && value == "Bearer access-token")
         );
+    }
+
+    #[test]
+    fn graph_errors_include_www_authenticate_header_when_body_is_empty() {
+        let response = RecordingHttpClient::text_with_header(
+            401,
+            "",
+            "WWW-Authenticate",
+            "Bearer error=\"invalid_token\", error_description=\"Invalid audience\"",
+        );
+
+        let err = parse_graph_success_json(response).expect_err("401 fails");
+
+        assert_eq!(
+            err.to_string(),
+            "Microsoft Graph error: HTTP 401: Bearer error=\"invalid_token\", error_description=\"Invalid audience\""
+        );
+    }
+
+    #[test]
+    fn inspect_token_reports_safe_jwt_claims_without_token_body() {
+        let store = MemoryTokenStore::default();
+        let claims = json!({
+            "aud": "https://graph.microsoft.com",
+            "scp": "User.Read Calendars.ReadWrite",
+            "tid": "tenant-id",
+            "iss": "https://sts.windows.net/tenant-id/",
+            "appid": "app-id",
+            "azp": "authorized-party",
+            "exp": 1_777_000_000
+        });
+        let access_token = format!(
+            "{}.{}.signature",
+            base64_url_no_pad(br#"{"alg":"none"}"#),
+            base64_url_no_pad(claims.to_string().as_bytes())
+        );
+        store.tokens.borrow_mut().insert(
+            "work".to_string(),
+            MicrosoftToken {
+                access_token,
+                refresh_token: "refresh".to_string(),
+                expires_at_epoch_seconds: 1_777_000_100,
+            },
+        );
+
+        let inspection = inspect_token("work", &store).expect("token inspects");
+
+        assert_eq!(inspection.account_id, "work");
+        assert_eq!(
+            inspection.audience.as_deref(),
+            Some("https://graph.microsoft.com")
+        );
+        assert_eq!(
+            inspection.scopes.as_deref(),
+            Some("User.Read Calendars.ReadWrite")
+        );
+        assert_eq!(inspection.tenant_id.as_deref(), Some("tenant-id"));
+        assert_eq!(inspection.jwt_expires_at_epoch_seconds, Some(1_777_000_000));
+        assert!(inspection.has_refresh_token);
     }
 
     #[test]

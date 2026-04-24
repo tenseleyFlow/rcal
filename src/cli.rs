@@ -28,7 +28,7 @@ use crate::{
     },
     providers::{
         KeyringMicrosoftTokenStore, MicrosoftProviderConfig, MicrosoftProviderRuntime,
-        ProviderConfig, ProviderError, ReqwestMicrosoftHttpClient, list_calendars,
+        ProviderConfig, ProviderError, ReqwestMicrosoftHttpClient, inspect_token, list_calendars,
         login_device_code_or_browser, logout,
     },
     reminders::{
@@ -54,6 +54,7 @@ const HELP: &str = concat!(
     "  rcal config init [--path PATH] [--force]\n\n",
     "  rcal providers microsoft auth login --account ID [--browser]\n",
     "  rcal providers microsoft auth logout --account ID\n",
+    "  rcal providers microsoft auth inspect --account ID\n",
     "  rcal providers microsoft calendars list --account ID\n",
     "  rcal providers microsoft sync [--account ID]\n",
     "  rcal providers microsoft status\n\n",
@@ -152,6 +153,9 @@ pub enum MicrosoftCliAction {
         config: MicrosoftProviderConfig,
     },
     AuthLogout {
+        account: String,
+    },
+    AuthInspect {
         account: String,
     },
     CalendarsList {
@@ -841,6 +845,12 @@ where
                 MicrosoftCliAction::AuthLogout { account },
             )))
         }
+        "inspect" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::AuthInspect { account },
+            )))
+        }
         _ => Err(CliError::UnknownProviderCommand(format!(
             "microsoft auth {command}"
         ))),
@@ -1244,6 +1254,71 @@ fn run_microsoft_action(
         MicrosoftCliAction::AuthLogout { account } => logout(&account, &token_store).map(|()| {
             let _ = writeln!(stdout, "removed Microsoft credentials for '{account}'");
         }),
+        MicrosoftCliAction::AuthInspect { account } => {
+            inspect_token(&account, &token_store).map(|inspection| {
+                let _ = writeln!(
+                    stdout,
+                    "account={} authenticated=true",
+                    inspection.account_id
+                );
+                let _ = writeln!(
+                    stdout,
+                    "aud={}",
+                    inspection.audience.as_deref().unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "scp={}",
+                    inspection.scopes.as_deref().unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "roles={}",
+                    if inspection.roles.is_empty() {
+                        "<missing>".to_string()
+                    } else {
+                        inspection.roles.join(",")
+                    }
+                );
+                let _ = writeln!(
+                    stdout,
+                    "tid={}",
+                    inspection.tenant_id.as_deref().unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "iss={}",
+                    inspection.issuer.as_deref().unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "appid={}",
+                    inspection.app_id.as_deref().unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "azp={}",
+                    inspection
+                        .authorized_party
+                        .as_deref()
+                        .unwrap_or("<missing>")
+                );
+                let _ = writeln!(
+                    stdout,
+                    "jwt_exp={}",
+                    inspection
+                        .jwt_expires_at_epoch_seconds
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "<missing>".to_string())
+                );
+                let _ = writeln!(
+                    stdout,
+                    "stored_exp={}",
+                    inspection.stored_expires_at_epoch_seconds
+                );
+                let _ = writeln!(stdout, "has_refresh_token={}", inspection.has_refresh_token);
+            })
+        }
         MicrosoftCliAction::CalendarsList { account, config } => {
             let Some(account_config) = config.account(&account) else {
                 return provider_error_exit(
@@ -2241,6 +2316,29 @@ create_event = ["n"]
                 account: Some("work".to_string()),
                 config: microsoft.clone(),
             }))
+        );
+
+        let inspect_action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("microsoft"),
+                arg("auth"),
+                arg("inspect"),
+                arg("--account"),
+                arg("work"),
+            ],
+            today.into(),
+            user_config.clone(),
+            None,
+        )
+        .expect("inspect parses");
+        assert_eq!(
+            inspect_action,
+            CliAction::Providers(ProviderCliAction::Microsoft(
+                MicrosoftCliAction::AuthInspect {
+                    account: "work".to_string(),
+                },
+            ))
         );
 
         let login_action = parse_args_with_config(
