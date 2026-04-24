@@ -1031,6 +1031,36 @@ calendars = ["cal-1"]
     }
 
     #[test]
+    fn google_provider_defaults_to_official_desktop_client() {
+        let path = temp_config_path("google-providers-official/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers.google]
+enabled = true
+default_account = "personal"
+default_calendar = "primary"
+
+[[providers.google.accounts]]
+id = "personal"
+calendars = ["primary"]
+"#,
+        )
+        .expect("config writes");
+
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        let account = &config.providers.google.accounts[0];
+        let (official_client_id, official_client_secret) =
+            google_official_client_config().expect("official Google client exists");
+        assert_eq!(account.client_id, official_client_id);
+        assert_eq!(account.client_secret, official_client_secret);
+    }
+
+    #[test]
     fn google_provider_config_parses_and_resolves_paths() {
         let path = temp_config_path("google-providers/config.toml");
         let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));

@@ -44,8 +44,9 @@ const GOOGLE_SCOPES: &str = concat!(
 const GOOGLE_KEYRING_SERVICE: &str = "rcal.google";
 pub const MICROSOFT_OFFICIAL_CLIENT_ID: &str = "9a49eaac-422b-4192-a65d-82dc8f43c11d";
 pub const MICROSOFT_DEFAULT_TENANT: &str = "common";
-pub const GOOGLE_OFFICIAL_CLIENT_ID: &str = "";
-pub const GOOGLE_OFFICIAL_CLIENT_SECRET: &str = "";
+pub const GOOGLE_OFFICIAL_CLIENT_ID: &str =
+    "1074776721941-d1paj4fnnn77bd3rrcliodhoveafbise.apps.googleusercontent.com";
+pub const GOOGLE_OFFICIAL_CLIENT_SECRET: &str = "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";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {

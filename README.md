@@ -268,9 +268,9 @@ Calendar. Provider reminders fire from cached Google events after a sync.
 - CalDAV and other non-Microsoft/non-Google providers are not implemented yet.
 - Provider sync is manual and cache-first; there is no background provider
   sync daemon yet.
-- Google official OAuth client registration and verification are still in
-  progress; until those constants are filled for a release build, use the
-  advanced custom-client setup above.
+- Google OAuth verification may still be in progress for early releases. If the
+  official client flow is unavailable in a custom build, use the advanced
+  custom-client setup above.
 
 ## Development
 
