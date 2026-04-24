@@ -3,10 +3,6 @@
 `rcal` is a terminal calendar for quick month, week, and day navigation. It is
 built in Rust with `ratatui`, `crossterm`, and the `time` crate.
 
-This first milestone is meant for local daily trial use. It opens on the
-current month, keeps keyboard navigation fast, falls back to week or day views
-when terminal space is tight, and shows agenda previews from the current local
-events file plus holiday sources.
 
 ## Install
 
@@ -66,6 +62,47 @@ fixed for now.
 
 Nager.Date is cache-first and opt-in. Default startup does not need network
 access.
+
+## Controls
+
+- Arrow keys move the selected date.
+- `?` opens contextual help.
+- `+` opens the Create event modal.
+- In day view, `c` opens the Copy confirmation for the selected editable event.
+- In day view, `d` opens the Delete confirmation for the selected editable event.
+- `Enter` opens the focused day view.
+- `Esc` returns from day view to month view.
+- `q` exits.
+- In day view, Left/Right move to the previous or next day while staying in day
+  view.
+- Digits jump immediately to a day in the visible month. A quick second digit
+  refines the selected day, so `1` selects day 1 and `1` then `6` selects day
+  16.
+- Weekday initials jump within the selected week. Use `tu` for Tuesday, `th`
+  for Thursday, `su` for Sunday, and `sa` for Saturday.
+- Left click selects a visible date; double-click a visible date to open day
+  view.
+
+The create/edit modal supports timed events, single-day all-day events,
+recurrence, location, notes, and multiple reminder offsets. Its `Calendar`
+field controls where the event is saved; use Left/Right on that field to cycle
+between local storage and configured editable provider calendars. Local events
+are stored as JSON, while Microsoft events are written through Graph and then
+shown immediately from the provider cache.
+Reminder notifications are delivered by a user-level background service. Use
+`rcal reminders install` to install it, `rcal reminders status` to inspect it,
+and `rcal reminders test` to send a test notification. On macOS, notification
+delivery uses `osascript` because it is more reliable for CLI-launched
+notifications than the generic notification backend. Reminder install snapshots
+the resolved events and state file paths, so reinstall the service after config
+changes that affect reminders.
+
+## Layout
+
+`rcal` tries to render the full month first. If the terminal is too constrained,
+it falls back to the selected week. If even that cannot fit cleanly, it falls
+back to a focused day summary.
+
 
 ## Microsoft Provider
 
@@ -150,45 +187,6 @@ create/edit/delete/copy operations for Microsoft events back through Graph.
 Provider reminders fire from cached provider events after a sync; the reminder
 daemon does not sync remote calendars itself.
 
-## Controls
-
-- Arrow keys move the selected date.
-- `?` opens contextual help.
-- `+` opens the Create event modal.
-- In day view, `c` opens the Copy confirmation for the selected editable event.
-- In day view, `d` opens the Delete confirmation for the selected editable event.
-- `Enter` opens the focused day view.
-- `Esc` returns from day view to month view.
-- `q` exits.
-- In day view, Left/Right move to the previous or next day while staying in day
-  view.
-- Digits jump immediately to a day in the visible month. A quick second digit
-  refines the selected day, so `1` selects day 1 and `1` then `6` selects day
-  16.
-- Weekday initials jump within the selected week. Use `tu` for Tuesday, `th`
-  for Thursday, `su` for Sunday, and `sa` for Saturday.
-- Left click selects a visible date; double-click a visible date to open day
-  view.
-
-The create/edit modal supports timed events, single-day all-day events,
-recurrence, location, notes, and multiple reminder offsets. Its `Calendar`
-field controls where the event is saved; use Left/Right on that field to cycle
-between local storage and configured editable provider calendars. Local events
-are stored as JSON, while Microsoft events are written through Graph and then
-shown immediately from the provider cache.
-Reminder notifications are delivered by a user-level background service. Use
-`rcal reminders install` to install it, `rcal reminders status` to inspect it,
-and `rcal reminders test` to send a test notification. On macOS, notification
-delivery uses `osascript` because it is more reliable for CLI-launched
-notifications than the generic notification backend. Reminder install snapshots
-the resolved events and state file paths, so reinstall the service after config
-changes that affect reminders.
-
-## Layout
-
-`rcal` tries to render the full month first. If the terminal is too constrained,
-it falls back to the selected week. If even that cannot fit cleanly, it falls
-back to a focused day summary.
 
 ## Current Limits
 
