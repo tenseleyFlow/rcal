@@ -23,15 +23,17 @@ use crate::{
     },
     calendar::CalendarDate,
     config::{
-        ConfigError, ConfigHolidaySource, MicrosoftSetupConfig, UserConfig, default_config_file,
-        init_config_file, load_discovered_config, load_explicit_config,
-        write_microsoft_setup_config,
+        ConfigError, ConfigHolidaySource, GoogleSetupConfig, MicrosoftSetupConfig, UserConfig,
+        default_config_file, init_config_file, load_discovered_config, load_explicit_config,
+        write_google_setup_config, write_microsoft_setup_config,
     },
     providers::{
-        KeyringMicrosoftTokenStore, MicrosoftAccountConfig, MicrosoftCalendarInfo,
-        MicrosoftProviderConfig, MicrosoftProviderRuntime, ProviderConfig, ProviderError,
-        ReqwestMicrosoftHttpClient, inspect_token, list_calendars, login_device_code_or_browser,
-        logout,
+        GoogleAccountConfig, GoogleCalendarInfo, GoogleProviderConfig, GoogleProviderRuntime,
+        KeyringGoogleTokenStore, KeyringMicrosoftTokenStore, MicrosoftAccountConfig,
+        MicrosoftCalendarInfo, MicrosoftProviderConfig, MicrosoftProviderRuntime, ProviderConfig,
+        ProviderError, ReqwestMicrosoftHttpClient, inspect_google_token, inspect_token,
+        list_calendars, list_google_calendars, login_device_code_or_browser, login_google_browser,
+        logout, logout_google,
     },
     reminders::{
         ReminderDaemonConfig, ReminderError, SystemNotifier, default_state_file,
@@ -61,6 +63,13 @@ const HELP: &str = concat!(
     "  rcal providers microsoft setup --account ID [--browser] [--calendar ID]\n",
     "  rcal providers microsoft sync [--account ID]\n",
     "  rcal providers microsoft status\n\n",
+    "  rcal providers google auth login --account ID\n",
+    "  rcal providers google auth logout --account ID\n",
+    "  rcal providers google auth inspect --account ID\n",
+    "  rcal providers google calendars list --account ID\n",
+    "  rcal providers google setup --account ID --client-id ID [--client-secret SECRET] [--calendar ID]\n",
+    "  rcal providers google sync [--account ID]\n",
+    "  rcal providers google status\n\n",
     "  rcal reminders run [--events-file PATH] [--state-file PATH] [--once]\n",
     "  rcal reminders install [--events-file PATH] [--state-file PATH]\n",
     "  rcal reminders uninstall\n",
@@ -92,7 +101,7 @@ const HELP: &str = concat!(
     "Mouse:\n",
     "  Left click selects a visible date; double-click a visible date to open day view.\n\n",
     "Notes:\n",
-    "  Microsoft provider data is cache-first. Run `rcal providers microsoft sync` to refresh it.\n",
+    "  Provider data is cache-first. Run `rcal providers microsoft sync` or `rcal providers google sync` to refresh it.\n",
 );
 
 const VERSION: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -146,6 +155,7 @@ pub enum ConfigCliAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderCliAction {
     Microsoft(MicrosoftCliAction),
+    Google(GoogleCliAction),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,8 +192,41 @@ pub enum MicrosoftCliAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GoogleCliAction {
+    Setup {
+        account: String,
+        client_id: String,
+        client_secret: Option<String>,
+        calendar: Option<String>,
+        config_path: PathBuf,
+        config: GoogleProviderConfig,
+    },
+    AuthLogin {
+        account: String,
+        config: GoogleProviderConfig,
+    },
+    AuthLogout {
+        account: String,
+    },
+    AuthInspect {
+        account: String,
+    },
+    CalendarsList {
+        account: String,
+        config: GoogleProviderConfig,
+    },
+    Sync {
+        account: Option<String>,
+        config: GoogleProviderConfig,
+    },
+    Status {
+        config: GoogleProviderConfig,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReminderCliAction {
-    Run(ReminderRunConfig),
+    Run(Box<ReminderRunConfig>),
     Install {
         events_file: PathBuf,
         state_file: PathBuf,
@@ -231,6 +274,10 @@ pub enum CliError {
     DuplicateProviderAccount,
     MissingProviderCalendar,
     DuplicateProviderCalendar,
+    MissingProviderClientId,
+    DuplicateProviderClientId,
+    MissingProviderClientSecret,
+    DuplicateProviderClientSecret,
     MissingReminderCommand,
     UnknownReminderCommand(String),
     DuplicateStateFile,
@@ -284,16 +331,26 @@ impl fmt::Display for CliError {
             Self::MissingConfigInitPathValue => write!(f, "config init --path requires a path"),
             Self::Config(err) => write!(f, "{err}"),
             Self::Provider(err) => write!(f, "{err}"),
-            Self::MissingProviderCommand => write!(f, "providers requires a command: microsoft"),
+            Self::MissingProviderCommand => {
+                write!(f, "providers requires a command: microsoft or google")
+            }
             Self::UnknownProviderCommand(command) => {
                 write!(f, "unknown providers command: {command}")
             }
-            Self::MissingProviderAccount => write!(f, "--account requires a Microsoft account id"),
+            Self::MissingProviderAccount => write!(f, "--account requires a provider account id"),
             Self::DuplicateProviderAccount => write!(f, "--account may only be provided once"),
             Self::MissingProviderCalendar => {
-                write!(f, "--calendar requires a Microsoft calendar id")
+                write!(f, "--calendar requires a provider calendar id")
             }
             Self::DuplicateProviderCalendar => write!(f, "--calendar may only be provided once"),
+            Self::MissingProviderClientId => write!(f, "--client-id requires a client id"),
+            Self::DuplicateProviderClientId => write!(f, "--client-id may only be provided once"),
+            Self::MissingProviderClientSecret => {
+                write!(f, "--client-secret requires a client secret")
+            }
+            Self::DuplicateProviderClientSecret => {
+                write!(f, "--client-secret may only be provided once")
+            }
             Self::MissingReminderCommand => write!(
                 f,
                 "reminders requires one of: run, install, uninstall, status, test"
@@ -821,6 +878,7 @@ where
         "microsoft" => {
             parse_microsoft_provider_args(args, &user_config.providers.microsoft, config_path)
         }
+        "google" => parse_google_provider_args(args, &user_config.providers.google, config_path),
         "--help" | "-h" => Ok(CliAction::Help),
         _ => Err(CliError::UnknownProviderCommand(command.to_string())),
     }
@@ -1005,6 +1063,214 @@ where
     Ok(CliAction::Providers(ProviderCliAction::Microsoft(action)))
 }
 
+fn parse_google_provider_args<I>(
+    args: I,
+    config: &GoogleProviderConfig,
+    config_path: PathBuf,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "auth" => parse_google_auth_args(args, config),
+        "calendars" => parse_google_calendars_args(args, config),
+        "setup" => parse_google_setup_args(args, config, config_path),
+        "sync" => parse_google_sync_args(args, config),
+        "status" => no_extra_google_provider_args(
+            args,
+            GoogleCliAction::Status {
+                config: config.clone(),
+            },
+        ),
+        "--help" | "-h" => Ok(CliAction::Help),
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "google {command}"
+        ))),
+    }
+}
+
+fn parse_google_auth_args<I>(args: I, config: &GoogleProviderConfig) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+
+    match command {
+        "login" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Google(
+                GoogleCliAction::AuthLogin {
+                    account,
+                    config: config.clone(),
+                },
+            )))
+        }
+        "logout" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Google(
+                GoogleCliAction::AuthLogout { account },
+            )))
+        }
+        "inspect" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Google(
+                GoogleCliAction::AuthInspect { account },
+            )))
+        }
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "google auth {command}"
+        ))),
+    }
+}
+
+fn parse_google_setup_args<I>(
+    args: I,
+    config: &GoogleProviderConfig,
+    config_path: PathBuf,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut account = None;
+    let mut calendar = None;
+    let mut client_id = None;
+    let mut client_secret = None;
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg == "--calendar" {
+            if calendar.is_some() {
+                return Err(CliError::DuplicateProviderCalendar);
+            }
+            calendar = Some(display_arg(
+                &args.next().ok_or(CliError::MissingProviderCalendar)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--calendar="))
+        {
+            if calendar.is_some() {
+                return Err(CliError::DuplicateProviderCalendar);
+            }
+            calendar = Some(value.to_string());
+            continue;
+        }
+        if arg == "--client-id" {
+            if client_id.is_some() {
+                return Err(CliError::DuplicateProviderClientId);
+            }
+            client_id = Some(display_arg(
+                &args.next().ok_or(CliError::MissingProviderClientId)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--client-id="))
+        {
+            if client_id.is_some() {
+                return Err(CliError::DuplicateProviderClientId);
+            }
+            client_id = Some(value.to_string());
+            continue;
+        }
+        if arg == "--client-secret" {
+            if client_secret.is_some() {
+                return Err(CliError::DuplicateProviderClientSecret);
+            }
+            client_secret = Some(display_arg(
+                &args.next().ok_or(CliError::MissingProviderClientSecret)?,
+            ));
+            continue;
+        }
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--client-secret="))
+        {
+            if client_secret.is_some() {
+                return Err(CliError::DuplicateProviderClientSecret);
+            }
+            client_secret = Some(value.to_string());
+            continue;
+        }
+        parse_account_arg(arg, &mut args, &mut account)?;
+    }
+
+    Ok(CliAction::Providers(ProviderCliAction::Google(
+        GoogleCliAction::Setup {
+            account: account.ok_or(CliError::MissingProviderAccount)?,
+            client_id: client_id.ok_or(CliError::MissingProviderClientId)?,
+            client_secret,
+            calendar,
+            config_path,
+            config: config.clone(),
+        },
+    )))
+}
+
+fn parse_google_calendars_args<I>(
+    args: I,
+    config: &GoogleProviderConfig,
+) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    let command = args.next().ok_or(CliError::MissingProviderCommand)?;
+    let Some(command) = command.to_str() else {
+        return Err(CliError::UnknownProviderCommand(display_arg(&command)));
+    };
+    match command {
+        "list" => {
+            let account = parse_required_account(args)?;
+            Ok(CliAction::Providers(ProviderCliAction::Google(
+                GoogleCliAction::CalendarsList {
+                    account,
+                    config: config.clone(),
+                },
+            )))
+        }
+        _ => Err(CliError::UnknownProviderCommand(format!(
+            "google calendars {command}"
+        ))),
+    }
+}
+
+fn parse_google_sync_args<I>(args: I, config: &GoogleProviderConfig) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let account = parse_optional_account(args)?;
+    Ok(CliAction::Providers(ProviderCliAction::Google(
+        GoogleCliAction::Sync {
+            account,
+            config: config.clone(),
+        },
+    )))
+}
+
+fn no_extra_google_provider_args<I>(args: I, action: GoogleCliAction) -> Result<CliAction, CliError>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if let Some(arg) = args.next() {
+        return Err(CliError::UnknownArgument(display_arg(&arg)));
+    }
+    Ok(CliAction::Providers(ProviderCliAction::Google(action)))
+}
+
 fn parse_required_account<I>(args: I) -> Result<String, CliError>
 where
     I: IntoIterator<Item = OsString>,
@@ -1148,7 +1414,7 @@ where
         return Err(CliError::UnknownArgument(display_arg(&arg)));
     }
 
-    Ok(CliAction::Reminders(ReminderCliAction::Run(
+    Ok(CliAction::Reminders(ReminderCliAction::Run(Box::new(
         ReminderRunConfig {
             events_file: events_file.unwrap_or_else(|| {
                 user_config
@@ -1165,7 +1431,7 @@ where
             providers: user_config.providers.clone(),
             once,
         },
-    )))
+    ))))
 }
 
 fn parse_reminder_install_args<I>(args: I, user_config: &UserConfig) -> Result<CliAction, CliError>
@@ -1287,10 +1553,17 @@ fn agenda_source(config: &AppConfig) -> Result<ConfiguredAgendaSource, LocalEven
 
     ConfiguredAgendaSource::from_events_file(config.events_file.clone(), holidays).and_then(
         |source| {
-            source.with_microsoft_provider(
-                config.providers.microsoft.clone(),
-                config.providers.create_target,
-            )
+            source
+                .with_microsoft_provider(
+                    config.providers.microsoft.clone(),
+                    config.providers.create_target,
+                )
+                .and_then(|source| {
+                    source.with_google_provider(
+                        config.providers.google.clone(),
+                        config.providers.create_target,
+                    )
+                })
         },
     )
 }
@@ -1318,6 +1591,7 @@ fn run_provider_action(
 ) -> std::process::ExitCode {
     match action {
         ProviderCliAction::Microsoft(action) => run_microsoft_action(action, stdout, stderr),
+        ProviderCliAction::Google(action) => run_google_action(action, stdout, stderr),
     }
 }
 
@@ -1526,6 +1800,157 @@ fn run_microsoft_action(
     }
 }
 
+fn run_google_action(
+    action: GoogleCliAction,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> std::process::ExitCode {
+    let http = ReqwestMicrosoftHttpClient;
+    let token_store = KeyringGoogleTokenStore;
+    let result = match action {
+        GoogleCliAction::Setup {
+            account,
+            client_id,
+            client_secret,
+            calendar,
+            config_path,
+            config,
+        } => (|| {
+            let account_config =
+                GoogleAccountConfig::new(account.clone(), client_id.clone(), client_secret.clone());
+            login_google_browser(&account_config, &http, &token_store, stdout)?;
+            let calendars = list_google_calendars(&account_config, &http, &token_store)?;
+            let calendar = choose_google_setup_calendar(&calendars, calendar.as_deref())?;
+            let setup = GoogleSetupConfig {
+                account_id: account.clone(),
+                client_id,
+                client_secret,
+                calendar_id: calendar.id.clone(),
+                calendar_name: calendar.name.clone(),
+                sync_past_days: config.sync_past_days,
+                sync_future_days: config.sync_future_days,
+                redirect_port: account_config.redirect_port,
+            };
+            let written = write_google_setup_config(Some(config_path), &setup)
+                .map_err(|err| ProviderError::Config(err.to_string()))?;
+            let _ = writeln!(
+                stdout,
+                "selected Google calendar '{}' ({})",
+                calendar.name, calendar.id
+            );
+            let _ = writeln!(stdout, "wrote config {}", written.display());
+            let setup_config = google_setup_provider_config(config, account_config, calendar);
+            let mut runtime = GoogleProviderRuntime::load(setup_config)?;
+            let summary = runtime.sync(
+                Some(&account),
+                &http,
+                &token_store,
+                CalendarDate::from(default_start_date()),
+            )?;
+            let _ = writeln!(
+                stdout,
+                "synced accounts={} calendars={} events={}",
+                summary.accounts, summary.calendars, summary.events
+            );
+            Ok(())
+        })(),
+        GoogleCliAction::AuthLogin { account, config } => {
+            let Some(account_config) = config.account(&account) else {
+                return provider_error_exit(
+                    stderr,
+                    ProviderError::Config(format!("Google account '{account}' is not configured")),
+                );
+            };
+            login_google_browser(account_config, &http, &token_store, stdout)
+        }
+        GoogleCliAction::AuthLogout { account } => {
+            logout_google(&account, &token_store).map(|()| {
+                let _ = writeln!(stdout, "removed Google credentials for '{account}'");
+            })
+        }
+        GoogleCliAction::AuthInspect { account } => inspect_google_token(&account, &token_store)
+            .map(|inspection| {
+                let _ = writeln!(
+                    stdout,
+                    "account={} authenticated=true",
+                    inspection.account_id
+                );
+                let _ = writeln!(
+                    stdout,
+                    "stored_exp={}",
+                    inspection.stored_expires_at_epoch_seconds
+                );
+                let _ = writeln!(stdout, "has_refresh_token={}", inspection.has_refresh_token);
+            }),
+        GoogleCliAction::CalendarsList { account, config } => {
+            let Some(account_config) = config.account(&account) else {
+                return provider_error_exit(
+                    stderr,
+                    ProviderError::Config(format!("Google account '{account}' is not configured")),
+                );
+            };
+            list_google_calendars(account_config, &http, &token_store).map(|calendars| {
+                for calendar in calendars {
+                    let _ = writeln!(
+                        stdout,
+                        "{}\t{}\tcan_edit={}\tdefault={}",
+                        calendar.id, calendar.name, calendar.can_edit, calendar.is_default
+                    );
+                }
+            })
+        }
+        GoogleCliAction::Sync { account, config } => {
+            let mut runtime = match GoogleProviderRuntime::load(config) {
+                Ok(runtime) => runtime,
+                Err(err) => return provider_error_exit(stderr, err),
+            };
+            runtime
+                .sync(
+                    account.as_deref(),
+                    &http,
+                    &token_store,
+                    CalendarDate::from(default_start_date()),
+                )
+                .map(|summary| {
+                    let _ = writeln!(
+                        stdout,
+                        "synced accounts={} calendars={} events={}",
+                        summary.accounts, summary.calendars, summary.events
+                    );
+                })
+        }
+        GoogleCliAction::Status { config } => {
+            let runtime = match GoogleProviderRuntime::load(config.clone()) {
+                Ok(runtime) => runtime,
+                Err(err) => return provider_error_exit(stderr, err),
+            };
+            let status = runtime.status(&token_store);
+            let _ = writeln!(
+                stdout,
+                "enabled={} cache={} cached_events={}",
+                status.enabled,
+                status.cache_file.display(),
+                status.event_count
+            );
+            for account in status.accounts {
+                let _ = writeln!(
+                    stdout,
+                    "account={} authenticated={} calendars={}",
+                    account.id,
+                    account.authenticated,
+                    account.calendars.join(",")
+                );
+            }
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => provider_error_exit(stderr, err),
+    }
+}
+
 fn choose_setup_calendar<'a>(
     calendars: &'a [MicrosoftCalendarInfo],
     requested: Option<&str>,
@@ -1559,11 +1984,67 @@ fn choose_setup_calendar<'a>(
         })
 }
 
+fn choose_google_setup_calendar<'a>(
+    calendars: &'a [GoogleCalendarInfo],
+    requested: Option<&str>,
+) -> Result<&'a GoogleCalendarInfo, ProviderError> {
+    if let Some(requested) = requested {
+        let calendar = calendars
+            .iter()
+            .find(|calendar| calendar.id == requested)
+            .ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "Google calendar '{requested}' was not found for this account"
+                ))
+            })?;
+        if !calendar.can_edit {
+            return Err(ProviderError::Config(format!(
+                "Google calendar '{}' is read-only; choose an editable calendar",
+                calendar.name
+            )));
+        }
+        return Ok(calendar);
+    }
+
+    calendars
+        .iter()
+        .find(|calendar| calendar.can_edit && calendar.is_default)
+        .or_else(|| calendars.iter().find(|calendar| calendar.can_edit))
+        .ok_or_else(|| {
+            ProviderError::Config(
+                "no editable Google calendars were found for this account".to_string(),
+            )
+        })
+}
+
 fn microsoft_setup_provider_config(
     mut config: MicrosoftProviderConfig,
     mut account: MicrosoftAccountConfig,
     calendar: &MicrosoftCalendarInfo,
 ) -> MicrosoftProviderConfig {
+    config.enabled = true;
+    config.default_account = Some(account.id.clone());
+    config.default_calendar = Some(calendar.id.clone());
+    account.calendars = vec![calendar.id.clone()];
+
+    if let Some(existing) = config
+        .accounts
+        .iter_mut()
+        .find(|existing| existing.id == account.id)
+    {
+        *existing = account;
+    } else {
+        config.accounts.push(account);
+    }
+
+    config
+}
+
+fn google_setup_provider_config(
+    mut config: GoogleProviderConfig,
+    mut account: GoogleAccountConfig,
+    calendar: &GoogleCalendarInfo,
+) -> GoogleProviderConfig {
     config.enabled = true;
     config.default_account = Some(account.id.clone());
     config.default_calendar = Some(calendar.id.clone());
@@ -1589,6 +2070,7 @@ fn run_reminder_action(
 ) -> std::process::ExitCode {
     match action {
         ReminderCliAction::Run(config) => {
+            let config = *config;
             let daemon_config = ReminderDaemonConfig::new(config.events_file, config.state_file)
                 .with_providers(config.providers);
             let mut notifier = SystemNotifier;
@@ -2013,7 +2495,10 @@ mod tests {
 
     use crate::app::{KeyBindingOverrides, KeyCommand};
     use crate::calendar::CalendarMonth;
-    use crate::providers::{MicrosoftAccountConfig, MicrosoftCalendarInfo, ProviderCreateTarget};
+    use crate::providers::{
+        GoogleAccountConfig, GoogleProviderConfig, MicrosoftAccountConfig, MicrosoftCalendarInfo,
+        ProviderCreateTarget,
+    };
     use time::Month;
 
     fn date(year: i32, month: Month, day: u8) -> CalendarDate {
@@ -2073,6 +2558,36 @@ mod tests {
             providers: ProviderConfig {
                 create_target: ProviderCreateTarget::Microsoft,
                 microsoft: microsoft_provider_config(),
+                google: GoogleProviderConfig::default(),
+            },
+            ..UserConfig::empty()
+        }
+    }
+
+    fn google_provider_config() -> GoogleProviderConfig {
+        GoogleProviderConfig {
+            enabled: true,
+            default_account: Some("personal".to_string()),
+            default_calendar: Some("primary".to_string()),
+            sync_past_days: 30,
+            sync_future_days: 365,
+            cache_file: PathBuf::from("/tmp/google-cache.json"),
+            accounts: vec![GoogleAccountConfig {
+                id: "personal".to_string(),
+                client_id: "google-client".to_string(),
+                client_secret: Some("google-secret".to_string()),
+                redirect_port: 8766,
+                calendars: vec!["primary".to_string()],
+            }],
+        }
+    }
+
+    fn config_with_google_provider() -> UserConfig {
+        UserConfig {
+            providers: ProviderConfig {
+                create_target: ProviderCreateTarget::Google,
+                microsoft: MicrosoftProviderConfig::default(),
+                google: google_provider_config(),
             },
             ..UserConfig::empty()
         }
@@ -2378,12 +2893,12 @@ create_event = ["n"]
 
         assert_eq!(
             action,
-            CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
+            CliAction::Reminders(ReminderCliAction::Run(Box::new(ReminderRunConfig {
                 events_file: PathBuf::from("/tmp/events.json"),
                 state_file: PathBuf::from("/tmp/state.json"),
                 providers: ProviderConfig::default(),
                 once: true,
-            }))
+            })))
         );
     }
 
@@ -2400,12 +2915,12 @@ create_event = ["n"]
         .expect("run parses");
         assert_eq!(
             run_action,
-            CliAction::Reminders(ReminderCliAction::Run(ReminderRunConfig {
+            CliAction::Reminders(ReminderCliAction::Run(Box::new(ReminderRunConfig {
                 events_file: PathBuf::from("/tmp/config-events.json"),
                 state_file: PathBuf::from("/tmp/config-state.json"),
                 providers: ProviderConfig::default(),
                 once: true,
-            }))
+            })))
         );
 
         let install_action = parse_args_with_config(
@@ -2569,6 +3084,93 @@ create_event = ["n"]
                     config: microsoft,
                 },
             ))
+        );
+    }
+
+    #[test]
+    fn google_provider_commands_parse_configured_account() {
+        let today = date(2026, Month::April, 23);
+        let user_config = config_with_google_provider();
+        let google = user_config.providers.google.clone();
+
+        let sync_action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("google"),
+                arg("sync"),
+                arg("--account"),
+                arg("personal"),
+            ],
+            today.into(),
+            user_config.clone(),
+            None,
+        )
+        .expect("sync parses");
+        assert_eq!(
+            sync_action,
+            CliAction::Providers(ProviderCliAction::Google(GoogleCliAction::Sync {
+                account: Some("personal".to_string()),
+                config: google.clone(),
+            }))
+        );
+
+        let login_action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("google"),
+                arg("auth"),
+                arg("login"),
+                arg("--account=personal"),
+            ],
+            today.into(),
+            user_config,
+            None,
+        )
+        .expect("login parses");
+        assert_eq!(
+            login_action,
+            CliAction::Providers(ProviderCliAction::Google(GoogleCliAction::AuthLogin {
+                account: "personal".to_string(),
+                config: google,
+            }))
+        );
+    }
+
+    #[test]
+    fn google_setup_command_parses_client_id_secret_and_calendar() {
+        let today = date(2026, Month::April, 23);
+        let user_config = config_with_google_provider();
+        let google = user_config.providers.google.clone();
+        let config_path = PathBuf::from("/tmp/rcal/google-setup-config.toml");
+
+        let action = parse_args_with_config(
+            [
+                arg("providers"),
+                arg("google"),
+                arg("setup"),
+                arg("--account"),
+                arg("personal"),
+                arg("--client-id=google-client"),
+                arg("--client-secret"),
+                arg("google-secret"),
+                arg("--calendar=primary"),
+            ],
+            today.into(),
+            user_config,
+            Some(config_path.clone()),
+        )
+        .expect("setup parses");
+
+        assert_eq!(
+            action,
+            CliAction::Providers(ProviderCliAction::Google(GoogleCliAction::Setup {
+                account: "personal".to_string(),
+                client_id: "google-client".to_string(),
+                client_secret: Some("google-secret".to_string()),
+                calendar: Some("primary".to_string()),
+                config_path,
+                config: google,
+            }))
         );
     }
 

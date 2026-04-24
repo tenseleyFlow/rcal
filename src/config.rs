@@ -10,8 +10,9 @@ use serde::Deserialize;
 use crate::{
     app::{KeyBindingError, KeyBindingOverrides, KeyBindings},
     providers::{
-        MICROSOFT_DEFAULT_TENANT, MICROSOFT_OFFICIAL_CLIENT_ID, MicrosoftAccountConfig,
-        MicrosoftProviderConfig, ProviderConfig, ProviderCreateTarget,
+        GoogleAccountConfig, GoogleProviderConfig, MICROSOFT_DEFAULT_TENANT,
+        MICROSOFT_OFFICIAL_CLIENT_ID, MicrosoftAccountConfig, MicrosoftProviderConfig,
+        ProviderConfig, ProviderCreateTarget,
     },
 };
 
@@ -33,7 +34,8 @@ country = "US"
 state_file = "~/.local/state/rcal/reminders-state.json"
 
 [providers]
-# Where newly created events go when provider support is enabled: "local" or "microsoft".
+# Where newly created events go when provider support is enabled:
+# "local", "microsoft", or "google".
 create_target = "local"
 
 [providers.microsoft]
@@ -50,6 +52,25 @@ sync_future_days = 365
 [[providers.microsoft.accounts]]
 id = "work"
 redirect_port = 8765
+calendars = []
+
+[providers.google]
+# Google Calendar provider.
+# For now, create a Google OAuth Desktop client and paste its client_id here.
+# Some Google clients also provide a client_secret; include it in the account
+# block if token exchange requires it.
+enabled = false
+default_account = "personal"
+sync_past_days = 30
+sync_future_days = 365
+# Provider cache is separate from the local events file.
+# cache_file = "~/.cache/rcal/google-cache.json"
+
+[[providers.google.accounts]]
+id = "personal"
+client_id = ""
+# client_secret = ""
+redirect_port = 8766
 calendars = []
 
 [keybindings]
@@ -191,6 +212,18 @@ pub struct MicrosoftSetupConfig {
     pub redirect_port: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleSetupConfig {
+    pub account_id: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub calendar_id: String,
+    pub calendar_name: String,
+    pub sync_past_days: i32,
+    pub sync_future_days: i32,
+    pub redirect_port: u16,
+}
+
 pub fn write_microsoft_setup_config(
     path: Option<PathBuf>,
     setup: &MicrosoftSetupConfig,
@@ -221,12 +254,42 @@ pub fn write_microsoft_setup_config(
     Ok(path)
 }
 
+pub fn write_google_setup_config(
+    path: Option<PathBuf>,
+    setup: &GoogleSetupConfig,
+) -> Result<PathBuf, ConfigError> {
+    let path = match path {
+        Some(path) => expand_user_path(path)?,
+        None => default_config_file(),
+    };
+    let existing = if path.exists() {
+        fs::read_to_string(&path).map_err(|err| ConfigError::Read {
+            path: path.clone(),
+            reason: err.to_string(),
+        })?
+    } else {
+        String::new()
+    };
+    let body = google_setup_config_body(&existing, setup);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|err| ConfigError::Write {
+            path: parent.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+    }
+    fs::write(&path, body).map_err(|err| ConfigError::Write {
+        path: path.clone(),
+        reason: err.to_string(),
+    })?;
+    Ok(path)
+}
+
 fn microsoft_setup_config_body(existing: &str, setup: &MicrosoftSetupConfig) -> String {
     let mut kept = Vec::new();
     let mut skipping = false;
     for line in existing.lines() {
         if is_toml_table_header(line) {
-            skipping = is_managed_provider_header(line);
+            skipping = is_managed_provider_header(line, "microsoft");
         }
         if !skipping {
             kept.push(line);
@@ -266,12 +329,67 @@ fn microsoft_setup_config_body(existing: &str, setup: &MicrosoftSetupConfig) -> 
     body
 }
 
+fn google_setup_config_body(existing: &str, setup: &GoogleSetupConfig) -> String {
+    let mut kept = Vec::new();
+    let mut skipping = false;
+    for line in existing.lines() {
+        if is_toml_table_header(line) {
+            skipping = is_managed_provider_header(line, "google");
+        }
+        if !skipping {
+            kept.push(line);
+        }
+    }
+    while kept.last().is_some_and(|line| line.trim().is_empty()) {
+        kept.pop();
+    }
+
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push_str("\n\n");
+    }
+    body.push_str(&format!(
+        concat!(
+            "[providers]\n",
+            "create_target = \"google\"\n\n",
+            "[providers.google]\n",
+            "enabled = true\n",
+            "default_account = {account}\n",
+            "default_calendar = {calendar}\n",
+            "sync_past_days = {sync_past_days}\n",
+            "sync_future_days = {sync_future_days}\n\n",
+            "[[providers.google.accounts]]\n",
+            "id = {account}\n",
+            "client_id = {client_id}\n",
+        ),
+        account = toml_string(&setup.account_id),
+        calendar = toml_string(&setup.calendar_id),
+        client_id = toml_string(&setup.client_id),
+        sync_past_days = setup.sync_past_days.max(0),
+        sync_future_days = setup.sync_future_days.max(1),
+    ));
+    if let Some(client_secret) = &setup.client_secret {
+        body.push_str(&format!("client_secret = {}\n", toml_string(client_secret)));
+    }
+    body.push_str(&format!(
+        concat!(
+            "redirect_port = {redirect_port}\n",
+            "calendars = [{calendar}]\n",
+            "# Selected calendar: {calendar_name}\n"
+        ),
+        calendar = toml_string(&setup.calendar_id),
+        calendar_name = toml_comment_value(&setup.calendar_name),
+        redirect_port = setup.redirect_port,
+    ));
+    body
+}
+
 fn is_toml_table_header(line: &str) -> bool {
     let trimmed = line.trim();
     trimmed.starts_with('[') && trimmed.ends_with(']')
 }
 
-fn is_managed_provider_header(line: &str) -> bool {
+fn is_managed_provider_header(line: &str, provider: &str) -> bool {
     let trimmed = line.trim();
     let name = trimmed
         .trim_start_matches('[')
@@ -279,7 +397,9 @@ fn is_managed_provider_header(line: &str) -> bool {
         .trim_end_matches(']')
         .trim_end_matches(']')
         .trim();
-    name == "providers" || name == "providers.microsoft" || name == "providers.microsoft.accounts"
+    let provider_header = format!("providers.{provider}");
+    let accounts_header = format!("providers.{provider}.accounts");
+    name == "providers" || name == provider_header || name == accounts_header
 }
 
 fn toml_string(value: &str) -> String {
@@ -459,6 +579,7 @@ struct RawRemindersConfig {
 struct RawProvidersConfig {
     create_target: Option<String>,
     microsoft: Option<RawMicrosoftProviderConfig>,
+    google: Option<RawGoogleProviderConfig>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -479,6 +600,28 @@ struct RawMicrosoftAccountConfig {
     id: String,
     client_id: Option<String>,
     tenant: Option<String>,
+    redirect_port: Option<u16>,
+    calendars: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGoogleProviderConfig {
+    enabled: Option<bool>,
+    default_account: Option<String>,
+    default_calendar: Option<String>,
+    sync_past_days: Option<i32>,
+    sync_future_days: Option<i32>,
+    cache_file: Option<String>,
+    accounts: Option<Vec<RawGoogleAccountConfig>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawGoogleAccountConfig {
+    id: String,
+    client_id: String,
+    client_secret: Option<String>,
     redirect_port: Option<u16>,
     calendars: Option<Vec<String>>,
 }
@@ -544,8 +687,21 @@ impl RawProvidersConfig {
                 config.create_target = ProviderCreateTarget::Microsoft;
             }
         }
+        if let Some(google) = self.google {
+            config.google = google.into_config(path, base_dir)?;
+            if config.google.enabled && !create_target_was_set {
+                config.create_target = ProviderCreateTarget::Google;
+            }
+        }
         config
             .microsoft
+            .validate()
+            .map_err(|err| ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        config
+            .google
             .validate()
             .map_err(|err| ConfigError::Invalid {
                 path: path.to_path_buf(),
@@ -606,14 +762,62 @@ impl RawMicrosoftAccountConfig {
     }
 }
 
+impl RawGoogleProviderConfig {
+    fn into_config(
+        self,
+        path: &Path,
+        base_dir: &Path,
+    ) -> Result<GoogleProviderConfig, ConfigError> {
+        let mut config = GoogleProviderConfig::default();
+        if let Some(enabled) = self.enabled {
+            config.enabled = enabled;
+        }
+        config.default_account = self.default_account;
+        config.default_calendar = self.default_calendar;
+        if let Some(sync_past_days) = self.sync_past_days {
+            config.sync_past_days = sync_past_days.max(0);
+        }
+        if let Some(sync_future_days) = self.sync_future_days {
+            config.sync_future_days = sync_future_days.max(1);
+        }
+        if let Some(cache_file) = self.cache_file {
+            config.cache_file = resolve_config_path(&cache_file, base_dir)?;
+        }
+        config.accounts = self
+            .accounts
+            .unwrap_or_default()
+            .into_iter()
+            .map(RawGoogleAccountConfig::into_config)
+            .collect();
+        config.validate().map_err(|err| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+        Ok(config)
+    }
+}
+
+impl RawGoogleAccountConfig {
+    fn into_config(self) -> GoogleAccountConfig {
+        GoogleAccountConfig {
+            id: self.id,
+            client_id: self.client_id,
+            client_secret: self.client_secret,
+            redirect_port: self.redirect_port.unwrap_or(8766),
+            calendars: self.calendars.unwrap_or_default(),
+        }
+    }
+}
+
 fn parse_create_target(value: &str, path: &Path) -> Result<ProviderCreateTarget, ConfigError> {
     match value {
         "local" => Ok(ProviderCreateTarget::Local),
         "microsoft" => Ok(ProviderCreateTarget::Microsoft),
+        "google" => Ok(ProviderCreateTarget::Google),
         _ => Err(ConfigError::Invalid {
             path: path.to_path_buf(),
             reason: format!(
-                "invalid providers.create_target '{value}'; expected local or microsoft"
+                "invalid providers.create_target '{value}'; expected local, microsoft, or google"
             ),
         }),
     }
@@ -819,6 +1023,57 @@ calendars = ["cal-1"]
     }
 
     #[test]
+    fn google_provider_config_parses_and_resolves_paths() {
+        let path = temp_config_path("google-providers/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers]
+create_target = "google"
+
+[providers.google]
+enabled = true
+default_account = "personal"
+default_calendar = "primary"
+sync_past_days = 14
+sync_future_days = 120
+cache_file = "google-cache.json"
+
+[[providers.google.accounts]]
+id = "personal"
+client_id = "google-client"
+client_secret = "google-secret"
+redirect_port = 9002
+calendars = ["primary"]
+"#,
+        )
+        .expect("config writes");
+
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        assert_eq!(config.providers.create_target, ProviderCreateTarget::Google);
+        assert!(config.providers.google.enabled);
+        assert_eq!(
+            config.providers.google.cache_file,
+            path.parent().expect("config dir").join("google-cache.json")
+        );
+        assert_eq!(config.providers.google.sync_past_days, 14);
+        assert_eq!(config.providers.google.sync_future_days, 120);
+        assert_eq!(
+            config.providers.google.accounts[0].client_id,
+            "google-client"
+        );
+        assert_eq!(
+            config.providers.google.accounts[0].client_secret.as_deref(),
+            Some("google-secret")
+        );
+        assert_eq!(config.providers.google.accounts[0].redirect_port, 9002);
+    }
+
+    #[test]
     fn microsoft_setup_config_preserves_unrelated_sections() {
         let path = temp_config_path("providers-setup/config.toml");
         let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
@@ -838,6 +1093,15 @@ enabled = false
 [[providers.microsoft.accounts]]
 id = "old"
 calendars = []
+
+[providers.google]
+enabled = true
+default_account = "personal"
+
+[[providers.google.accounts]]
+id = "personal"
+client_id = "google-client"
+calendars = ["primary"]
 
 [keybindings]
 quit = ["q"]
@@ -863,6 +1127,7 @@ quit = ["q"]
 
         assert!(body.contains("[paths]"));
         assert!(body.contains("[keybindings]"));
+        assert!(body.contains("[providers.google]"));
         assert!(body.contains("# Selected calendar: Calendar Injected"));
         assert!(!body.contains("id = \"old\""));
         assert_eq!(
@@ -874,6 +1139,69 @@ quit = ["q"]
             Some("cal-1")
         );
         assert_eq!(config.providers.microsoft.accounts[0].redirect_port, 9001);
+        assert!(config.providers.google.enabled);
+        assert_eq!(
+            config.providers.google.accounts[0].client_id,
+            "google-client"
+        );
+    }
+
+    #[test]
+    fn google_setup_config_preserves_microsoft_provider() {
+        let path = temp_config_path("google-setup/config.toml");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+        fs::create_dir_all(path.parent().expect("config dir")).expect("dir creates");
+        fs::write(
+            &path,
+            r#"
+[providers]
+create_target = "microsoft"
+
+[providers.microsoft]
+enabled = true
+default_account = "work"
+default_calendar = "cal-1"
+
+[[providers.microsoft.accounts]]
+id = "work"
+calendars = ["cal-1"]
+
+[providers.google]
+enabled = false
+"#,
+        )
+        .expect("config writes");
+
+        write_google_setup_config(
+            Some(path.clone()),
+            &GoogleSetupConfig {
+                account_id: "personal".to_string(),
+                client_id: "google-client".to_string(),
+                client_secret: Some("google-secret".to_string()),
+                calendar_id: "primary".to_string(),
+                calendar_name: "Calendar".to_string(),
+                sync_past_days: 7,
+                sync_future_days: 90,
+                redirect_port: 9002,
+            },
+        )
+        .expect("setup config writes");
+        let body = fs::read_to_string(&path).expect("config reads");
+        let config = load_config_file(&path).expect("config loads");
+        let _ = fs::remove_dir_all(path.parent().and_then(Path::parent).expect("test root"));
+
+        assert!(body.contains("[providers.microsoft]"));
+        assert!(body.contains("[providers.google]"));
+        assert_eq!(config.providers.create_target, ProviderCreateTarget::Google);
+        assert!(config.providers.microsoft.enabled);
+        assert_eq!(
+            config.providers.google.default_calendar.as_deref(),
+            Some("primary")
+        );
+        assert_eq!(
+            config.providers.google.accounts[0].client_secret.as_deref(),
+            Some("google-secret")
+        );
     }
 
     #[test]

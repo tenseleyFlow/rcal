@@ -30,6 +30,13 @@ rcal providers microsoft calendars list --account ID
 rcal providers microsoft setup --account ID [--browser] [--calendar ID]
 rcal providers microsoft sync [--account ID]
 rcal providers microsoft status
+rcal providers google auth login --account ID
+rcal providers google auth logout --account ID
+rcal providers google auth inspect --account ID
+rcal providers google calendars list --account ID
+rcal providers google setup --account ID --client-id ID [--client-secret SECRET] [--calendar ID]
+rcal providers google sync [--account ID]
+rcal providers google status
 rcal reminders run [--events-file PATH] [--state-file PATH] [--once]
 rcal reminders install [--events-file PATH] [--state-file PATH]
 rcal reminders uninstall
@@ -59,8 +66,8 @@ Config is discovered at `$XDG_CONFIG_HOME/rcal/config.toml`, else
 `rcal config init` to write a commented starter file. Omitted settings keep
 built-in defaults, and CLI flags override config values. Config can set the
 events file, holiday source and country, reminder state file, and normal-mode
-keybindings. It can also configure the Microsoft provider. Modal/form keys stay
-fixed for now.
+keybindings. It can also configure the Microsoft and Google Calendar providers.
+Modal/form keys stay fixed for now.
 
 Nager.Date is cache-first and opt-in. Default startup does not need network
 access.
@@ -89,8 +96,8 @@ The create/edit modal supports timed events, single-day all-day events,
 recurrence, location, notes, and multiple reminder offsets. Its `Calendar`
 field controls where the event is saved; use Left/Right on that field to cycle
 between local storage and configured editable provider calendars. Local events
-are stored as JSON, while Microsoft events are written through Graph and then
-shown immediately from the provider cache.
+are stored as JSON, while provider events are written through their remote API
+and then shown immediately from the provider cache.
 Reminder notifications are delivered by a user-level background service. Use
 `rcal reminders install` to install it, `rcal reminders status` to inspect it,
 and `rcal reminders test` to send a test notification. On macOS, notification
@@ -192,13 +199,68 @@ create/edit/delete/copy operations for Microsoft events back through Graph.
 Provider reminders fire from cached provider events after a sync; the reminder
 daemon does not sync remote calendars itself.
 
+## Google Calendar Provider
+
+Google Calendar support is also cache-first. You refresh remote data explicitly:
+
+```sh
+rcal providers google setup --account personal --client-id GOOGLE_CLIENT_ID
+rcal
+```
+
+Google setup currently needs your own Google OAuth Desktop client ID. If Google
+also gives you a client secret, pass `--client-secret GOOGLE_CLIENT_SECRET`.
+The setup flow opens browser auth, selects your default editable calendar,
+writes `~/.config/rcal/config.toml`, performs the first sync, and sets new
+event creation to Google by default. User tokens are stored in the OS keychain.
+
+Use `--calendar CALENDAR_ID` to choose a known editable calendar. You can list
+calendars later with:
+
+```sh
+rcal providers google calendars list --account personal
+```
+
+Manual sync:
+
+```sh
+rcal providers google sync --account personal
+```
+
+Generated Google config looks like:
+
+```toml
+[providers]
+create_target = "google" # or "local" to keep new events local-only
+
+[providers.google]
+enabled = true
+default_account = "personal"
+default_calendar = "primary"
+sync_past_days = 30
+sync_future_days = 365
+
+[[providers.google.accounts]]
+id = "personal"
+client_id = "GOOGLE_CLIENT_ID"
+# client_secret = "GOOGLE_CLIENT_SECRET"
+redirect_port = 8766
+calendars = ["primary"]
+```
+
+The Google provider syncs configured calendars through the Calendar API,
+caches selected events separately from the local events JSON, and routes
+create/edit/delete/copy operations for Google events back through Google
+Calendar. Provider reminders fire from cached Google events after a sync.
+
 
 ## Current Limits
 
-- Google Calendar, CalDAV, and other providers are not implemented yet.
-- Microsoft sync is manual and cache-first; there is no background provider
+- CalDAV and other non-Microsoft/non-Google providers are not implemented yet.
+- Provider sync is manual and cache-first; there is no background provider
   sync daemon yet.
-- Packaging is currently source-based through Cargo.
+- Google currently requires a user-supplied OAuth Desktop client ID; rcal does
+  not yet ship an official Google OAuth client.
 
 ## Development
 

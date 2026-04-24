@@ -14,6 +14,7 @@ use time::{Month, Time, Weekday};
 use crate::{
     calendar::CalendarDate,
     providers::{
+        GoogleProviderConfig, GoogleProviderRuntime, KeyringGoogleTokenStore,
         KeyringMicrosoftTokenStore, MicrosoftProviderConfig, MicrosoftProviderRuntime,
         ProviderCreateTarget, ProviderError, ReqwestMicrosoftHttpClient,
     },
@@ -753,6 +754,7 @@ pub struct ConfiguredAgendaSource {
     events_file: Option<PathBuf>,
     create_target: ProviderCreateTarget,
     microsoft: Option<MicrosoftProviderRuntime>,
+    google: Option<GoogleProviderRuntime>,
 }
 
 impl ConfiguredAgendaSource {
@@ -767,6 +769,7 @@ impl ConfiguredAgendaSource {
             events_file: None,
             create_target: ProviderCreateTarget::Local,
             microsoft: None,
+            google: None,
         }
     }
 
@@ -782,6 +785,7 @@ impl ConfiguredAgendaSource {
             events_file: Some(events_file),
             create_target: ProviderCreateTarget::Local,
             microsoft: None,
+            google: None,
         })
     }
 
@@ -792,6 +796,18 @@ impl ConfiguredAgendaSource {
     ) -> Result<Self, LocalEventStoreError> {
         if config.enabled {
             self.microsoft = Some(MicrosoftProviderRuntime::load(config).map_err(provider_error)?);
+            self.create_target = create_target;
+        }
+        Ok(self)
+    }
+
+    pub fn with_google_provider(
+        mut self,
+        config: GoogleProviderConfig,
+        create_target: ProviderCreateTarget,
+    ) -> Result<Self, LocalEventStoreError> {
+        if config.enabled {
+            self.google = Some(GoogleProviderRuntime::load(config).map_err(provider_error)?);
             self.create_target = create_target;
         }
         Ok(self)
@@ -814,6 +830,15 @@ impl ConfiguredAgendaSource {
                 let http = ReqwestMicrosoftHttpClient;
                 let token_store = KeyringMicrosoftTokenStore;
                 return microsoft
+                    .create_event_in_target(draft, target, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
                     .create_event_in_target(draft, target, &http, &token_store)
                     .map_err(provider_error);
             }
@@ -882,6 +907,15 @@ impl ConfiguredAgendaSource {
                     .update_event(id, draft, &http, &token_store)
                     .map_err(provider_error);
             }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
+                    .update_event(id, draft, &http, &token_store)
+                    .map_err(provider_error);
+            }
             return Err(provider_not_configured(provider_id));
         }
 
@@ -934,6 +968,15 @@ impl ConfiguredAgendaSource {
                 let http = ReqwestMicrosoftHttpClient;
                 let token_store = KeyringMicrosoftTokenStore;
                 return microsoft
+                    .update_occurrence(series_id, anchor, draft, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
                     .update_occurrence(series_id, anchor, draft, &http, &token_store)
                     .map_err(provider_error);
             }
@@ -1002,6 +1045,15 @@ impl ConfiguredAgendaSource {
                     .delete_event(id, &http, &token_store)
                     .map_err(provider_error);
             }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
+                    .delete_event(id, &http, &token_store)
+                    .map_err(provider_error);
+            }
             return Err(provider_not_configured(provider_id));
         }
 
@@ -1034,6 +1086,15 @@ impl ConfiguredAgendaSource {
                     .duplicate_event(id, &http, &token_store)
                     .map_err(provider_error);
             }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
+                    .duplicate_event(id, &http, &token_store)
+                    .map_err(provider_error);
+            }
             return Err(provider_not_configured(provider_id));
         }
 
@@ -1058,6 +1119,15 @@ impl ConfiguredAgendaSource {
                 let http = ReqwestMicrosoftHttpClient;
                 let token_store = KeyringMicrosoftTokenStore;
                 return microsoft
+                    .duplicate_occurrence(series_id, anchor, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
                     .duplicate_occurrence(series_id, anchor, &http, &token_store)
                     .map_err(provider_error);
             }
@@ -1101,6 +1171,15 @@ impl ConfiguredAgendaSource {
                 let http = ReqwestMicrosoftHttpClient;
                 let token_store = KeyringMicrosoftTokenStore;
                 return microsoft
+                    .delete_occurrence(series_id, anchor, &http, &token_store)
+                    .map_err(provider_error);
+            }
+            if provider_id == "google"
+                && let Some(google) = &mut self.google
+            {
+                let http = ReqwestMicrosoftHttpClient;
+                let token_store = KeyringGoogleTokenStore;
+                return google
                     .delete_occurrence(series_id, anchor, &http, &token_store)
                     .map_err(provider_error);
             }
@@ -1164,6 +1243,11 @@ impl ConfiguredAgendaSource {
                 let event = microsoft.agenda_source().editable_event_by_id(id)?;
                 EventWriteTargetId::from_event(&event)
             })
+            .or_else(|| {
+                let google = self.google.as_ref()?;
+                let event = google.agenda_source().editable_event_by_id(id)?;
+                EventWriteTargetId::from_event(&event)
+            })
     }
 
     fn next_local_event_id(&self, title: &str) -> String {
@@ -1187,6 +1271,9 @@ impl AgendaSource for ConfiguredAgendaSource {
         if let Some(microsoft) = &self.microsoft {
             events.extend(microsoft.agenda_source().events_intersecting(range));
         }
+        if let Some(google) = &self.google {
+            events.extend(google.agenda_source().events_intersecting(range));
+        }
         events.sort_by(|left, right| {
             event_sort_key(left)
                 .cmp(&event_sort_key(right))
@@ -1204,6 +1291,9 @@ impl AgendaSource for ConfiguredAgendaSource {
         if let Some(microsoft) = &self.microsoft {
             targets.extend(microsoft.write_targets());
         }
+        if let Some(google) = &self.google {
+            targets.extend(google.write_targets());
+        }
         targets
     }
 
@@ -1216,6 +1306,14 @@ impl AgendaSource for ConfiguredAgendaSource {
         {
             return target;
         }
+        if self.create_target == ProviderCreateTarget::Google
+            && let Some(target) = self
+                .google
+                .as_ref()
+                .and_then(GoogleProviderRuntime::default_write_target)
+        {
+            return target;
+        }
         EventWriteTargetId::Local
     }
 
@@ -1224,11 +1322,18 @@ impl AgendaSource for ConfiguredAgendaSource {
     }
 
     fn editable_event_by_id(&self, id: &str) -> Option<Event> {
-        self.events.local_event_by_id(id).or_else(|| {
-            self.microsoft
-                .as_ref()
-                .and_then(|microsoft| microsoft.agenda_source().event_by_id(id))
-        })
+        self.events
+            .local_event_by_id(id)
+            .or_else(|| {
+                self.microsoft
+                    .as_ref()
+                    .and_then(|microsoft| microsoft.agenda_source().event_by_id(id))
+            })
+            .or_else(|| {
+                self.google
+                    .as_ref()
+                    .and_then(|google| google.agenda_source().event_by_id(id))
+            })
     }
 }
 

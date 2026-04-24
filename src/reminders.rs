@@ -230,6 +230,12 @@ pub fn run_once(
                     config.providers.create_target,
                 )
             })
+            .and_then(|source| {
+                source.with_google_provider(
+                    config.providers.google.clone(),
+                    config.providers.create_target,
+                )
+            })
             .map_err(|err| ReminderError::Events(err.to_string()))?;
     let mut state = ReminderState::load(&config.state_file)?;
     let instances = reminder_instances(&source, now);

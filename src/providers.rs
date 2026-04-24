@@ -28,10 +28,16 @@ use crate::{
 };
 
 const MICROSOFT_CACHE_VERSION: u8 = 1;
+const GOOGLE_CACHE_VERSION: u8 = 1;
 const GRAPH_BASE_URL: &str = "https://graph.microsoft.com/v1.0";
 const LOGIN_BASE_URL: &str = "https://login.microsoftonline.com";
 const MICROSOFT_SCOPES: &str = "offline_access User.Read Calendars.ReadWrite";
 const KEYRING_SERVICE: &str = "rcal.microsoft";
+const GOOGLE_CALENDAR_BASE_URL: &str = "https://www.googleapis.com/calendar/v3";
+const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const GOOGLE_SCOPES: &str = "https://www.googleapis.com/auth/calendar";
+const GOOGLE_KEYRING_SERVICE: &str = "rcal.google";
 pub const MICROSOFT_OFFICIAL_CLIENT_ID: &str = "9a49eaac-422b-4192-a65d-82dc8f43c11d";
 pub const MICROSOFT_DEFAULT_TENANT: &str = "common";
 
@@ -39,6 +45,7 @@ pub const MICROSOFT_DEFAULT_TENANT: &str = "common";
 pub struct ProviderConfig {
     pub create_target: ProviderCreateTarget,
     pub microsoft: MicrosoftProviderConfig,
+    pub google: GoogleProviderConfig,
 }
 
 impl Default for ProviderConfig {
@@ -46,6 +53,7 @@ impl Default for ProviderConfig {
         Self {
             create_target: ProviderCreateTarget::Local,
             microsoft: MicrosoftProviderConfig::default(),
+            google: GoogleProviderConfig::default(),
         }
     }
 }
@@ -54,6 +62,7 @@ impl Default for ProviderConfig {
 pub enum ProviderCreateTarget {
     Local,
     Microsoft,
+    Google,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +222,149 @@ impl MicrosoftAccountConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleProviderConfig {
+    pub enabled: bool,
+    pub default_account: Option<String>,
+    pub default_calendar: Option<String>,
+    pub sync_past_days: i32,
+    pub sync_future_days: i32,
+    pub cache_file: PathBuf,
+    pub accounts: Vec<GoogleAccountConfig>,
+}
+
+impl Default for GoogleProviderConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_account: None,
+            default_calendar: None,
+            sync_past_days: 30,
+            sync_future_days: 365,
+            cache_file: default_google_cache_file(),
+            accounts: Vec::new(),
+        }
+    }
+}
+
+impl GoogleProviderConfig {
+    pub fn account(&self, id: &str) -> Option<&GoogleAccountConfig> {
+        self.accounts.iter().find(|account| account.id == id)
+    }
+
+    pub fn default_account(&self) -> Option<&GoogleAccountConfig> {
+        self.default_account
+            .as_deref()
+            .and_then(|id| self.account(id))
+            .or_else(|| self.accounts.first())
+    }
+
+    pub fn default_calendar(&self) -> Option<(&GoogleAccountConfig, &str)> {
+        let account = self.default_account()?;
+        let calendar = self
+            .default_calendar
+            .as_deref()
+            .or_else(|| account.calendars.first().map(String::as_str))?;
+        Some((account, calendar))
+    }
+
+    pub fn validate(&self) -> Result<(), ProviderError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        if self.accounts.is_empty() {
+            return Err(ProviderError::Config(
+                "providers.google.enabled requires at least one account".to_string(),
+            ));
+        }
+        let mut seen = HashMap::new();
+        for account in &self.accounts {
+            if account.id.trim().is_empty() {
+                return Err(ProviderError::Config(
+                    "Google account id may not be empty".to_string(),
+                ));
+            }
+            if seen.insert(account.id.clone(), ()).is_some() {
+                return Err(ProviderError::Config(format!(
+                    "duplicate Google account id '{}'",
+                    account.id
+                )));
+            }
+            if account.client_id.trim().is_empty() {
+                return Err(ProviderError::Config(format!(
+                    "Google account '{}' requires client_id",
+                    account.id
+                )));
+            }
+            if account
+                .calendars
+                .iter()
+                .any(|calendar| calendar.trim().is_empty())
+            {
+                return Err(ProviderError::Config(format!(
+                    "Google account '{}' has an empty calendar id",
+                    account.id
+                )));
+            }
+        }
+        if let Some(default_account) = &self.default_account
+            && self.account(default_account).is_none()
+        {
+            return Err(ProviderError::Config(format!(
+                "providers.google.default_account '{}' is not configured",
+                default_account
+            )));
+        }
+        if let Some(default_calendar) = &self.default_calendar {
+            let Some(account) = self.default_account() else {
+                return Err(ProviderError::Config(
+                    "providers.google.default_calendar requires a default account".to_string(),
+                ));
+            };
+            if !account
+                .calendars
+                .iter()
+                .any(|calendar| calendar == default_calendar)
+            {
+                return Err(ProviderError::Config(format!(
+                    "default Google calendar '{}' is not listed for account '{}'",
+                    default_calendar, account.id
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleAccountConfig {
+    pub id: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_port: u16,
+    pub calendars: Vec<String>,
+}
+
+impl GoogleAccountConfig {
+    pub fn new(
+        id: impl Into<String>,
+        client_id: impl Into<String>,
+        client_secret: Option<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            client_id: client_id.into(),
+            client_secret,
+            redirect_port: 8766,
+            calendars: Vec::new(),
+        }
+    }
+
+    fn redirect_uri(&self) -> String {
+        format!("http://127.0.0.1:{}/callback", self.redirect_port)
+    }
+}
+
 pub fn default_microsoft_cache_file() -> PathBuf {
     if let Some(cache_home) = env::var_os("XDG_CACHE_HOME") {
         return PathBuf::from(cache_home)
@@ -228,12 +380,110 @@ pub fn default_microsoft_cache_file() -> PathBuf {
     env::temp_dir().join("rcal").join("microsoft-cache.json")
 }
 
+pub fn default_google_cache_file() -> PathBuf {
+    if let Some(cache_home) = env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(cache_home)
+            .join("rcal")
+            .join("google-cache.json");
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("rcal")
+            .join("google-cache.json");
+    }
+    env::temp_dir().join("rcal").join("google-cache.json")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MicrosoftCalendarInfo {
     pub id: String,
     pub name: String,
     pub can_edit: bool,
     pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleCalendarInfo {
+    pub id: String,
+    pub name: String,
+    pub can_edit: bool,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct GoogleAgendaSource {
+    cache: GoogleCacheFile,
+}
+
+impl GoogleAgendaSource {
+    pub fn load(path: &Path) -> Result<Self, ProviderError> {
+        Ok(Self {
+            cache: GoogleCacheFile::load(path)?,
+        })
+    }
+
+    pub fn empty() -> Self {
+        Self {
+            cache: GoogleCacheFile::empty(),
+        }
+    }
+
+    pub fn event_by_id(&self, id: &str) -> Option<Event> {
+        self.cache
+            .accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .flat_map(|calendar| &calendar.events)
+            .find(|event| event.id == id)
+            .and_then(GoogleCachedEvent::to_event)
+    }
+
+    pub fn event_count(&self) -> usize {
+        self.cache
+            .accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .map(|calendar| calendar.events.len())
+            .sum()
+    }
+}
+
+impl AgendaSource for GoogleAgendaSource {
+    fn events_intersecting(&self, range: DateRange) -> Vec<Event> {
+        let cached_events = self
+            .cache
+            .accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .flat_map(|calendar| &calendar.events)
+            .collect::<Vec<_>>();
+        let concrete_occurrence_series_ids = cached_events
+            .iter()
+            .filter_map(|event| event.series_master_app_id.clone())
+            .collect::<HashSet<_>>();
+        let events = cached_events
+            .into_iter()
+            .filter(|event| {
+                event.event_type.as_deref() != Some("recurringMaster")
+                    || !concrete_occurrence_series_ids.contains(&event.id)
+            })
+            .filter_map(GoogleCachedEvent::to_event)
+            .collect::<Vec<_>>();
+        let mut events = InMemoryAgendaSource::with_events_and_holidays(events, Vec::new())
+            .events_intersecting(range);
+        events.sort_by(|left, right| left.id.cmp(&right.id));
+        events
+    }
+
+    fn holidays_in(&self, _range: DateRange) -> Vec<Holiday> {
+        Vec::new()
+    }
+
+    fn editable_event_by_id(&self, id: &str) -> Option<Event> {
+        self.event_by_id(id)
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -684,6 +934,366 @@ impl MicrosoftProviderRuntime {
     }
 }
 
+#[derive(Debug)]
+pub struct GoogleProviderRuntime {
+    config: GoogleProviderConfig,
+    cache: GoogleCacheFile,
+}
+
+impl GoogleProviderRuntime {
+    pub fn load(config: GoogleProviderConfig) -> Result<Self, ProviderError> {
+        config.validate()?;
+        let cache = GoogleCacheFile::load(&config.cache_file)?;
+        Ok(Self { config, cache })
+    }
+
+    pub fn agenda_source(&self) -> GoogleAgendaSource {
+        GoogleAgendaSource {
+            cache: self.cache.clone(),
+        }
+    }
+
+    pub fn write_targets(&self) -> Vec<EventWriteTarget> {
+        if !self.config.enabled {
+            return Vec::new();
+        }
+        self.config
+            .accounts
+            .iter()
+            .flat_map(|account| {
+                account.calendars.iter().map(|calendar_id| {
+                    let label = self
+                        .cache
+                        .calendar_record(&account.id, calendar_id)
+                        .map(|calendar| format!("Google {}: {}", account.id, calendar.name))
+                        .unwrap_or_else(|| {
+                            format!(
+                                "Google {}: {}",
+                                account.id,
+                                short_calendar_label(calendar_id)
+                            )
+                        });
+                    EventWriteTarget::provider("google", &account.id, calendar_id, label)
+                })
+            })
+            .collect()
+    }
+
+    pub fn default_write_target(&self) -> Option<EventWriteTargetId> {
+        let (account, calendar_id) = self.config.default_calendar()?;
+        Some(EventWriteTargetId::provider(
+            "google",
+            account.id.clone(),
+            calendar_id.to_string(),
+        ))
+    }
+
+    pub fn status(&self, token_store: &dyn GoogleTokenStore) -> GoogleProviderStatus {
+        let accounts = self
+            .config
+            .accounts
+            .iter()
+            .map(|account| GoogleAccountStatus {
+                id: account.id.clone(),
+                authenticated: token_store.load(&account.id).ok().flatten().is_some(),
+                calendars: account.calendars.clone(),
+            })
+            .collect();
+        GoogleProviderStatus {
+            enabled: self.config.enabled,
+            cache_file: self.config.cache_file.clone(),
+            event_count: self.agenda_source().event_count(),
+            accounts,
+        }
+    }
+
+    pub fn sync(
+        &mut self,
+        account_id: Option<&str>,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+        now: CalendarDate,
+    ) -> Result<GoogleSyncSummary, ProviderError> {
+        if !self.config.enabled {
+            return Err(ProviderError::Config(
+                "Google provider is disabled".to_string(),
+            ));
+        }
+        let mut summary = GoogleSyncSummary::default();
+        let accounts = match account_id {
+            Some(account_id) => {
+                vec![self.config.account(account_id).cloned().ok_or_else(|| {
+                    ProviderError::Config(format!(
+                        "Google account '{account_id}' is not configured"
+                    ))
+                })?]
+            }
+            None => self.config.accounts.clone(),
+        };
+        for account in accounts {
+            let token = google_access_token(&account, http, token_store)?;
+            let calendar_ids = account.calendars.clone();
+            for calendar_id in calendar_ids {
+                let calendar = fetch_google_calendar(http, &token, &calendar_id)?;
+                let start = now.add_days(-self.config.sync_past_days);
+                let end = now.add_days(self.config.sync_future_days);
+                let events = fetch_google_events(http, &token, &account.id, &calendar, start, end)?;
+                summary.events += events.len();
+                summary.calendars += 1;
+                self.cache
+                    .replace_calendar(&account.id, calendar, events, current_epoch_seconds());
+            }
+            summary.accounts += 1;
+        }
+
+        self.cache.save(&self.config.cache_file)?;
+        Ok(summary)
+    }
+
+    pub fn create_event(
+        &mut self,
+        draft: CreateEventDraft,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let target = self.default_write_target().ok_or_else(|| {
+            ProviderError::Config("no Google default calendar configured".to_string())
+        })?;
+        self.create_event_in_target(draft, &target, http, token_store)
+    }
+
+    pub fn create_event_in_target(
+        &mut self,
+        draft: CreateEventDraft,
+        target: &EventWriteTargetId,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let Some((_, account_id, calendar_id)) = target.provider_parts() else {
+            return Err(ProviderError::Config(
+                "Google provider requires a Google calendar target".to_string(),
+            ));
+        };
+        if !target.is_provider("google") {
+            return Err(ProviderError::Config(
+                "Google provider requires a Google calendar target".to_string(),
+            ));
+        }
+        let account = self
+            .config
+            .account(account_id)
+            .ok_or_else(|| {
+                ProviderError::Config(format!("Google account '{account_id}' is not configured"))
+            })?
+            .clone();
+        if !account
+            .calendars
+            .iter()
+            .any(|calendar| calendar == calendar_id)
+        {
+            return Err(ProviderError::Config(format!(
+                "Google calendar '{calendar_id}' is not configured for account '{account_id}'"
+            )));
+        }
+        let token = google_access_token(&account, http, token_store)?;
+        let body = google_event_payload(&draft, false)?;
+        let response = google_request(
+            http,
+            "POST",
+            &format!(
+                "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events",
+                percent_encode(calendar_id)
+            ),
+            &token,
+            Some(body.to_string()),
+        )?;
+        let value = parse_google_success_json(response)?;
+        let calendar =
+            fetch_google_calendar(http, &token, calendar_id).unwrap_or(GoogleCalendarRecord {
+                id: calendar_id.to_string(),
+                name: calendar_id.to_string(),
+                can_edit: true,
+                is_default: false,
+            });
+        let cached = GoogleCachedEvent::from_google(&account.id, &calendar, value)?;
+        self.cache
+            .upsert_event(&account.id, calendar, cached.clone());
+        self.cache.save(&self.config.cache_file)?;
+        cached.to_event().ok_or_else(|| {
+            ProviderError::Mapping("created Google event could not be converted".to_string())
+        })
+    }
+
+    pub fn update_event(
+        &mut self,
+        id: &str,
+        draft: CreateEventDraft,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let metadata = self
+            .cache
+            .metadata_for_event(id)
+            .ok_or_else(|| ProviderError::NotFound(id.to_string()))?;
+        let account = self
+            .config
+            .account(&metadata.account_id)
+            .ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "Google account '{}' is not configured",
+                    metadata.account_id
+                ))
+            })?
+            .clone();
+        let token = google_access_token(&account, http, token_store)?;
+        let body = google_event_payload(&draft, true)?;
+        let response = google_request(
+            http,
+            "PATCH",
+            &format!(
+                "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events/{}",
+                percent_encode(&metadata.calendar_id),
+                percent_encode(&metadata.google_id)
+            ),
+            &token,
+            Some(body.to_string()),
+        )?;
+        let value = parse_google_success_json(response)?;
+        let calendar = self
+            .cache
+            .calendar_record(&metadata.account_id, &metadata.calendar_id)
+            .unwrap_or(GoogleCalendarRecord {
+                id: metadata.calendar_id.clone(),
+                name: metadata.calendar_id.clone(),
+                can_edit: true,
+                is_default: false,
+            });
+        let cached = GoogleCachedEvent::from_google(&metadata.account_id, &calendar, value)?;
+        self.cache.remove_occurrences_for_series(&cached.id);
+        self.cache
+            .upsert_event(&metadata.account_id, calendar, cached.clone());
+        self.cache.save(&self.config.cache_file)?;
+        cached.to_event().ok_or_else(|| {
+            ProviderError::Mapping("updated Google event could not be converted".to_string())
+        })
+    }
+
+    pub fn update_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+        draft: CreateEventDraft,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let id = self
+            .cache
+            .event_id_for_anchor(series_id, anchor)
+            .ok_or_else(|| {
+                ProviderError::NotFound(format!("{series_id}:{}", anchor_label(anchor)))
+            })?;
+        self.update_event(
+            &id,
+            draft.without_recurrence_for_provider(),
+            http,
+            token_store,
+        )
+    }
+
+    pub fn delete_event(
+        &mut self,
+        id: &str,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let metadata = self
+            .cache
+            .metadata_for_event(id)
+            .ok_or_else(|| ProviderError::NotFound(id.to_string()))?;
+        let event = self
+            .cache
+            .event_by_id(id)
+            .and_then(|cached| cached.to_event())
+            .ok_or_else(|| ProviderError::NotFound(id.to_string()))?;
+        let account = self
+            .config
+            .account(&metadata.account_id)
+            .ok_or_else(|| {
+                ProviderError::Config(format!(
+                    "Google account '{}' is not configured",
+                    metadata.account_id
+                ))
+            })?
+            .clone();
+        let token = google_access_token(&account, http, token_store)?;
+        let response = google_request(
+            http,
+            "DELETE",
+            &format!(
+                "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events/{}",
+                percent_encode(&metadata.calendar_id),
+                percent_encode(&metadata.google_id)
+            ),
+            &token,
+            None,
+        )?;
+        parse_google_empty_success(response)?;
+        self.cache.remove_event(id);
+        self.cache.save(&self.config.cache_file)?;
+        Ok(event)
+    }
+
+    pub fn delete_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<(), ProviderError> {
+        let id = self
+            .cache
+            .event_id_for_anchor(series_id, anchor)
+            .ok_or_else(|| {
+                ProviderError::NotFound(format!("{series_id}:{}", anchor_label(anchor)))
+            })?;
+        self.delete_event(&id, http, token_store).map(|_| ())
+    }
+
+    pub fn duplicate_event(
+        &mut self,
+        id: &str,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let event = self
+            .cache
+            .event_by_id(id)
+            .and_then(|cached| cached.to_event())
+            .ok_or_else(|| ProviderError::NotFound(id.to_string()))?;
+        self.create_event(
+            CreateEventDraft::from_event(&event).without_recurrence_for_provider(),
+            http,
+            token_store,
+        )
+    }
+
+    pub fn duplicate_occurrence(
+        &mut self,
+        series_id: &str,
+        anchor: OccurrenceAnchor,
+        http: &dyn MicrosoftHttpClient,
+        token_store: &dyn GoogleTokenStore,
+    ) -> Result<Event, ProviderError> {
+        let id = self
+            .cache
+            .event_id_for_anchor(series_id, anchor)
+            .ok_or_else(|| {
+                ProviderError::NotFound(format!("{series_id}:{}", anchor_label(anchor)))
+            })?;
+        self.duplicate_event(&id, http, token_store)
+    }
+}
+
 trait ProviderDraftExt {
     fn without_recurrence_for_provider(self) -> Self;
 }
@@ -724,6 +1334,447 @@ pub struct MicrosoftEventMetadata {
     pub graph_id: String,
     pub series_master_id: Option<String>,
     pub occurrence_anchor: Option<OccurrenceAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleProviderStatus {
+    pub enabled: bool,
+    pub cache_file: PathBuf,
+    pub event_count: usize,
+    pub accounts: Vec<GoogleAccountStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleAccountStatus {
+    pub id: String,
+    pub authenticated: bool,
+    pub calendars: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GoogleSyncSummary {
+    pub accounts: usize,
+    pub calendars: usize,
+    pub events: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleEventMetadata {
+    pub account_id: String,
+    pub calendar_id: String,
+    pub google_id: String,
+    pub recurring_event_id: Option<String>,
+    pub occurrence_anchor: Option<OccurrenceAnchor>,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct GoogleCacheFile {
+    version: u8,
+    #[serde(default)]
+    accounts: Vec<GoogleCacheAccount>,
+}
+
+impl GoogleCacheFile {
+    fn empty() -> Self {
+        Self {
+            version: GOOGLE_CACHE_VERSION,
+            accounts: Vec::new(),
+        }
+    }
+
+    fn load(path: &Path) -> Result<Self, ProviderError> {
+        let body = match fs::read_to_string(path) {
+            Ok(body) => body,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Self::empty()),
+            Err(err) => {
+                return Err(ProviderError::CacheRead {
+                    path: path.to_path_buf(),
+                    reason: err.to_string(),
+                });
+            }
+        };
+        let file =
+            serde_json::from_str::<Self>(&body).map_err(|err| ProviderError::CacheParse {
+                path: path.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        if file.version != GOOGLE_CACHE_VERSION {
+            return Err(ProviderError::CacheParse {
+                path: path.to_path_buf(),
+                reason: format!("unsupported Google cache version {}", file.version),
+            });
+        }
+        Ok(file)
+    }
+
+    fn save(&self, path: &Path) -> Result<(), ProviderError> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|err| ProviderError::CacheWrite {
+                path: parent.to_path_buf(),
+                reason: err.to_string(),
+            })?;
+        }
+        let body = serde_json::to_string_pretty(self).map_err(|err| ProviderError::CacheWrite {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })?;
+        let temp_path = path.with_extension("json.tmp");
+        fs::write(&temp_path, body).map_err(|err| ProviderError::CacheWrite {
+            path: temp_path.clone(),
+            reason: err.to_string(),
+        })?;
+        fs::rename(&temp_path, path).map_err(|err| ProviderError::CacheWrite {
+            path: path.to_path_buf(),
+            reason: err.to_string(),
+        })
+    }
+
+    fn replace_calendar(
+        &mut self,
+        account_id: &str,
+        calendar: GoogleCalendarRecord,
+        events: Vec<GoogleCachedEvent>,
+        synced_at_epoch_seconds: u64,
+    ) {
+        let account = self.account_mut(account_id);
+        if let Some(existing) = account
+            .calendars
+            .iter_mut()
+            .find(|existing| existing.id == calendar.id)
+        {
+            existing.name = calendar.name;
+            existing.can_edit = calendar.can_edit;
+            existing.is_default = calendar.is_default;
+            existing.last_synced_at_epoch_seconds = Some(synced_at_epoch_seconds);
+            existing.events = events;
+        } else {
+            account.calendars.push(GoogleCacheCalendar {
+                id: calendar.id,
+                name: calendar.name,
+                can_edit: calendar.can_edit,
+                is_default: calendar.is_default,
+                sync_token: None,
+                last_synced_at_epoch_seconds: Some(synced_at_epoch_seconds),
+                events,
+            });
+        }
+        account
+            .calendars
+            .sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
+    fn upsert_event(
+        &mut self,
+        account_id: &str,
+        calendar: GoogleCalendarRecord,
+        event: GoogleCachedEvent,
+    ) {
+        let account = self.account_mut(account_id);
+        let calendar_record = if let Some(existing) = account
+            .calendars
+            .iter_mut()
+            .find(|existing| existing.id == calendar.id)
+        {
+            existing
+        } else {
+            account.calendars.push(GoogleCacheCalendar {
+                id: calendar.id.clone(),
+                name: calendar.name.clone(),
+                can_edit: calendar.can_edit,
+                is_default: calendar.is_default,
+                sync_token: None,
+                last_synced_at_epoch_seconds: None,
+                events: Vec::new(),
+            });
+            account.calendars.last_mut().expect("calendar was pushed")
+        };
+        if let Some(existing) = calendar_record
+            .events
+            .iter_mut()
+            .find(|existing| existing.id == event.id)
+        {
+            *existing = event;
+        } else {
+            calendar_record.events.push(event);
+        }
+        calendar_record
+            .events
+            .sort_by(|left, right| left.id.cmp(&right.id));
+    }
+
+    fn remove_event(&mut self, id: &str) {
+        for calendar in self
+            .accounts
+            .iter_mut()
+            .flat_map(|account| &mut account.calendars)
+        {
+            calendar.events.retain(|event| {
+                event.id != id && event.series_master_app_id.as_deref() != Some(id)
+            });
+        }
+    }
+
+    fn remove_occurrences_for_series(&mut self, series_id: &str) {
+        for calendar in self
+            .accounts
+            .iter_mut()
+            .flat_map(|account| &mut account.calendars)
+        {
+            calendar
+                .events
+                .retain(|event| event.series_master_app_id.as_deref() != Some(series_id));
+        }
+    }
+
+    fn metadata_for_event(&self, id: &str) -> Option<GoogleEventMetadata> {
+        self.accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .flat_map(|calendar| &calendar.events)
+            .find(|event| event.id == id)
+            .map(GoogleCachedEvent::metadata)
+    }
+
+    fn event_by_id(&self, id: &str) -> Option<GoogleCachedEvent> {
+        self.accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .flat_map(|calendar| &calendar.events)
+            .find(|event| event.id == id)
+            .cloned()
+    }
+
+    fn event_id_for_anchor(&self, series_id: &str, anchor: OccurrenceAnchor) -> Option<String> {
+        self.accounts
+            .iter()
+            .flat_map(|account| &account.calendars)
+            .flat_map(|calendar| &calendar.events)
+            .find(|event| {
+                event
+                    .occurrence_anchor()
+                    .map(|event_anchor| event_anchor == anchor)
+                    .unwrap_or(false)
+                    && event.series_master_app_id.as_deref() == Some(series_id)
+            })
+            .map(|event| event.id.clone())
+    }
+
+    fn calendar_record(&self, account_id: &str, calendar_id: &str) -> Option<GoogleCalendarRecord> {
+        self.accounts
+            .iter()
+            .find(|account| account.id == account_id)?
+            .calendars
+            .iter()
+            .find(|calendar| calendar.id == calendar_id)
+            .map(|calendar| GoogleCalendarRecord {
+                id: calendar.id.clone(),
+                name: calendar.name.clone(),
+                can_edit: calendar.can_edit,
+                is_default: calendar.is_default,
+            })
+    }
+
+    fn account_mut(&mut self, account_id: &str) -> &mut GoogleCacheAccount {
+        if let Some(index) = self
+            .accounts
+            .iter()
+            .position(|account| account.id == account_id)
+        {
+            &mut self.accounts[index]
+        } else {
+            self.accounts.push(GoogleCacheAccount {
+                id: account_id.to_string(),
+                calendars: Vec::new(),
+            });
+            self.accounts.last_mut().expect("account was pushed")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleCacheAccount {
+    id: String,
+    #[serde(default)]
+    calendars: Vec<GoogleCacheCalendar>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleCacheCalendar {
+    id: String,
+    name: String,
+    #[serde(default)]
+    can_edit: bool,
+    #[serde(default)]
+    is_default: bool,
+    #[serde(default)]
+    sync_token: Option<String>,
+    #[serde(default)]
+    last_synced_at_epoch_seconds: Option<u64>,
+    #[serde(default)]
+    events: Vec<GoogleCachedEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleCachedEvent {
+    id: String,
+    account_id: String,
+    calendar_id: String,
+    calendar_name: String,
+    google_id: String,
+    #[serde(default)]
+    event_type: Option<String>,
+    #[serde(default)]
+    recurring_event_id: Option<String>,
+    #[serde(default)]
+    series_master_app_id: Option<String>,
+    #[serde(default)]
+    status: Option<String>,
+    title: String,
+    timing: GoogleCachedTiming,
+    #[serde(default)]
+    original_start: Option<GoogleCachedTiming>,
+    #[serde(default)]
+    location: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
+    #[serde(default)]
+    reminders_minutes_before: Vec<u16>,
+    #[serde(default)]
+    recurrence: Option<MicrosoftCachedRecurrence>,
+    #[serde(default)]
+    raw: Value,
+}
+
+impl GoogleCachedEvent {
+    fn from_google(
+        account_id: &str,
+        calendar: &GoogleCalendarRecord,
+        raw: Value,
+    ) -> Result<Self, ProviderError> {
+        let google_id = graph_string(&raw, "id")
+            .ok_or_else(|| ProviderError::Mapping("Google event is missing id".to_string()))?;
+        let title = graph_string(&raw, "summary").unwrap_or_else(|| "(Untitled)".to_string());
+        let timing = google_timing(&raw, "start", "end")?;
+        let original_start = raw
+            .get("originalStartTime")
+            .map(google_single_time)
+            .transpose()?;
+        let recurring_event_id = graph_string(&raw, "recurringEventId");
+        let series_master_app_id = recurring_event_id
+            .as_ref()
+            .map(|id| google_event_app_id(account_id, &calendar.id, id));
+        let recurrence = raw
+            .get("recurrence")
+            .and_then(Value::as_array)
+            .and_then(|rules| {
+                rules
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|rule| rule.starts_with("RRULE:"))
+            })
+            .and_then(google_rrule_to_cache);
+        let reminders_minutes_before = raw
+            .get("reminders")
+            .and_then(|reminders| reminders.get("overrides"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|reminder| graph_i64(reminder, "minutes"))
+            .filter_map(|value| u16::try_from(value).ok())
+            .collect();
+
+        Ok(Self {
+            id: google_event_app_id(account_id, &calendar.id, &google_id),
+            account_id: account_id.to_string(),
+            calendar_id: calendar.id.clone(),
+            calendar_name: calendar.name.clone(),
+            google_id,
+            event_type: if recurrence.is_some() && recurring_event_id.is_none() {
+                Some("recurringMaster".to_string())
+            } else {
+                graph_string(&raw, "eventType")
+            },
+            recurring_event_id,
+            series_master_app_id,
+            status: graph_string(&raw, "status"),
+            title,
+            timing,
+            original_start,
+            location: graph_string(&raw, "location").filter(|value| !value.trim().is_empty()),
+            notes: graph_string(&raw, "description").filter(|value| !value.trim().is_empty()),
+            reminders_minutes_before,
+            recurrence,
+            raw,
+        })
+    }
+
+    fn to_event(&self) -> Option<Event> {
+        if self.status.as_deref() == Some("cancelled") {
+            return None;
+        }
+        let source = SourceMetadata::new(
+            format!("google:{}:{}", self.account_id, self.calendar_id),
+            format!("Google {}/{}", self.account_id, self.calendar_name),
+        )
+        .with_external_id(self.google_id.clone());
+        let mut event = match self.timing {
+            GoogleCachedTiming::AllDay { date } => {
+                Event::all_day(self.id.clone(), self.title.clone(), date, source)
+            }
+            GoogleCachedTiming::Timed { start, end } => {
+                Event::timed(self.id.clone(), self.title.clone(), start, end, source).ok()?
+            }
+        };
+        event.location = self.location.clone();
+        event.notes = self.notes.clone();
+        event.reminders = self
+            .reminders_minutes_before
+            .iter()
+            .copied()
+            .map(Reminder::minutes_before)
+            .collect();
+        event.recurrence = self
+            .recurrence
+            .as_ref()
+            .and_then(MicrosoftCachedRecurrence::to_rule);
+        if let Some(series_master_app_id) = &self.series_master_app_id {
+            event.occurrence = Some(OccurrenceMetadata {
+                series_id: series_master_app_id.clone(),
+                anchor: self.occurrence_anchor()?,
+            });
+        }
+        Some(event)
+    }
+
+    fn metadata(&self) -> GoogleEventMetadata {
+        GoogleEventMetadata {
+            account_id: self.account_id.clone(),
+            calendar_id: self.calendar_id.clone(),
+            google_id: self.google_id.clone(),
+            recurring_event_id: self.recurring_event_id.clone(),
+            occurrence_anchor: self.occurrence_anchor(),
+        }
+    }
+
+    fn occurrence_anchor(&self) -> Option<OccurrenceAnchor> {
+        let timing = self.original_start.unwrap_or(self.timing);
+        match timing {
+            GoogleCachedTiming::AllDay { date } => Some(OccurrenceAnchor::AllDay { date }),
+            GoogleCachedTiming::Timed { start, .. } => Some(OccurrenceAnchor::Timed { start }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum GoogleCachedTiming {
+    AllDay {
+        date: CalendarDate,
+    },
+    Timed {
+        start: EventDateTime,
+        end: EventDateTime,
+    },
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -1341,6 +2392,14 @@ struct MicrosoftCalendarRecord {
     is_default: bool,
 }
 
+#[derive(Debug, Clone)]
+struct GoogleCalendarRecord {
+    id: String,
+    name: String,
+    can_edit: bool,
+    is_default: bool,
+}
+
 pub trait MicrosoftTokenStore {
     fn load(&self, account_id: &str) -> Result<Option<MicrosoftToken>, ProviderError>;
     fn save(&self, account_id: &str, token: &MicrosoftToken) -> Result<(), ProviderError>;
@@ -1385,6 +2444,55 @@ impl MicrosoftTokenStore for KeyringMicrosoftTokenStore {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MicrosoftToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_at_epoch_seconds: u64,
+}
+
+pub trait GoogleTokenStore {
+    fn load(&self, account_id: &str) -> Result<Option<GoogleToken>, ProviderError>;
+    fn save(&self, account_id: &str, token: &GoogleToken) -> Result<(), ProviderError>;
+    fn delete(&self, account_id: &str) -> Result<(), ProviderError>;
+}
+
+#[derive(Debug, Default)]
+pub struct KeyringGoogleTokenStore;
+
+impl GoogleTokenStore for KeyringGoogleTokenStore {
+    fn load(&self, account_id: &str) -> Result<Option<GoogleToken>, ProviderError> {
+        let entry = keyring::Entry::new(GOOGLE_KEYRING_SERVICE, account_id)
+            .map_err(|err| ProviderError::Keyring(format!("Google: {err}")))?;
+        match entry.get_password() {
+            Ok(body) => serde_json::from_str(&body)
+                .map(Some)
+                .map_err(|err| ProviderError::Keyring(format!("Google: {err}"))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(err) => Err(ProviderError::Keyring(format!("Google: {err}"))),
+        }
+    }
+
+    fn save(&self, account_id: &str, token: &GoogleToken) -> Result<(), ProviderError> {
+        let entry = keyring::Entry::new(GOOGLE_KEYRING_SERVICE, account_id)
+            .map_err(|err| ProviderError::Keyring(format!("Google: {err}")))?;
+        let body = serde_json::to_string(token)
+            .map_err(|err| ProviderError::Keyring(format!("Google: {err}")))?;
+        entry
+            .set_password(&body)
+            .map_err(|err| ProviderError::Keyring(format!("Google: {err}")))
+    }
+
+    fn delete(&self, account_id: &str) -> Result<(), ProviderError> {
+        let entry = keyring::Entry::new(GOOGLE_KEYRING_SERVICE, account_id)
+            .map_err(|err| ProviderError::Keyring(format!("Google: {err}")))?;
+        match entry.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(err) => Err(ProviderError::Keyring(format!("Google: {err}"))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GoogleToken {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_at_epoch_seconds: u64,
@@ -1681,21 +2789,22 @@ fn login_browser(
             .map(String::as_str)
             .unwrap_or("Microsoft did not provide an error description");
         let message = format!("{error}: {description}");
-        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        let _ = write_oauth_callback_response(&mut stream, "Microsoft", false, &message);
         return Err(ProviderError::Auth(message));
     }
     let code = params.get("code").ok_or_else(|| {
         let message = "OAuth callback did not include code".to_string();
-        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        let _ = write_oauth_callback_response(&mut stream, "Microsoft", false, &message);
         ProviderError::Auth(message)
     })?;
     if params.get("state") != Some(&state) {
         let message = "OAuth callback state mismatch".to_string();
-        let _ = write_oauth_callback_response(&mut stream, false, &message);
+        let _ = write_oauth_callback_response(&mut stream, "Microsoft", false, &message);
         return Err(ProviderError::Auth(message));
     }
     let _ = write_oauth_callback_response(
         &mut stream,
+        "Microsoft",
         true,
         "rcal Microsoft login complete. You can close this tab.",
     );
@@ -1782,6 +2891,166 @@ pub fn list_calendars(
             name: graph_string(calendar, "name").unwrap_or_default(),
             can_edit: graph_bool(calendar, "canEdit").unwrap_or(false),
             is_default: graph_bool(calendar, "isDefaultCalendar").unwrap_or(false),
+        })
+        .filter(|calendar| !calendar.id.is_empty())
+        .collect::<Vec<_>>();
+    Ok(calendars)
+}
+
+pub fn login_google_browser(
+    account: &GoogleAccountConfig,
+    http: &dyn MicrosoftHttpClient,
+    token_store: &dyn GoogleTokenStore,
+    stdout: &mut dyn Write,
+) -> Result<(), ProviderError> {
+    let verifier = pkce_verifier();
+    let challenge = pkce_challenge(&verifier);
+    let state = pkce_verifier();
+    let redirect_uri = account.redirect_uri();
+    let listener = TcpListener::bind(("127.0.0.1", account.redirect_port)).map_err(|err| {
+        ProviderError::Auth(format!("failed to listen for Google OAuth callback: {err}"))
+    })?;
+    let auth_url = format!(
+        "{GOOGLE_AUTH_URL}?client_id={}&response_type=code&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256&access_type=offline&prompt=consent",
+        percent_encode(&account.client_id),
+        percent_encode(&redirect_uri),
+        percent_encode(GOOGLE_SCOPES),
+        percent_encode(&state),
+        percent_encode(&challenge),
+    );
+    writeln!(stdout, "opening browser for Google login")
+        .map_err(|err| ProviderError::Auth(err.to_string()))?;
+    open_browser(&auth_url)?;
+    let (mut stream, _) = listener
+        .accept()
+        .map_err(|err| ProviderError::Auth(err.to_string()))?;
+    let mut request = String::new();
+    BufReader::new(
+        stream
+            .try_clone()
+            .map_err(|err| ProviderError::Auth(err.to_string()))?,
+    )
+    .read_line(&mut request)
+    .map_err(|err| ProviderError::Auth(err.to_string()))?;
+    let query = request
+        .split_whitespace()
+        .nth(1)
+        .and_then(|path| path.split_once('?').map(|(_, query)| query))
+        .ok_or_else(|| {
+            ProviderError::Auth("Google OAuth callback did not include a query".to_string())
+        })?;
+    let params = parse_query(query);
+    if let Some(error) = params.get("error") {
+        let description = params
+            .get("error_description")
+            .map(String::as_str)
+            .unwrap_or("Google did not provide an error description");
+        let message = format!("{error}: {description}");
+        let _ = write_oauth_callback_response(&mut stream, "Google", false, &message);
+        return Err(ProviderError::Auth(message));
+    }
+    let code = params.get("code").ok_or_else(|| {
+        let message = "Google OAuth callback did not include code".to_string();
+        let _ = write_oauth_callback_response(&mut stream, "Google", false, &message);
+        ProviderError::Auth(message)
+    })?;
+    if params.get("state") != Some(&state) {
+        let message = "Google OAuth callback state mismatch".to_string();
+        let _ = write_oauth_callback_response(&mut stream, "Google", false, &message);
+        return Err(ProviderError::Auth(message));
+    }
+    let _ = write_oauth_callback_response(
+        &mut stream,
+        "Google",
+        true,
+        "rcal Google login complete. You can close this tab.",
+    );
+    let mut fields = vec![
+        ("grant_type", "authorization_code"),
+        ("client_id", account.client_id.as_str()),
+        ("code", code),
+        ("redirect_uri", &redirect_uri),
+        ("code_verifier", &verifier),
+    ];
+    if let Some(client_secret) = &account.client_secret {
+        fields.push(("client_secret", client_secret.as_str()));
+    }
+    let response = http.request(MicrosoftHttpRequest {
+        method: "POST".to_string(),
+        url: GOOGLE_TOKEN_URL.to_string(),
+        headers: vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )],
+        body: Some(form_body(&fields)),
+    })?;
+    let token = google_token_from_response(response, None)?;
+    token_store.save(&account.id, &token)?;
+    writeln!(stdout, "authenticated Google account '{}'", account.id)
+        .map_err(|err| ProviderError::Auth(err.to_string()))
+}
+
+pub fn logout_google(
+    account_id: &str,
+    token_store: &dyn GoogleTokenStore,
+) -> Result<(), ProviderError> {
+    token_store.delete(account_id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoogleTokenInspection {
+    pub account_id: String,
+    pub stored_expires_at_epoch_seconds: u64,
+    pub has_refresh_token: bool,
+}
+
+pub fn inspect_google_token(
+    account_id: &str,
+    token_store: &dyn GoogleTokenStore,
+) -> Result<GoogleTokenInspection, ProviderError> {
+    let token = token_store.load(account_id)?.ok_or_else(|| {
+        ProviderError::Auth(format!(
+            "Google account '{account_id}' is not authenticated"
+        ))
+    })?;
+    Ok(GoogleTokenInspection {
+        account_id: account_id.to_string(),
+        stored_expires_at_epoch_seconds: token.expires_at_epoch_seconds,
+        has_refresh_token: !token.refresh_token.is_empty(),
+    })
+}
+
+pub fn list_google_calendars(
+    account: &GoogleAccountConfig,
+    http: &dyn MicrosoftHttpClient,
+    token_store: &dyn GoogleTokenStore,
+) -> Result<Vec<GoogleCalendarInfo>, ProviderError> {
+    let token = google_access_token(account, http, token_store)?;
+    let response = google_request(
+        http,
+        "GET",
+        &format!("{GOOGLE_CALENDAR_BASE_URL}/users/me/calendarList?maxResults=250"),
+        &token,
+        None,
+    )?;
+    let value = parse_google_success_json(response)?;
+    let calendars = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::Mapping("Google calendar list response is missing items".to_string())
+        })?
+        .iter()
+        .map(|calendar| {
+            let access_role = graph_string(calendar, "accessRole").unwrap_or_default();
+            GoogleCalendarInfo {
+                id: graph_string(calendar, "id").unwrap_or_default(),
+                name: graph_string(calendar, "summaryOverride")
+                    .or_else(|| graph_string(calendar, "summary"))
+                    .unwrap_or_default(),
+                can_edit: matches!(access_role.as_str(), "owner" | "writer"),
+                is_default: graph_bool(calendar, "primary").unwrap_or(false),
+            }
         })
         .filter(|calendar| !calendar.id.is_empty())
         .collect::<Vec<_>>();
@@ -1880,6 +3149,148 @@ fn fetch_event(
     parse_graph_success_json(response)
 }
 
+fn google_access_token(
+    account: &GoogleAccountConfig,
+    http: &dyn MicrosoftHttpClient,
+    token_store: &dyn GoogleTokenStore,
+) -> Result<String, ProviderError> {
+    let token = token_store.load(&account.id)?.ok_or_else(|| {
+        ProviderError::Auth(format!(
+            "Google account '{}' is not authenticated",
+            account.id
+        ))
+    })?;
+    if token.expires_at_epoch_seconds > current_epoch_seconds().saturating_add(120) {
+        return Ok(token.access_token);
+    }
+    let mut fields = vec![
+        ("grant_type", "refresh_token"),
+        ("client_id", account.client_id.as_str()),
+        ("refresh_token", token.refresh_token.as_str()),
+    ];
+    if let Some(client_secret) = &account.client_secret {
+        fields.push(("client_secret", client_secret.as_str()));
+    }
+    let response = http.request(MicrosoftHttpRequest {
+        method: "POST".to_string(),
+        url: GOOGLE_TOKEN_URL.to_string(),
+        headers: vec![(
+            "Content-Type".to_string(),
+            "application/x-www-form-urlencoded".to_string(),
+        )],
+        body: Some(form_body(&fields)),
+    })?;
+    let refreshed = google_token_from_response(response, Some(token.refresh_token))?;
+    token_store.save(&account.id, &refreshed)?;
+    Ok(refreshed.access_token)
+}
+
+fn fetch_google_calendar(
+    http: &dyn MicrosoftHttpClient,
+    token: &str,
+    calendar_id: &str,
+) -> Result<GoogleCalendarRecord, ProviderError> {
+    let response = google_request(
+        http,
+        "GET",
+        &format!(
+            "{GOOGLE_CALENDAR_BASE_URL}/users/me/calendarList/{}",
+            percent_encode(calendar_id)
+        ),
+        token,
+        None,
+    )?;
+    let value = parse_google_success_json(response)?;
+    let access_role = graph_string(&value, "accessRole").unwrap_or_default();
+    Ok(GoogleCalendarRecord {
+        id: graph_string(&value, "id").unwrap_or_else(|| calendar_id.to_string()),
+        name: graph_string(&value, "summaryOverride")
+            .or_else(|| graph_string(&value, "summary"))
+            .unwrap_or_else(|| calendar_id.to_string()),
+        can_edit: matches!(access_role.as_str(), "owner" | "writer"),
+        is_default: graph_bool(&value, "primary").unwrap_or(false),
+    })
+}
+
+fn fetch_google_events(
+    http: &dyn MicrosoftHttpClient,
+    token: &str,
+    account_id: &str,
+    calendar: &GoogleCalendarRecord,
+    start: CalendarDate,
+    end: CalendarDate,
+) -> Result<Vec<GoogleCachedEvent>, ProviderError> {
+    let mut url = format!(
+        "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events?singleEvents=true&showDeleted=false&maxResults=2500&orderBy=startTime&timeMin={}T00:00:00Z&timeMax={}T00:00:00Z",
+        percent_encode(&calendar.id),
+        start,
+        end
+    );
+    let mut events = Vec::new();
+    let mut series_master_ids = HashSet::new();
+    loop {
+        let response = google_request(http, "GET", &url, token, None)?;
+        let value = parse_google_success_json(response)?;
+        if let Some(values) = value.get("items").and_then(Value::as_array) {
+            for event in values {
+                if graph_string(event, "status").as_deref() == Some("cancelled") {
+                    continue;
+                }
+                if let Some(series_master_id) = graph_string(event, "recurringEventId") {
+                    series_master_ids.insert(series_master_id);
+                }
+                events.push(GoogleCachedEvent::from_google(
+                    account_id,
+                    calendar,
+                    event.clone(),
+                )?);
+            }
+        }
+        if let Some(next_page_token) = graph_string(&value, "nextPageToken") {
+            url = format!(
+                "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events?singleEvents=true&showDeleted=false&maxResults=2500&orderBy=startTime&timeMin={}T00:00:00Z&timeMax={}T00:00:00Z&pageToken={}",
+                percent_encode(&calendar.id),
+                start,
+                end,
+                percent_encode(&next_page_token)
+            );
+        } else {
+            break;
+        }
+    }
+    for series_master_id in series_master_ids {
+        if events
+            .iter()
+            .any(|event| event.google_id == series_master_id)
+        {
+            continue;
+        }
+        let raw = fetch_google_event(http, token, &calendar.id, &series_master_id)?;
+        events.push(GoogleCachedEvent::from_google(account_id, calendar, raw)?);
+    }
+    Ok(events)
+}
+
+fn fetch_google_event(
+    http: &dyn MicrosoftHttpClient,
+    token: &str,
+    calendar_id: &str,
+    google_id: &str,
+) -> Result<Value, ProviderError> {
+    let response = google_request(
+        http,
+        "GET",
+        &format!(
+            "{GOOGLE_CALENDAR_BASE_URL}/calendars/{}/events/{}",
+            percent_encode(calendar_id),
+            percent_encode(google_id)
+        ),
+        token,
+        None,
+    )?;
+    parse_google_success_json(response)
+}
+
 fn graph_request(
     http: &dyn MicrosoftHttpClient,
     method: &str,
@@ -1919,6 +3330,44 @@ fn parse_graph_empty_success(response: MicrosoftHttpResponse) -> Result<(), Prov
     }
 }
 
+fn google_request(
+    http: &dyn MicrosoftHttpClient,
+    method: &str,
+    url: &str,
+    token: &str,
+    body: Option<String>,
+) -> Result<MicrosoftHttpResponse, ProviderError> {
+    let mut headers = vec![
+        ("Authorization".to_string(), format!("Bearer {token}")),
+        ("Accept".to_string(), "application/json".to_string()),
+    ];
+    if body.is_some() {
+        headers.push(("Content-Type".to_string(), "application/json".to_string()));
+    }
+    http.request(MicrosoftHttpRequest {
+        method: method.to_string(),
+        url: url.to_string(),
+        headers,
+        body,
+    })
+}
+
+fn parse_google_success_json(response: MicrosoftHttpResponse) -> Result<Value, ProviderError> {
+    if (200..300).contains(&response.status) {
+        return serde_json::from_str(&response.body)
+            .map_err(|err| ProviderError::Mapping(format!("Google: {err}")));
+    }
+    Err(ProviderError::Api(google_error_message(response)))
+}
+
+fn parse_google_empty_success(response: MicrosoftHttpResponse) -> Result<(), ProviderError> {
+    if (200..300).contains(&response.status) {
+        Ok(())
+    } else {
+        Err(ProviderError::Api(google_error_message(response)))
+    }
+}
+
 fn graph_error_message(response: MicrosoftHttpResponse) -> String {
     let www_authenticate = response
         .headers
@@ -1944,6 +3393,24 @@ fn graph_error_message(response: MicrosoftHttpResponse) -> String {
     }
 }
 
+fn google_error_message(response: MicrosoftHttpResponse) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(&response.body)
+        && let Some(error) = value.get("error")
+    {
+        let code = graph_string(error, "status")
+            .or_else(|| graph_string(error, "code"))
+            .unwrap_or_else(|| response.status.to_string());
+        let message = graph_string(error, "message").unwrap_or_else(|| response.body.clone());
+        return format!("Google Calendar {code}: {message}");
+    }
+    let body = response.body.trim();
+    if body.is_empty() {
+        format!("Google Calendar HTTP {}", response.status)
+    } else {
+        format!("Google Calendar HTTP {}: {body}", response.status)
+    }
+}
+
 fn parse_oauth_json(response: MicrosoftHttpResponse) -> Result<Value, ProviderError> {
     if response.status != 200 {
         return Err(ProviderError::Auth(graph_error_message(response)));
@@ -1958,6 +3425,27 @@ fn token_from_response(response: MicrosoftHttpResponse) -> Result<MicrosoftToken
     let refresh_token = graph_string(&value, "refresh_token").unwrap_or_default();
     let expires_in = graph_i64(&value, "expires_in").unwrap_or(3600).max(1) as u64;
     Ok(MicrosoftToken {
+        access_token,
+        refresh_token,
+        expires_at_epoch_seconds: current_epoch_seconds().saturating_add(expires_in),
+    })
+}
+
+fn google_token_from_response(
+    response: MicrosoftHttpResponse,
+    existing_refresh_token: Option<String>,
+) -> Result<GoogleToken, ProviderError> {
+    if response.status != 200 {
+        return Err(ProviderError::Auth(google_error_message(response)));
+    }
+    let value = serde_json::from_str::<Value>(&response.body)
+        .map_err(|err| ProviderError::Auth(format!("Google token response is invalid: {err}")))?;
+    let access_token = required_json_string(&value, "access_token")?;
+    let refresh_token = graph_string(&value, "refresh_token")
+        .or(existing_refresh_token)
+        .unwrap_or_default();
+    let expires_in = graph_i64(&value, "expires_in").unwrap_or(3600).max(1) as u64;
+    Ok(GoogleToken {
         access_token,
         refresh_token,
         expires_at_epoch_seconds: current_epoch_seconds().saturating_add(expires_in),
@@ -2048,10 +3536,80 @@ pub fn graph_event_payload(
     Ok(Value::Object(payload))
 }
 
+pub fn google_event_payload(
+    draft: &CreateEventDraft,
+    is_update: bool,
+) -> Result<Value, ProviderError> {
+    if draft.reminders.len() > 5 {
+        return Err(ProviderError::Validation(
+            "Google Calendar events support at most five reminders".to_string(),
+        ));
+    }
+    let mut payload = Map::new();
+    payload.insert("summary".to_string(), Value::String(draft.title.clone()));
+    if let Some(notes) = &draft.notes {
+        payload.insert("description".to_string(), Value::String(notes.clone()));
+    } else if is_update {
+        payload.insert("description".to_string(), Value::String(String::new()));
+    }
+    if let Some(location) = &draft.location {
+        payload.insert("location".to_string(), Value::String(location.clone()));
+    } else if is_update {
+        payload.insert("location".to_string(), Value::String(String::new()));
+    }
+    if draft.reminders.is_empty() {
+        payload.insert("reminders".to_string(), json!({ "useDefault": false }));
+    } else {
+        payload.insert(
+            "reminders".to_string(),
+            json!({
+                "useDefault": false,
+                "overrides": draft.reminders.iter().map(|reminder| {
+                    json!({
+                        "method": "popup",
+                        "minutes": reminder.minutes_before
+                    })
+                }).collect::<Vec<_>>()
+            }),
+        );
+    }
+    match draft.timing {
+        CreateEventTiming::AllDay { date } => {
+            payload.insert("start".to_string(), json!({ "date": date.to_string() }));
+            payload.insert(
+                "end".to_string(),
+                json!({ "date": date.add_days(1).to_string() }),
+            );
+        }
+        CreateEventTiming::Timed { start, end } => {
+            payload.insert("start".to_string(), google_datetime_payload(start));
+            payload.insert("end".to_string(), google_datetime_payload(end));
+        }
+    }
+    if let Some(recurrence) = &draft.recurrence {
+        payload.insert(
+            "recurrence".to_string(),
+            Value::Array(vec![Value::String(google_rrule_payload(recurrence, draft))]),
+        );
+    }
+    Ok(Value::Object(payload))
+}
+
 fn graph_datetime_payload(date: CalendarDate, time: Time) -> Value {
     json!({
         "dateTime": format!("{}T{:02}:{:02}:00", date, time.hour(), time.minute()),
         "timeZone": "UTC"
+    })
+}
+
+fn google_datetime_payload(value: EventDateTime) -> Value {
+    json!({
+        "dateTime": format!(
+            "{}T{:02}:{:02}:00Z",
+            value.date,
+            value.time.hour(),
+            value.time.minute()
+        )
     })
 }
 
@@ -2198,6 +3756,89 @@ fn graph_recurrence_payload(
     }))
 }
 
+fn google_rrule_payload(rule: &RecurrenceRule, draft: &CreateEventDraft) -> String {
+    let start_date = match draft.timing {
+        CreateEventTiming::AllDay { date } => date,
+        CreateEventTiming::Timed { start, .. } => start.date,
+    };
+    let mut parts = vec![format!(
+        "FREQ={}",
+        match rule.frequency {
+            RecurrenceFrequency::Daily => "DAILY",
+            RecurrenceFrequency::Weekly => "WEEKLY",
+            RecurrenceFrequency::Monthly => "MONTHLY",
+            RecurrenceFrequency::Yearly => "YEARLY",
+        }
+    )];
+    if rule.interval() > 1 {
+        parts.push(format!("INTERVAL={}", rule.interval()));
+    }
+    match rule.frequency {
+        RecurrenceFrequency::Weekly => {
+            if !rule.weekdays.is_empty() {
+                parts.push(format!(
+                    "BYDAY={}",
+                    rule.weekdays
+                        .iter()
+                        .copied()
+                        .map(google_weekday)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ));
+            }
+        }
+        RecurrenceFrequency::Monthly => match rule.monthly {
+            Some(RecurrenceMonthlyRule::DayOfMonth(day)) => {
+                parts.push(format!("BYMONTHDAY={day}"));
+            }
+            Some(RecurrenceMonthlyRule::WeekdayOrdinal { ordinal, weekday }) => {
+                parts.push(format!(
+                    "BYDAY={}{}",
+                    google_ordinal_prefix(ordinal),
+                    google_weekday(weekday)
+                ));
+            }
+            None => parts.push(format!("BYMONTHDAY={}", start_date.day())),
+        },
+        RecurrenceFrequency::Yearly => match rule.yearly {
+            Some(RecurrenceYearlyRule::Date { month, day }) => {
+                parts.push(format!("BYMONTH={}", u8::from(month)));
+                parts.push(format!("BYMONTHDAY={day}"));
+            }
+            Some(RecurrenceYearlyRule::WeekdayOrdinal {
+                month,
+                ordinal,
+                weekday,
+            }) => {
+                parts.push(format!("BYMONTH={}", u8::from(month)));
+                parts.push(format!(
+                    "BYDAY={}{}",
+                    google_ordinal_prefix(ordinal),
+                    google_weekday(weekday)
+                ));
+            }
+            None => {
+                parts.push(format!("BYMONTH={}", u8::from(start_date.month())));
+                parts.push(format!("BYMONTHDAY={}", start_date.day()));
+            }
+        },
+        RecurrenceFrequency::Daily => {}
+    }
+    match rule.end {
+        RecurrenceEnd::Never => {}
+        RecurrenceEnd::Until(date) => {
+            parts.push(format!(
+                "UNTIL={}T000000Z",
+                date.to_string().replace('-', "")
+            ));
+        }
+        RecurrenceEnd::Count(count) => {
+            parts.push(format!("COUNT={count}"));
+        }
+    }
+    format!("RRULE:{}", parts.join(";"))
+}
+
 fn graph_recurrence_to_cache(value: &Value) -> Result<MicrosoftCachedRecurrence, ProviderError> {
     let pattern = value
         .get("pattern")
@@ -2310,6 +3951,126 @@ fn graph_recurrence_to_cache(value: &Value) -> Result<MicrosoftCachedRecurrence,
     }
 }
 
+fn google_rrule_to_cache(rule: &str) -> Option<MicrosoftCachedRecurrence> {
+    let body = rule.strip_prefix("RRULE:")?;
+    let mut parts = HashMap::new();
+    for part in body.split(';') {
+        let (key, value) = part.split_once('=')?;
+        parts.insert(key, value);
+    }
+    let frequency = match *parts.get("FREQ")? {
+        "DAILY" => RecurrenceFrequencyRecord::Daily,
+        "WEEKLY" => RecurrenceFrequencyRecord::Weekly,
+        "MONTHLY" => RecurrenceFrequencyRecord::Monthly,
+        "YEARLY" => RecurrenceFrequencyRecord::Yearly,
+        _ => return None,
+    };
+    let interval = parts
+        .get("INTERVAL")
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let end = if let Some(count) = parts
+        .get("COUNT")
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        RecurrenceEndRecord::Count { count }
+    } else if let Some(until) = parts.get("UNTIL") {
+        let date = until
+            .get(0..8)
+            .and_then(|value| {
+                let year = value.get(0..4)?;
+                let month = value.get(4..6)?;
+                let day = value.get(6..8)?;
+                parse_date(&format!("{year}-{month}-{day}"))
+            })
+            .unwrap_or_else(|| CalendarDate::from_ymd(9999, Month::December, 31).expect("date"));
+        RecurrenceEndRecord::Until { date }
+    } else {
+        RecurrenceEndRecord::Never
+    };
+    let weekdays = parts
+        .get("BYDAY")
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|day| {
+                    parse_google_weekday(day.trim_start_matches([
+                        '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
+                    ]))
+                })
+                .map(WeekdayRecord::from_weekday)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let monthly = if matches!(frequency, RecurrenceFrequencyRecord::Monthly) {
+        if let Some(day) = parts
+            .get("BYMONTHDAY")
+            .and_then(|value| value.parse::<u8>().ok())
+        {
+            Some(MonthlyRuleRecord::DayOfMonth { day })
+        } else if let Some(day) = parts.get("BYDAY").and_then(|value| value.split(',').next()) {
+            google_ordinal_weekday(day)
+                .map(|(ordinal, weekday)| MonthlyRuleRecord::WeekdayOrdinal { ordinal, weekday })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let yearly = if matches!(frequency, RecurrenceFrequencyRecord::Yearly) {
+        let month = parts
+            .get("BYMONTH")
+            .and_then(|value| value.parse::<u8>().ok())
+            .unwrap_or(1);
+        if let Some(day) = parts
+            .get("BYMONTHDAY")
+            .and_then(|value| value.parse::<u8>().ok())
+        {
+            Some(YearlyRuleRecord::Date { month, day })
+        } else if let Some(day) = parts.get("BYDAY").and_then(|value| value.split(',').next()) {
+            google_ordinal_weekday(day).map(|(ordinal, weekday)| YearlyRuleRecord::WeekdayOrdinal {
+                month,
+                ordinal,
+                weekday,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(MicrosoftCachedRecurrence {
+        frequency,
+        interval,
+        end,
+        weekdays: if matches!(frequency, RecurrenceFrequencyRecord::Weekly) {
+            weekdays
+        } else {
+            Vec::new()
+        },
+        monthly,
+        yearly,
+    })
+}
+
+fn google_ordinal_weekday(value: &str) -> Option<(OrdinalRecord, WeekdayRecord)> {
+    let weekday = value.get(value.len().saturating_sub(2)..)?;
+    let ordinal = value.get(..value.len().saturating_sub(2)).unwrap_or("1");
+    let ordinal = match ordinal {
+        "1" | "" => OrdinalRecord::First,
+        "2" => OrdinalRecord::Second,
+        "3" => OrdinalRecord::Third,
+        "4" => OrdinalRecord::Fourth,
+        "-1" => OrdinalRecord::Last,
+        _ => OrdinalRecord::First,
+    };
+    Some((
+        ordinal,
+        WeekdayRecord::from_weekday(parse_google_weekday(weekday)?),
+    ))
+}
+
 fn graph_weekday(weekday: Weekday) -> String {
     match weekday {
         Weekday::Sunday => "sunday",
@@ -2336,6 +4097,31 @@ fn parse_graph_weekday(value: &str) -> Option<Weekday> {
     }
 }
 
+fn google_weekday(weekday: Weekday) -> &'static str {
+    match weekday {
+        Weekday::Sunday => "SU",
+        Weekday::Monday => "MO",
+        Weekday::Tuesday => "TU",
+        Weekday::Wednesday => "WE",
+        Weekday::Thursday => "TH",
+        Weekday::Friday => "FR",
+        Weekday::Saturday => "SA",
+    }
+}
+
+fn parse_google_weekday(value: &str) -> Option<Weekday> {
+    match value {
+        "SU" => Some(Weekday::Sunday),
+        "MO" => Some(Weekday::Monday),
+        "TU" => Some(Weekday::Tuesday),
+        "WE" => Some(Weekday::Wednesday),
+        "TH" => Some(Weekday::Thursday),
+        "FR" => Some(Weekday::Friday),
+        "SA" => Some(Weekday::Saturday),
+        _ => None,
+    }
+}
+
 fn graph_ordinal(ordinal: RecurrenceOrdinal) -> String {
     match OrdinalRecord::from_rule(ordinal) {
         OrdinalRecord::First => "first",
@@ -2345,6 +4131,16 @@ fn graph_ordinal(ordinal: RecurrenceOrdinal) -> String {
         OrdinalRecord::Last => "last",
     }
     .to_string()
+}
+
+fn google_ordinal_prefix(ordinal: RecurrenceOrdinal) -> &'static str {
+    match ordinal {
+        RecurrenceOrdinal::Number(1) => "1",
+        RecurrenceOrdinal::Number(2) => "2",
+        RecurrenceOrdinal::Number(3) => "3",
+        RecurrenceOrdinal::Number(_) => "4",
+        RecurrenceOrdinal::Last => "-1",
+    }
 }
 
 fn parse_graph_ordinal(value: &str) -> OrdinalRecord {
@@ -2365,6 +4161,61 @@ fn graph_datetime(value: &Value, key: &str) -> Result<EventDateTime, ProviderErr
         .ok_or_else(|| ProviderError::Mapping(format!("Graph event is missing {key}.dateTime")))?;
     parse_event_datetime(&date_time)
         .ok_or_else(|| ProviderError::Mapping(format!("invalid Graph dateTime '{date_time}'")))
+}
+
+fn google_timing(
+    value: &Value,
+    start_key: &str,
+    end_key: &str,
+) -> Result<GoogleCachedTiming, ProviderError> {
+    let start = value
+        .get(start_key)
+        .ok_or_else(|| ProviderError::Mapping(format!("Google event is missing {start_key}")))?;
+    let end = value
+        .get(end_key)
+        .ok_or_else(|| ProviderError::Mapping(format!("Google event is missing {end_key}")))?;
+    match (graph_string(start, "date"), graph_string(end, "date")) {
+        (Some(date), _) => Ok(GoogleCachedTiming::AllDay {
+            date: parse_date(&date).ok_or_else(|| {
+                ProviderError::Mapping(format!("invalid Google all-day date '{date}'"))
+            })?,
+        }),
+        _ => {
+            let start = graph_string(start, "dateTime").ok_or_else(|| {
+                ProviderError::Mapping(format!("Google event is missing {start_key}.dateTime"))
+            })?;
+            let end = graph_string(end, "dateTime").ok_or_else(|| {
+                ProviderError::Mapping(format!("Google event is missing {end_key}.dateTime"))
+            })?;
+            Ok(GoogleCachedTiming::Timed {
+                start: parse_event_datetime(&start).ok_or_else(|| {
+                    ProviderError::Mapping(format!("invalid Google dateTime '{start}'"))
+                })?,
+                end: parse_event_datetime(&end).ok_or_else(|| {
+                    ProviderError::Mapping(format!("invalid Google dateTime '{end}'"))
+                })?,
+            })
+        }
+    }
+}
+
+fn google_single_time(value: &Value) -> Result<GoogleCachedTiming, ProviderError> {
+    if let Some(date) = graph_string(value, "date") {
+        return Ok(GoogleCachedTiming::AllDay {
+            date: parse_date(&date).ok_or_else(|| {
+                ProviderError::Mapping(format!("invalid Google originalStartTime date '{date}'"))
+            })?,
+        });
+    }
+    let start = graph_string(value, "dateTime").ok_or_else(|| {
+        ProviderError::Mapping("Google originalStartTime is missing dateTime".to_string())
+    })?;
+    let start = parse_event_datetime(&start).ok_or_else(|| {
+        ProviderError::Mapping(format!(
+            "invalid Google originalStartTime dateTime '{start}'"
+        ))
+    })?;
+    Ok(GoogleCachedTiming::Timed { start, end: start })
 }
 
 fn parse_event_datetime(value: &str) -> Option<EventDateTime> {
@@ -2411,6 +4262,10 @@ fn graph_i64(value: &Value, key: &str) -> Option<i64> {
 
 fn microsoft_event_app_id(account_id: &str, calendar_id: &str, graph_id: &str) -> String {
     format!("microsoft:{account_id}:{calendar_id}:{graph_id}")
+}
+
+fn google_event_app_id(account_id: &str, calendar_id: &str, google_id: &str) -> String {
+    format!("google:{account_id}:{calendar_id}:{google_id}")
 }
 
 fn short_calendar_label(calendar_id: &str) -> String {
@@ -2499,14 +4354,15 @@ fn parse_query(query: &str) -> BTreeMap<String, String> {
 
 fn write_oauth_callback_response(
     stream: &mut impl Write,
+    provider_name: &str,
     success: bool,
     message: &str,
 ) -> io::Result<()> {
     let status = if success { "200 OK" } else { "400 Bad Request" };
     let heading = if success {
-        "rcal Microsoft login complete"
+        format!("rcal {provider_name} login complete")
     } else {
-        "rcal Microsoft login failed"
+        format!("rcal {provider_name} login failed")
     };
     let body = format!("{heading}\n\n{message}\n");
     write!(
@@ -2618,6 +4474,7 @@ pub enum ProviderError {
     Keyring(String),
     Http(String),
     Graph(String),
+    Api(String),
     Mapping(String),
     Validation(String),
     NotFound(String),
@@ -2635,6 +4492,7 @@ impl fmt::Display for ProviderError {
             Self::Keyring(reason) => write!(f, "Microsoft token keyring error: {reason}"),
             Self::Http(reason) => write!(f, "Microsoft HTTP error: {reason}"),
             Self::Graph(reason) => write!(f, "Microsoft Graph error: {reason}"),
+            Self::Api(reason) => write!(f, "provider API error: {reason}"),
             Self::Mapping(reason) => write!(f, "Microsoft event mapping error: {reason}"),
             Self::Validation(reason) => write!(f, "{reason}"),
             Self::NotFound(id) => write!(f, "Microsoft event '{id}' was not found"),
@@ -2724,6 +4582,37 @@ mod tests {
         }
     }
 
+    fn google_account() -> GoogleAccountConfig {
+        GoogleAccountConfig {
+            id: "personal".to_string(),
+            client_id: "google-client".to_string(),
+            client_secret: Some("google-secret".to_string()),
+            redirect_port: 8766,
+            calendars: vec!["primary".to_string()],
+        }
+    }
+
+    fn google_provider_config(cache_file: PathBuf) -> GoogleProviderConfig {
+        GoogleProviderConfig {
+            enabled: true,
+            default_account: Some("personal".to_string()),
+            default_calendar: Some("primary".to_string()),
+            sync_past_days: 30,
+            sync_future_days: 365,
+            cache_file,
+            accounts: vec![google_account()],
+        }
+    }
+
+    fn google_calendar_record(id: &str, name: &str, can_edit: bool) -> GoogleCalendarRecord {
+        GoogleCalendarRecord {
+            id: id.to_string(),
+            name: name.to_string(),
+            can_edit,
+            is_default: false,
+        }
+    }
+
     fn calendar_record(id: &str, name: &str, can_edit: bool) -> MicrosoftCalendarRecord {
         MicrosoftCalendarRecord {
             id: id.to_string(),
@@ -2759,6 +4648,44 @@ mod tests {
         }
 
         fn save(&self, account_id: &str, token: &MicrosoftToken) -> Result<(), ProviderError> {
+            self.tokens
+                .borrow_mut()
+                .insert(account_id.to_string(), token.clone());
+            Ok(())
+        }
+
+        fn delete(&self, account_id: &str) -> Result<(), ProviderError> {
+            self.tokens.borrow_mut().remove(account_id);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct GoogleMemoryTokenStore {
+        tokens: RefCell<HashMap<String, GoogleToken>>,
+    }
+
+    impl GoogleMemoryTokenStore {
+        fn with_token(account_id: &str) -> Self {
+            let store = Self::default();
+            store.tokens.borrow_mut().insert(
+                account_id.to_string(),
+                GoogleToken {
+                    access_token: "access-token".to_string(),
+                    refresh_token: "refresh-token".to_string(),
+                    expires_at_epoch_seconds: current_epoch_seconds().saturating_add(3600),
+                },
+            );
+            store
+        }
+    }
+
+    impl GoogleTokenStore for GoogleMemoryTokenStore {
+        fn load(&self, account_id: &str) -> Result<Option<GoogleToken>, ProviderError> {
+            Ok(self.tokens.borrow().get(account_id).cloned())
+        }
+
+        fn save(&self, account_id: &str, token: &GoogleToken) -> Result<(), ProviderError> {
             self.tokens
                 .borrow_mut()
                 .insert(account_id.to_string(), token.clone());
@@ -2848,6 +4775,203 @@ mod tests {
         assert_eq!(event.location.as_deref(), Some("Room"));
         assert_eq!(event.reminders, vec![Reminder::minutes_before(15)]);
         assert!(event.source.source_id.starts_with("microsoft:work:cal"));
+    }
+
+    #[test]
+    fn google_timed_event_maps_to_rcal_event() {
+        let calendar = google_calendar_record("primary", "Calendar", true);
+        let raw = json!({
+            "id": "abc",
+            "summary": "Standup",
+            "eventType": "default",
+            "status": "confirmed",
+            "start": {"dateTime": "2026-04-23T09:00:00Z"},
+            "end": {"dateTime": "2026-04-23T09:30:00Z"},
+            "location": "Room",
+            "description": "Notes",
+            "reminders": {
+                "useDefault": false,
+                "overrides": [
+                    {"method": "popup", "minutes": 10},
+                    {"method": "email", "minutes": 60}
+                ]
+            }
+        });
+
+        let cached = GoogleCachedEvent::from_google("personal", &calendar, raw).expect("maps");
+        let event = cached.to_event().expect("event converts");
+
+        assert_eq!(event.id, "google:personal:primary:abc");
+        assert_eq!(event.title, "Standup");
+        assert_eq!(event.location.as_deref(), Some("Room"));
+        assert_eq!(event.notes.as_deref(), Some("Notes"));
+        assert_eq!(event.reminders.len(), 2);
+        assert_eq!(event.source.source_id, "google:personal:primary");
+    }
+
+    #[test]
+    fn google_rrule_payload_and_parse_cover_weekly_multi_day() {
+        let draft = CreateEventDraft {
+            title: "Class".to_string(),
+            timing: CreateEventTiming::Timed {
+                start: EventDateTime::new(
+                    date(2026, Month::April, 23),
+                    Time::from_hms(13, 50, 0).unwrap(),
+                ),
+                end: EventDateTime::new(
+                    date(2026, Month::April, 23),
+                    Time::from_hms(14, 40, 0).unwrap(),
+                ),
+            },
+            location: None,
+            notes: None,
+            reminders: Vec::new(),
+            recurrence: Some(RecurrenceRule {
+                frequency: RecurrenceFrequency::Weekly,
+                interval: 1,
+                end: RecurrenceEnd::Count(9),
+                weekdays: vec![Weekday::Monday, Weekday::Wednesday, Weekday::Friday],
+                monthly: None,
+                yearly: None,
+            }),
+        };
+
+        let rule = google_rrule_payload(draft.recurrence.as_ref().unwrap(), &draft);
+        let parsed = google_rrule_to_cache(&rule)
+            .and_then(|cache| cache.to_rule())
+            .expect("rrule parses");
+
+        assert_eq!(rule, "RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR;COUNT=9");
+        assert_eq!(parsed.frequency, RecurrenceFrequency::Weekly);
+        assert_eq!(parsed.weekdays, draft.recurrence.as_ref().unwrap().weekdays);
+        assert_eq!(parsed.end, RecurrenceEnd::Count(9));
+    }
+
+    #[test]
+    fn google_sync_writes_selected_calendar_cache_and_renders_event() {
+        let cache_file = temp_path("google-sync/google-cache.json");
+        let _ = fs::remove_file(&cache_file);
+        let store = GoogleMemoryTokenStore::with_token("personal");
+        let http = RecordingHttpClient::new(vec![
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "id": "primary",
+                    "summary": "Calendar",
+                    "accessRole": "owner",
+                    "primary": true
+                }),
+            ),
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "items": [
+                        {
+                            "id": "evt",
+                            "summary": "Planning",
+                            "eventType": "default",
+                            "status": "confirmed",
+                            "start": {"dateTime": "2026-04-23T09:00:00Z"},
+                            "end": {"dateTime": "2026-04-23T10:00:00Z"}
+                        }
+                    ]
+                }),
+            ),
+        ]);
+        let mut runtime =
+            GoogleProviderRuntime::load(google_provider_config(cache_file.clone())).expect("load");
+
+        let summary = runtime
+            .sync(
+                Some("personal"),
+                &http,
+                &store,
+                date(2026, Month::April, 23),
+            )
+            .expect("sync succeeds");
+        let source = GoogleAgendaSource::load(&cache_file).expect("cache reloads");
+        let events = source.events_intersecting(DateRange::day(date(2026, Month::April, 23)));
+        let _ = fs::remove_file(&cache_file);
+
+        assert_eq!(summary.events, 1);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "google:personal:primary:evt");
+        assert_eq!(events[0].source.source_id, "google:personal:primary");
+    }
+
+    #[test]
+    fn google_sync_fetches_recurring_master_without_render_duplicate() {
+        let cache_file = temp_path("google-series/google-cache.json");
+        let _ = fs::remove_file(&cache_file);
+        let store = GoogleMemoryTokenStore::with_token("personal");
+        let http = RecordingHttpClient::new(vec![
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "id": "primary",
+                    "summary": "Calendar",
+                    "accessRole": "owner",
+                    "primary": true
+                }),
+            ),
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "items": [
+                        {
+                            "id": "occ-1",
+                            "summary": "Class",
+                            "eventType": "default",
+                            "status": "confirmed",
+                            "recurringEventId": "master",
+                            "originalStartTime": {"dateTime": "2026-04-23T13:50:00Z"},
+                            "start": {"dateTime": "2026-04-23T13:50:00Z"},
+                            "end": {"dateTime": "2026-04-23T14:40:00Z"}
+                        }
+                    ]
+                }),
+            ),
+            RecordingHttpClient::json(
+                200,
+                json!({
+                    "id": "master",
+                    "summary": "Class",
+                    "eventType": "default",
+                    "status": "confirmed",
+                    "start": {"dateTime": "2026-04-20T13:50:00Z"},
+                    "end": {"dateTime": "2026-04-20T14:40:00Z"},
+                    "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO,WE,FR"]
+                }),
+            ),
+        ]);
+        let mut runtime =
+            GoogleProviderRuntime::load(google_provider_config(cache_file.clone())).expect("load");
+
+        runtime
+            .sync(
+                Some("personal"),
+                &http,
+                &store,
+                date(2026, Month::April, 23),
+            )
+            .expect("sync succeeds");
+        let source = GoogleAgendaSource::load(&cache_file).expect("cache reloads");
+        let events = source.events_intersecting(DateRange::day(date(2026, Month::April, 23)));
+        let master = source
+            .editable_event_by_id("google:personal:primary:master")
+            .expect("series master cached for edit");
+        let _ = fs::remove_file(&cache_file);
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "google:personal:primary:occ-1");
+        assert_eq!(
+            events[0]
+                .occurrence
+                .as_ref()
+                .map(|occurrence| occurrence.series_id.as_str()),
+            Some("google:personal:primary:master")
+        );
+        assert!(master.recurrence.is_some());
     }
 
     #[test]
@@ -3157,6 +5281,7 @@ mod tests {
 
         write_oauth_callback_response(
             &mut response,
+            "Microsoft",
             false,
             "invalid_request: the application must use consumers",
         )
